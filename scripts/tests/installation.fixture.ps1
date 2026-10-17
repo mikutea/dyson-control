@@ -266,21 +266,22 @@ fs.mkdirSync(config.dataDirectory,{recursive:true}); fs.writeFileSync(path.join(
   Register-ScheduledTask -TaskName $bootstrapTaskName -TaskPath '\' -InputObject $definition | Out-Null
   Start-ScheduledTask -TaskName $bootstrapTaskName -TaskPath '\'
 
-  $helperDeadline = [DateTime]::UtcNow.AddSeconds(90)
+  $helperStartDeadline = [DateTime]::UtcNow.AddSeconds(60)
   do {
     if (Test-Path -LiteralPath $helperStatusPath -PathType Leaf) { break }
     Start-Sleep -Milliseconds 250
-  } while ([DateTime]::UtcNow -lt $helperDeadline)
+  } while ([DateTime]::UtcNow -lt $helperStartDeadline)
   if (-not (Test-Path -LiteralPath $helperStatusPath -PathType Leaf)) { throw 'The SYSTEM control update helper did not publish status.' }
   Stop-ScheduledTask -TaskName $bootstrapTaskName -TaskPath '\' -ErrorAction SilentlyContinue
   Unregister-ScheduledTask -TaskName $bootstrapTaskName -TaskPath '\' -Confirm:$false
   Wait-FixtureTaskAbsent $bootstrapTaskName 10
 
+  $helperTerminalDeadline = [DateTime]::UtcNow.AddMinutes(5)
   do {
     $helperStatus = Get-Content -LiteralPath $helperStatusPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ([string]$helperStatus.status -in @('succeeded', 'rolledBack', 'failed')) { break }
     Start-Sleep -Milliseconds 250
-  } while ([DateTime]::UtcNow -lt $helperDeadline)
+  } while ([DateTime]::UtcNow -lt $helperTerminalDeadline)
   Assert-Utf8JsonWithoutBom $helperStatusPath 'SYSTEM helper status'
   if ($helperStatus.schema -ne 1 -or [string]$helperStatus.product -cne 'dyson-control-control-update-result' -or
       [string]$helperStatus.operationId -cne $operationId -or [string]$helperStatus.targetVersion -cne $nextVersion -or
