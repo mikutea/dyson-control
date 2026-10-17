@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>DysonControlBridge.ProtocolTests</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\BridgeProtocol.cs" Link="BridgeProtocol.cs" />
+    <Compile Include="..\BridgeFileStore.cs" Link="BridgeFileStore.cs" />
+    <Compile Include="..\DirectoryIdentity.cs" Link="DirectoryIdentity.cs" />
+    <Compile Include="..\SaveVerification.cs" Link="SaveVerification.cs" />
+    <Compile Include="..\PlayerSessionState.cs" Link="PlayerSessionState.cs" />
+  </ItemGroup>
+</Project>

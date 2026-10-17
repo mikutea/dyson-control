@@ -1,0 +1,194 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-and-package:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Set up .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Exercise Bridge protocol contracts
+        shell: powershell
+        run: dotnet run --project .\integrations\bridge\protocol-tests -c Release --nologo -p:NuGetAudit=false
+
+      - name: Build
+        run: npm run build
+
+      - name: Parse Windows scripts
+        shell: powershell
+        run: |
+          $errorsFound = @()
+          Get-ChildItem -LiteralPath .\scripts\windows -Filter *.ps1 -File | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              $errorsFound += $errors | ForEach-Object { "$($_.Extent.File):$($_.Extent.StartLineNumber): $($_.Message)" }
+            }
+          }
+          if ($errorsFound.Count -gt 0) { throw ($errorsFound -join "`n") }
+
+      - name: Exercise Windows maintenance guards
+        shell: powershell
+        run: |
+          $node = (Get-Command node.exe).Source
+          foreach ($relativeScript in @('scripts\windows\upgrade-control.ps1', 'scripts\windows\uninstall-control.ps1')) {
+            & {
+              param($scriptPath, $nodeExecutable)
+              $content = Get-Content -LiteralPath $scriptPath -Raw -Encoding UTF8
+              $cut = $content.IndexOf("`r`nAssert-TaskName `$TaskName", [StringComparison]::Ordinal)
+              if ($cut -lt 0) { $cut = $content.IndexOf("`nAssert-TaskName `$TaskName", [StringComparison]::Ordinal) }
+              if ($cut -lt 0) { throw "Unable to isolate helpers from $scriptPath" }
+              $definitions = [scriptblock]::Create($content.Substring(0, $cut))
+              if ([IO.Path]::GetFileName($scriptPath) -eq 'upgrade-control.ps1') { . $definitions -SourcePath $PWD }
+              else { . $definitions }
+
+              $fixture = Join-Path $env:RUNNER_TEMP ('dyson-control-maintenance-' + [guid]::NewGuid().ToString('N'))
+              New-Item -ItemType Directory -Path (Join-Path $fixture 'uploads') -Force | Out-Null
+              try {
+                $lease = New-ControlMaintenance $fixture
+                $marker = Get-Content -LiteralPath $lease.Path -Raw -Encoding UTF8 | ConvertFrom-Json
+                if ([string]$marker.token -cne [string]$lease.Token -or [int]$marker.requestedByProcessId -ne $PID) {
+                  throw "Invalid maintenance marker from $scriptPath"
+                }
+                $foreignRejected = $false
+                try { Remove-ControlMaintenance ([pscustomobject]@{ Path = $lease.Path; Token = ('f' * 32) }) }
+                catch {
+                  if ($_.Exception.Message -notlike 'Refusing to remove a maintenance marker owned by another operation:*') { throw }
+                  $foreignRejected = $true
+                }
+                if (-not $foreignRejected -or -not (Test-Path -LiteralPath $lease.Path -PathType Leaf)) {
+                  throw "Foreign token was not rejected by $scriptPath"
+                }
+
+                $database = Join-Path $fixture 'control.sqlite'
+                $setup = "const {DatabaseSync}=require('node:sqlite');const d=new DatabaseSync(process.argv[1]);d.exec('CREATE TABLE jobs (state TEXT);INSERT INTO jobs VALUES(char(113,117,101,117,101,100));');d.close();"
+                & $nodeExecutable -e $setup $database
+                if ($LASTEXITCODE -ne 0) { throw 'Unable to create the queue fixture.' }
+                $activity = Get-ControlActivity $fixture $nodeExecutable
+                if ([int]$activity.outstandingJobs -ne 1 -or [int]$activity.activeUploads -ne 0) { throw 'Queued work was not detected.' }
+                Set-Content -LiteralPath (Join-Path $fixture 'uploads\fixture.part') -Value 'partial' -Encoding ASCII
+                $activity = Get-ControlActivity $fixture $nodeExecutable
+                if ([int]$activity.outstandingJobs -ne 1 -or [int]$activity.activeUploads -ne 1) { throw 'Active upload was not detected.' }
+                Remove-ControlMaintenance $lease
+              }
+              finally { Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue }
+            } (Join-Path $PWD $relativeScript) $node
+          }
+
+      - name: Exercise game configuration prepare fixture
+        shell: powershell
+        run: .\scripts\tests\configure-game.fixture.ps1
+
+      - name: Exercise complete release fixture
+        shell: powershell
+        run: .\scripts\tests\release.fixture.ps1
+
+      - name: Create panel-only release archive
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dyson-control-release'
+          New-Item -ItemType Directory -Path $out | Out-Null
+          node .\scripts\release.mjs --out-dir $out --panel-only
+
+      - name: Audit panel-only release archive and checksum
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dyson-control-release'
+          $zip = @(Get-ChildItem -LiteralPath $out -Filter 'dyson-control-v*-windows-panel-only.zip' -File)
+          if ($zip.Count -ne 1) { throw 'Expected exactly one panel-only release ZIP.' }
+          $checksumPath = "$($zip.FullName).sha256"
+          $expected = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0]
+          $actual = (Get-FileHash -LiteralPath $zip.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected) { throw 'Release SHA-256 mismatch.' }
+
+          $expanded = Join-Path $env:RUNNER_TEMP 'dyson-control-release-audit'
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $expanded
+          $files = Get-ChildItem -LiteralPath $expanded -Recurse -File | ForEach-Object {
+            $_.FullName.Substring($expanded.Length + 1).Replace('\', '/')
+          }
+          $required = @(
+            'package.json', 'package-lock.json', 'control.config.example.json', 'LICENSE',
+            'dist/server/index.js', 'dist/server/admin.js', 'dist/web/index.html',
+            'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1',
+            'scripts/windows/uninstall-control.ps1', 'docs/installation.md',
+            'scripts/windows/configure-game.ps1', 'docs/game-configuration.md',
+            'release-manifest.json'
+          )
+          foreach ($requiredFile in $required) {
+            if ($files -notcontains $requiredFile) { throw "Release is missing $requiredFile" }
+          }
+          foreach ($file in $files) {
+            $allowed = $file -in @('package.json', 'package-lock.json', 'control.config.example.json', 'LICENSE', 'README.md', 'GOAL.md', 'release-manifest.json') `
+              -or $file.StartsWith('dist/server/') `
+              -or $file.StartsWith('dist/shared/') `
+              -or $file.StartsWith('dist/web/') `
+              -or ($file.StartsWith('scripts/windows/') -and $file.EndsWith('.ps1')) `
+              -or ($file.StartsWith('docs/') -and $file.EndsWith('.md'))
+            if (-not $allowed) { throw "Unexpected release file: $file" }
+            if ($file -match '(^|/)(node_modules|\.data|state|coverage|backups?|userdata|validation|fixtures?|tests?|temp|tmp)(/|$)' `
+                -or $file -match '(^|/)control\.config\.json$' `
+                -or $file -match '(\.test\.|\.spec\.|\.log$|\.sqlite3?$|\.db$|\.env(?:\.|$))') {
+              throw "Forbidden release file: $file"
+            }
+          }
+          if ($files | Where-Object { $_.StartsWith('dist/bridge/') }) {
+            throw 'Panel-only release must not contain dist/bridge.'
+          }
+          $manifest = Get-Content -LiteralPath (Join-Path $expanded 'release-manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+          $properties = @($manifest.PSObject.Properties.Name)
+          $expectedProperties = @('schema', 'product', 'packageVersion', 'kind', 'bridge')
+          if ($properties.Count -ne $expectedProperties.Count -or
+              @(Compare-Object -ReferenceObject $expectedProperties -DifferenceObject $properties -CaseSensitive).Count -ne 0 -or
+              $manifest.schema -ne 1 -or $manifest.product -cne 'dyson-control' -or
+              $manifest.kind -cne 'panel-only' -or $null -ne $manifest.bridge) {
+            throw 'Panel-only release manifest is invalid.'
+          }
+
+      - name: Exercise isolated Windows installation lifecycle
+        shell: powershell
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'dyson-control-release'
+          $zip = @(Get-ChildItem -LiteralPath $out -Filter 'dyson-control-v*-windows-panel-only.zip' -File)
+          if ($zip.Count -ne 1) { throw 'Expected exactly one panel-only release ZIP.' }
+          .\scripts\tests\installation.fixture.ps1 `
+            -ReleaseArchive $zip[0].FullName `
+            -NodePath (Get-Command node.exe).Source `
+            -NpmPath (Get-Command npm.cmd).Source
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: dyson-control-windows-panel-only-${{ github.sha }}
+          path: ${{ runner.temp }}/dyson-control-release/*
+          if-no-files-found: error
+          retention-days: 14

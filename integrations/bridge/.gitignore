@@ -1,0 +1,4 @@
+bin/
+obj/
+protocol-tests/bin/
+protocol-tests/obj/

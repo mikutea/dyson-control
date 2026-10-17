@@ -1,0 +1,18 @@
+{
+  "host": "127.0.0.1",
+  "port": 13020,
+  "dataDirectory": "./state",
+  "mode": "windows",
+  "adminPasswordHash": "REPLACE_WITH_OUTPUT_OF_NPM_RUN_ADMIN_HASH_PASSWORD",
+  "game": {
+    "root": "E:/Dyson/server",
+    "saveDirectory": "E:/Dyson/userdata/Save",
+    "backupDirectory": "E:/Dyson/backups",
+    "logFile": "E:/Dyson/server/BepInEx/LogOutput.log",
+    "bridgeDirectory": "E:/Dyson/bridge",
+    "bridgeSecretFile": "E:/Dyson/private/bridge-secret",
+    "startTaskName": "Dyson-Game-Start",
+    "address": "game.example.com:8469",
+    "serverName": "Dyson Server"
+  }
+}

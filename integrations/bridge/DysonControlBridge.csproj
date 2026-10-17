@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <AssemblyName>DysonControlBridge</AssemblyName>
+    <RootNamespace>DysonControl.Bridge</RootNamespace>
+    <Version>0.1.0</Version>
+    <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <FileVersion>0.1.0.0</FileVersion>
+    <InformationalVersion>0.1.0</InformationalVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <DysonServerRoot Condition="'$(DysonServerRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\server</DysonServerRoot>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Remove="protocol-tests\**\*.cs" />
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+    <Reference Include="BepInEx" HintPath="$(DysonServerRoot)\BepInEx\core\BepInEx.dll" Private="false" />
+    <Reference Include="UnityEngine" HintPath="$(DysonServerRoot)\DSPGAME_Data\Managed\UnityEngine.dll" Private="false" />
+    <Reference Include="UnityEngine.CoreModule" HintPath="$(DysonServerRoot)\DSPGAME_Data\Managed\UnityEngine.CoreModule.dll" Private="false" />
+    <Reference Include="netstandard" HintPath="$(DysonServerRoot)\DSPGAME_Data\Managed\netstandard.dll" Private="false" />
+    <Reference Include="Assembly-CSharp" HintPath="$(DysonServerRoot)\DSPGAME_Data\Managed\Assembly-CSharp.dll" Private="false" />
+    <Reference Include="NebulaAPI" HintPath="$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerModApi\NebulaAPI.dll" Private="false" />
+    <Reference Include="NebulaModel" HintPath="$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerMod\NebulaModel.dll" Private="false" />
+    <Reference Include="NebulaWorld" HintPath="$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerMod\NebulaWorld.dll" Private="false" />
+    <Reference Include="websocket-sharp" HintPath="$(DysonServerRoot)\BepInEx\plugins\nebula-NebulaMultiplayerMod\websocket-sharp.dll" Private="false" />
+  </ItemGroup>
+</Project>
