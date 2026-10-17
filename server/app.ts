@@ -21,6 +21,7 @@ import { playerIdPattern } from './game/bridge.js'
 import { ControlUpdateError, ControlUpdateManager } from './control-updates.js'
 
 const emptyObjectSchema = z.object({}).strict()
+const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
 const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player'])
@@ -79,7 +80,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     logger: options.logger ?? false,
     logController: new LogController({ disableRequestLogging: true }),
     bodyLimit: 64 * 1024,
-    requestTimeout: 30_000,
+    requestTimeout: REQUEST_TIMEOUT_MS,
+    trustProxy: (address, hop) => hop === 0 && isLoopbackAddress(address),
   })
   const adapter = options.adapter ?? await createGameAdapter(options.config)
   const store = new JobStore(options.databasePath ?? resolve(options.config.dataDirectory, 'control.sqlite'))
@@ -484,19 +486,18 @@ function validateSameOrigin(request: FastifyRequest): void {
     throw new ApiError(403, 'origin_forbidden', '请求来源无效。')
   }
   const host = request.headers.host
-  const protocol = forwardedProtocol(request) ?? request.protocol
+  const protocol = request.protocol
   if (!host || parsed.host !== host || parsed.protocol !== `${protocol}:`) {
     throw new ApiError(403, 'origin_forbidden', '不允许跨站请求。')
   }
 }
 
-function forwardedProtocol(request: FastifyRequest): string | undefined {
-  const value = request.headers['x-forwarded-proto']
-  return typeof value === 'string' ? value.split(',')[0]?.trim() : undefined
+function isLoopbackAddress(address: string): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
 function isSecure(request: FastifyRequest): boolean {
-  return (forwardedProtocol(request) ?? request.protocol) === 'https'
+  return request.protocol === 'https'
 }
 
 function cookieOptions(request: FastifyRequest) {

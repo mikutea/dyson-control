@@ -421,6 +421,61 @@ describe('Dyson Control API', () => {
     await app.close()
   })
 
+  it('trusts forwarded client and protocol metadata only from the loopback proxy', async () => {
+    const fixture = await createFixture()
+    const app = await buildApp({
+      config: fixture.config,
+      adapter: fixture.adapter,
+      databasePath: ':memory:',
+      loginGuard: new LoginGuard({ maxFailures: 2, windowMs: 60_000, blockMs: 30_000 }),
+    })
+    await app.ready()
+    try {
+      const proxiedHeaders = { 'x-forwarded-for': '198.51.100.1', 'x-forwarded-proto': 'https' }
+      expect((await app.inject({ method: 'POST', url: '/api/session', remoteAddress: '127.0.0.1', headers: proxiedHeaders, payload: { password: 'wrong password' } })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'POST', url: '/api/session', remoteAddress: '127.0.0.1', headers: proxiedHeaders, payload: { password: 'wrong password' } })).statusCode).toBe(429)
+
+      const otherClient = await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '127.0.0.1',
+        headers: { 'x-forwarded-for': '198.51.100.2', 'x-forwarded-proto': 'https' },
+        payload: { password: 'correct horse battery staple' },
+      })
+      expect(otherClient.statusCode).toBe(200)
+      expect(String(otherClient.headers['set-cookie'])).toMatch(/;\s*Secure\b/i)
+
+      expect((await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '203.0.113.5',
+        headers: { 'x-forwarded-for': '198.51.100.10' }, payload: { password: 'wrong password' },
+      })).statusCode).toBe(401)
+      expect((await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '203.0.113.5',
+        headers: { 'x-forwarded-for': '198.51.100.11' }, payload: { password: 'wrong password' },
+      })).statusCode).toBe(429)
+      expect((await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '203.0.113.5',
+        headers: { 'x-forwarded-for': '198.51.100.12' }, payload: { password: 'correct horse battery staple' },
+      })).statusCode).toBe(429)
+
+      const directLogin = await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '203.0.113.6',
+        headers: { 'x-forwarded-for': '198.51.100.20', 'x-forwarded-proto': 'https' },
+        payload: { password: 'correct horse battery staple' },
+      })
+      expect(directLogin.statusCode).toBe(200)
+      expect(String(directLogin.headers['set-cookie'])).not.toMatch(/;\s*Secure\b/i)
+
+      const originHeaders = { host: 'control.example.test', origin: 'https://control.example.test', 'x-forwarded-proto': 'https' }
+      expect((await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '::1', headers: originHeaders,
+        payload: { password: 'correct horse battery staple' },
+      })).statusCode).toBe(200)
+      expect((await app.inject({
+        method: 'POST', url: '/api/session', remoteAddress: '203.0.113.7', headers: originHeaders,
+        payload: { password: 'correct horse battery staple' },
+      })).statusCode).toBe(403)
+    } finally { await app.close() }
+  })
+
   it('aborts the active adapter operation during a clean shutdown', async () => {
     const fixture = await createFixture()
     fixture.adapter.run = async (_action, _input, _report, signal) => new Promise((resolve, reject) => {

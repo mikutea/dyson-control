@@ -7,6 +7,7 @@ Requires an elevated Windows PowerShell session. Only unique fixture tasks and a
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)][string]$ReleaseArchive,
+  [string]$ControlUpdateArchive = '',
   [Parameter(Mandatory = $true)][string]$NodePath,
   [Parameter(Mandatory = $true)][string]$NpmPath
 )
@@ -19,6 +20,15 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $archivePath = (Resolve-Path -LiteralPath $ReleaseArchive).Path
 $expected = ((Get-Content -LiteralPath ($archivePath + '.sha256') -Raw).Trim() -split '\s+')[0]
 if ((Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) { throw 'Release checksum mismatch.' }
+$controlUpdateArchivePath = $archivePath
+$controlUpdateExpected = $expected
+if (-not [string]::IsNullOrWhiteSpace($ControlUpdateArchive)) {
+  $controlUpdateArchivePath = (Resolve-Path -LiteralPath $ControlUpdateArchive).Path
+  $controlUpdateExpected = ((Get-Content -LiteralPath ($controlUpdateArchivePath + '.sha256') -Raw).Trim() -split '\s+')[0]
+  if ((Get-FileHash -LiteralPath $controlUpdateArchivePath -Algorithm SHA256).Hash.ToLowerInvariant() -cne $controlUpdateExpected) {
+    throw 'Control update release checksum mismatch.'
+  }
+}
 $node = (Resolve-Path -LiteralPath $NodePath).Path
 $npm = (Resolve-Path -LiteralPath $NpmPath).Path
 $fixtureId = [guid]::NewGuid().ToString('N')
@@ -29,6 +39,7 @@ New-Item -ItemType Directory -Path $root | Out-Null
 $taskName = 'Dyson-Control-Fixture-' + $fixtureId
 $installRoot = Join-Path $root 'installed'
 $sourceRoot = Join-Path $root 'source'
+$candidateTemplateRoot = $sourceRoot
 $privateRoot = Join-Path $root 'private'
 New-Item -ItemType Directory -Path $privateRoot | Out-Null
 $configPath = Join-Path $privateRoot 'control.config.json'
@@ -98,7 +109,7 @@ function Assert-Utf8JsonWithoutBom([string]$PathValue, [string]$Label) {
 
 function New-Candidate([string]$PathValue, [string]$Version, [bool]$FailStartup) {
   $candidate = [IO.Path]::GetFullPath($PathValue)
-  Copy-Item -LiteralPath $sourceRoot -Destination $candidate -Recurse
+  Copy-Item -LiteralPath $candidateTemplateRoot -Destination $candidate -Recurse
   & $node -e $candidateEditor $candidate $Version
   if ($LASTEXITCODE -ne 0) { throw "Unable to prepare fixture candidate $Version." }
   if ($FailStartup) {
@@ -158,6 +169,10 @@ function Wait-FixtureTaskAbsent([string]$Name, [int]$TimeoutSeconds) {
 
 try {
   Expand-Archive -LiteralPath $archivePath -DestinationPath $sourceRoot
+  if (-not [string]::IsNullOrWhiteSpace($ControlUpdateArchive)) {
+    $candidateTemplateRoot = Join-Path $root 'control-update-source'
+    Expand-Archive -LiteralPath $controlUpdateArchivePath -DestinationPath $candidateTemplateRoot
+  }
   $package = Get-Content -LiteralPath (Join-Path $sourceRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json
   $originalVersion = [string]$package.version
   $versionPrefix = ($originalVersion -split '[-+]')[0]
@@ -329,10 +344,10 @@ fs.mkdirSync(config.dataDirectory,{recursive:true}); fs.writeFileSync(path.join(
   if (-not (Test-Path -LiteralPath (Join-Path $installRoot ('versions\' + $originalVersion)))) { throw 'Uninstall removed retained program versions.' }
   $installed = $false
   $steps.Add('uninstall-stops-service-and-preserves-config-data-and-program-versions')
-  [ordered]@{schema=1;passed=$true;releaseSha256=$expected;originalVersion=$originalVersion;scope=$scope;cleanupVerified=$true;steps=@($steps.ToArray());completedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+  [ordered]@{schema=1;passed=$true;releaseSha256=$expected;controlUpdateReleaseSha256=$controlUpdateExpected;originalVersion=$originalVersion;scope=$scope;cleanupVerified=$true;steps=@($steps.ToArray());completedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8
   Write-Output "Installation lifecycle fixture passed. Report: $reportPath"
 } catch {
-  [ordered]@{schema=1;passed=$false;releaseSha256=$expected;scope=$scope;cleanupVerified=$false;steps=@($steps.ToArray());error=$_.Exception.Message;failedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+  [ordered]@{schema=1;passed=$false;releaseSha256=$expected;controlUpdateReleaseSha256=$controlUpdateExpected;scope=$scope;cleanupVerified=$false;steps=@($steps.ToArray());error=$_.Exception.Message;failedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8
   throw
 } finally {
   foreach ($temporaryTask in @($bootstrapTaskName, $helperTaskName)) {
