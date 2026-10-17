@@ -19,7 +19,9 @@ const execFileAsync = promisify(execFile)
 afterEach(async () => { await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true }))) })
 
 async function config(mode: 'demo' | 'windows'): Promise<ControlConfig> {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), `dyson-${mode}-test-`))
+  // Windows runners may expose TEMP through an 8.3 alias. Match the real path
+  // PowerShell uses, including when the fixture simulates a separate SMB path.
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), `dyson-${mode}-test-`)))
   temporaryDirectories.push(root)
   const saveDirectory = path.join(root, 'userdata', 'Save')
   const backupDirectory = path.join(root, 'backups')
