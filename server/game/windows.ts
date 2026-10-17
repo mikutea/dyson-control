@@ -51,6 +51,7 @@ interface WindowsAdapterOptions {
   logicalProcessorCount?: number
   clock?: () => number
   lifecycleTimeoutMs?: number
+  startupTimeoutMs?: number
   pollIntervalMs?: number
 }
 
@@ -147,6 +148,7 @@ export class WindowsGameAdapter implements GameAdapter {
   readonly #logicalProcessorCount: number
   readonly #clock: () => number
   readonly #lifecycleTimeoutMs: number
+  readonly #startupTimeoutMs: number
   readonly #pollIntervalMs: number
   readonly #networkRates = new HostNetworkRateTracker()
   #settings: StoredSettings
@@ -166,8 +168,10 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#logicalProcessorCount = logicalProcessorCount
     this.#clock = options.clock ?? Date.now
     this.#lifecycleTimeoutMs = options.lifecycleTimeoutMs ?? 60_000
+    this.#startupTimeoutMs = options.startupTimeoutMs ?? options.lifecycleTimeoutMs ?? 10 * 60_000
     this.#pollIntervalMs = options.pollIntervalMs ?? 500
     if (!Number.isSafeInteger(this.#lifecycleTimeoutMs) || this.#lifecycleTimeoutMs < 1 ||
+        !Number.isSafeInteger(this.#startupTimeoutMs) || this.#startupTimeoutMs < 1 ||
         !Number.isSafeInteger(this.#pollIntervalMs) || this.#pollIntervalMs < 1) {
       throw new GameAdapterError('LIFECYCLE_TIMING_INVALID', 'Lifecycle timeout and polling interval must be positive integers.')
     }
@@ -664,7 +668,7 @@ export class WindowsGameAdapter implements GameAdapter {
     await this.#steamUpdates?.recoverInterrupted(report, signal)
     report('正在启动服务器')
     await this.#runScript('invoke-scheduled-task.ps1', { taskName: this.#config.game.startTaskName }, signal)
-    const processId = await this.#waitForStartedBridge(signal)
+    const processId = await this.#waitForStartedBridge(report, signal)
     report('服务器已启动，Bridge 已就绪')
     return { state: 'running', pid: processId, bridgeReady: true }
   }
@@ -718,14 +722,17 @@ export class WindowsGameAdapter implements GameAdapter {
     throw new GameAdapterError('GAME_STOP_TIMEOUT', 'The game accepted the Bridge stop request, but the exact DSP process did not exit before the timeout.')
   }
 
-  async #waitForStartedBridge(signal: AbortSignal): Promise<number> {
-    const deadline = Date.now() + this.#lifecycleTimeoutMs
+  async #waitForStartedBridge(report: ReportStep, signal: AbortSignal): Promise<number> {
+    const deadline = Date.now() + this.#startupTimeoutMs
     let expectedProcessId: number | null = null
     let lastBridgeError: unknown = null
     while (Date.now() < deadline) {
       signal.throwIfAborted()
       const process = (await this.#inspect(true)).process
-      if (expectedProcessId === null && process) expectedProcessId = process.pid
+      if (expectedProcessId === null && process) {
+        expectedProcessId = process.pid
+        report('游戏进程已启动，正在等待存档加载和 Bridge 就绪')
+      }
       if (expectedProcessId !== null) {
         if (!process) {
           throw new GameAdapterError('GAME_START_PROCESS_EXITED', 'DSPGAME.exe exited before its signed Bridge heartbeat became ready.', { cause: lastBridgeError ?? undefined })
@@ -1002,7 +1009,7 @@ export class WindowsGameAdapter implements GameAdapter {
           const directory = ensureInside(root, path.join(root, entry.name))
           const manifestPath = path.join(directory, 'manifest.json')
           let manifest: Record<string, unknown> | null = null
-          try { manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as Record<string, unknown> } catch { /* Report unmanaged DLL directories below. */ }
+          try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(manifestPath))) as Record<string, unknown> } catch { /* Report unmanaged DLL directories below. */ }
           if (!manifest) {
             const dlls = (await fs.readdir(directory, { withFileTypes: true }))
               .filter(candidate => candidate.isFile() && candidate.name.toLowerCase().endsWith('.dll'))

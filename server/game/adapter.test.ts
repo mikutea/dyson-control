@@ -1253,11 +1253,11 @@ describe('Windows adapter fixture behavior', () => {
     expect((await adapter.backups()).some(backup => backup.reason === 'automatic-before-mod-removal')).toBe(true)
   })
 
-  it('uses the persisted Thunderstore BepInEx package version in client exports', async () => {
+  it('exports exact package versions from BOM-prefixed installed manifests', async () => {
     const fixture = await config('windows')
     const nebula = path.join(fixture.game.root, 'BepInEx', 'plugins', 'nebula-NebulaMultiplayerMod')
     await fs.mkdir(nebula, { recursive: true })
-    await fs.writeFile(path.join(nebula, 'manifest.json'), JSON.stringify({
+    await fs.writeFile(path.join(nebula, 'manifest.json'), '\uFEFF' + JSON.stringify({
       author_name: 'nebula', name: 'NebulaMultiplayerMod', version_number: '0.9.24', dependencies: ['xiaoye97-BepInEx-5.4.17']
     }))
     const adapter = new WindowsGameAdapter(fixture, {
@@ -1403,6 +1403,33 @@ describe('Windows adapter fixture behavior', () => {
     await expect(adapter.run('start', {}, () => undefined, new AbortController().signal))
       .resolves.toMatchObject({ state: 'running', pid: processId })
     expect(order).toEqual(['recover', 'start-task'])
+  })
+
+  it('allows save loading to exceed the stop deadline while still waiting for the exact signed process', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    const processId = 4242
+    let running = false
+    const reports: string[] = []
+    const adapter = new WindowsGameAdapter(fixture, {
+      lifecycleTimeoutMs: 20,
+      startupTimeoutMs: 1_000,
+      pollIntervalMs: 5,
+      inspect: async () => ({
+        process: running ? { pid: processId, startedAt: new Date().toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 0, targetUps: 60, selectedSave: 'World' } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: true, configuredTargetUps: null }
+      }),
+      runScript: async <T>() => { running = true; return {} as T }
+    })
+    await prepareBridge(fixture, processId + 1)
+    const publishReady = new Promise<void>((resolve, reject) => {
+      setTimeout(() => { prepareBridge(fixture, processId).then(() => resolve(), reject) }, 100)
+    })
+    await expect(adapter.run('start', {}, message => reports.push(message), new AbortController().signal))
+      .resolves.toMatchObject({ pid: processId, bridgeReady: true })
+    await publishReady
+    expect(reports).toContain('游戏进程已启动，正在等待存档加载和 Bridge 就绪')
   })
 
   it('does not invoke the managed start task when interrupted package recovery fails', async () => {

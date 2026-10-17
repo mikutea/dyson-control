@@ -30,13 +30,14 @@ interface FixturePackage {
   description?: string
   downloads?: number
   ratingScore?: number
+  manifestBom?: boolean
 }
 
 function packageFixture(input: FixturePackage): { metadata: Record<string, unknown>; url: string; archive: Buffer } {
   const fullName = `${input.owner}-${input.name}`
   const versionFullName = `${fullName}-${input.version}`
   const url = `https://packages.test/${versionFullName}.zip`
-  const manifest = JSON.stringify({ name: input.name, version_number: input.version, dependencies: input.dependencies ?? [] })
+  const manifest = (input.manifestBom ? '\uFEFF' : '') + JSON.stringify({ name: input.name, version_number: input.version, dependencies: input.dependencies ?? [] })
   const archive = buildStoredZip([
     { name: 'manifest.json', data: manifest },
     ...(input.entries ?? [{ name: `${input.name}.dll`, data: `${versionFullName}-binary` }])
@@ -206,7 +207,7 @@ describe('Thunderstore updates', () => {
     })
   })
 
-  it('installs BepInEx, exact dependencies and Nebula with a persistent backup', async () => {
+  it('installs BepInEx and exact dependencies over BOM-prefixed manifests with a persistent backup', async () => {
     const roots = await fixtureRoot()
     const bepinex = packageFixture({
       owner: 'xiaoye97', name: 'BepInEx', version: '5.4.17',
@@ -216,7 +217,7 @@ describe('Thunderstore updates', () => {
       ]
     })
     const nebula = packageFixture({
-      owner: 'nebula', name: 'NebulaMultiplayerMod', version: '0.9.24',
+      owner: 'nebula', name: 'NebulaMultiplayerMod', version: '0.9.24', manifestBom: true,
       dependencies: ['xiaoye97-BepInEx-5.4.17'],
       entries: [{ name: 'NebulaMultiplayerMod.dll', data: 'new-nebula' }]
     })
@@ -225,7 +226,7 @@ describe('Thunderstore updates', () => {
     await fs.mkdir(oldPackage, { recursive: true })
     await fs.writeFile(path.join(roots.game, 'winhttp.dll'), 'old-doorstop')
     await fs.writeFile(path.join(roots.game, 'BepInEx', 'core', 'BepInEx.dll'), 'old-core')
-    await fs.writeFile(path.join(oldPackage, 'manifest.json'), JSON.stringify({ name: 'NebulaMultiplayerMod', version_number: '0.9.23' }))
+    await fs.writeFile(path.join(oldPackage, 'manifest.json'), '\uFEFF' + JSON.stringify({ name: 'NebulaMultiplayerMod', version_number: '0.9.23' }))
     await fs.writeFile(path.join(oldPackage, 'NebulaMultiplayerMod.dll'), 'old-nebula')
 
     const reports: string[] = []

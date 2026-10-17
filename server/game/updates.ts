@@ -1133,7 +1133,7 @@ export class GameUpdateManager {
   async #validateManifest(extracted: string, item: ResolvedPackage): Promise<void> {
     const manifestPath = path.join(extracted, 'manifest.json')
     let manifest: unknown
-    try { manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) }
+    try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(manifestPath))) }
     catch (error) { throw updateError('PACKAGE_MANIFEST_INVALID', `${item.fullName} does not contain a valid root manifest.json.`, error) }
     if (!manifest || typeof manifest !== 'object') throw updateError('PACKAGE_MANIFEST_INVALID', `${item.fullName} manifest is malformed.`)
     const record = manifest as Record<string, unknown>
@@ -1642,7 +1642,7 @@ export class GameUpdateManager {
         if (!entry.isDirectory() || entry.isSymbolicLink()) continue
         const directory = path.join(root, entry.name)
         try {
-          const manifest = JSON.parse(await fs.readFile(path.join(directory, 'manifest.json'), 'utf8')) as Record<string, unknown>
+          const manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(path.join(directory, 'manifest.json')))) as Record<string, unknown>
           const author = typeof manifest.author_name === 'string' ? manifest.author_name : null
           if (manifest.name === item.packageName && (author === null || author.toLowerCase() === item.owner.toLowerCase())) matches.push(directory)
         } catch { /* An unrelated or incomplete package is not an update target. */ }
