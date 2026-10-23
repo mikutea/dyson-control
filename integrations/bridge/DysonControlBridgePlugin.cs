@@ -12,12 +12,13 @@ namespace DysonControl.Bridge
 {
     [BepInPlugin(PluginGuid, PluginName, PluginVersion)]
     [BepInDependency("dsp.nebula-multiplayer", BepInDependency.DependencyFlags.HardDependency)]
-    [BepInDependency("dsp.nebula-multiplayer-api", BepInDependency.DependencyFlags.HardDependency)]
+    // A direct Nebula API dependency opts into host/client mod parity checks.
+    // This server-only plugin depends on Nebula itself and sends no custom game packets.
     public sealed class DysonControlBridgePlugin : BaseUnityPlugin
     {
         public const string PluginGuid = "net.miyuo.dyson-control.bridge";
         public const string PluginName = "Dyson Control Bridge";
-        public const string PluginVersion = "0.1.1";
+        public const string PluginVersion = "0.1.2";
 
         private ConfigEntry<string> controlDirectory;
         private ConfigEntry<string> secretFile;

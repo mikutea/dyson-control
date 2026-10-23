@@ -2,6 +2,8 @@
 
 Dyson Control Bridge is a small BepInEx plugin used by the Windows game adapter. It runs on Unity's main thread, reads the installed Nebula 0.9.22 API directly, and exchanges bounded HMAC-signed files with Dyson Control. Player actions are pinned to the installed Nebula `0.9.22.2+3cdf95c` assembly shape. A complete Windows release includes the plugin and its reference manifest; a panel-only release does not. The plugin initializes only after its private paths and secret have been configured.
 
+The Bridge is server-only and is excluded from client exports. Its BepInEx dependency targets the Nebula runtime, not the Nebula API plugin: Nebula treats a direct API dependency (hard or soft), or an `IMultiplayerMod` implementation, as a requirement for both peers to install the plugin. The Bridge does not register custom game packets or synchronize client settings. `build-bridge.ps1` checks the compiled metadata against this handshake rule before producing a release artifact.
+
 It provides eight surfaces:
 
 - a fresh heartbeat bound to the current `DSPGAME.exe` PID;

@@ -411,8 +411,8 @@ export class WindowsGameAdapter implements GameAdapter {
       inspected.process
         ? readBridgeVersions(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, inspected.process.pid).catch(() => null)
         : Promise.resolve(null),
-      this.#updates.installedPackageVersion(componentPackageIds.nebula),
-      this.#updates.installedPackageVersion(componentPackageIds.bepinex)
+      this.#installedComponentPackageVersion('nebula'),
+      this.#installedComponentPackageVersion('bepinex')
     ])
     return this.#updates.versions({
       game: runtime?.game ?? 'unknown',
@@ -422,6 +422,15 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async versionLocks() { return this.#versionLocks.list() }
+
+  async #installedComponentPackageVersion(component: 'nebula' | 'bepinex'): Promise<string | null> {
+    const packageId = componentPackageIds[component]
+    const recorded = await this.#updates.installedPackageVersion(packageId)
+    if (recorded) return recorded
+    const installed = (await this.#scanMods()).find(record =>
+      record.dto.enabled && record.packageIdentity?.toLowerCase() === packageId.toLowerCase())
+    return installed && installed.dto.version !== 'unknown' ? installed.dto.version : null
+  }
 
   async #setVersionLock(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (typeof input.locked !== 'boolean' || Boolean(input.component) === Boolean(input.modId)) invalidInput('Select one installed component or mod.')
@@ -434,7 +443,7 @@ export class WindowsGameAdapter implements GameAdapter {
       if (input.locked) {
         currentVersion = component === 'game'
           ? await this.#steamUpdates?.currentBuild() ?? null
-          : await this.#updates.installedPackageVersion(componentPackageIds[component])
+          : await this.#installedComponentPackageVersion(component)
       }
     } else {
       const record = (await this.#scanMods()).find(item => item.dto.id === input.modId)

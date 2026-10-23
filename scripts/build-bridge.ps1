@@ -47,6 +47,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Bridge protocol tests failed.' }
 if ($LASTEXITCODE -ne 0) { throw 'Bridge target build failed.' }
 
 $dll = Join-Path $projectRoot 'integrations\bridge\bin\Release\net472\DysonControlBridge.dll'
+& (Join-Path $projectRoot 'scripts\tests\bridge-metadata.fixture.ps1') -BridgeDll $dll -DysonServerRoot $serverRoot
 New-Item -ItemType Directory -Force -Path $output | Out-Null
 Copy-Item -LiteralPath $dll -Destination (Join-Path $output 'DysonControlBridge.dll') -Force
 $referenceEvidence = foreach ($entry in $references.GetEnumerator()) {

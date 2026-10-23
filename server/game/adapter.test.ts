@@ -526,6 +526,35 @@ describe('Windows adapter fixture behavior', () => {
     })
   })
 
+  it.each([true, false])('discovers an existing component manifest without update history only when enabled=%s', async enabled => {
+    const fixture = await config('windows')
+    const nebula = path.join(fixture.game.root, 'BepInEx', enabled ? 'plugins' : 'disabled-plugins', 'nebula-NebulaMultiplayerMod')
+    await fs.mkdir(nebula, { recursive: true })
+    await fs.writeFile(path.join(nebula, 'manifest.json'), '\uFEFF' + JSON.stringify({
+      author_name: 'nebula', name: 'NebulaMultiplayerMod', version_number: '0.9.22', dependencies: []
+    }))
+    let supplied: { game: string; nebula: string; bepinex: string } | null = null
+    const adapter = new WindowsGameAdapter(fixture, {
+      inspect: async () => ({
+        process: null,
+        versions: { game: null, nebula: '0.9.22.2', bepinex: null },
+        tasks: { start: true, startManaged: true, configuredTargetUps: null }
+      }),
+      updates: updateFixture({
+        installedPackageVersion: async () => null,
+        versions: async current => { supplied = current; return [] }
+      })
+    })
+    await adapter.versions()
+    expect(supplied).toEqual({ game: 'unknown', nebula: enabled ? '0.9.22' : 'unknown', bepinex: 'unknown' })
+    const lock = adapter.run('set-version-lock', { component: 'nebula', locked: true }, () => undefined, new AbortController().signal)
+    if (enabled) {
+      await expect(lock).resolves.toMatchObject({ package: 'nebula-NebulaMultiplayerMod', version: '0.9.22', locked: true })
+    } else {
+      await expect(lock).rejects.toMatchObject({ code: 'VERSION_UNKNOWN' })
+    }
+  })
+
   it('reads the last signed player event batch after the game has stopped', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
