@@ -79,3 +79,69 @@ function Test-DysonPathEquals([string]$Left, [string]$Right) {
   }
   catch { return $false }
 }
+
+function Get-DysonDirectoryLinkTarget([string]$LinkPath) {
+  # Windows PowerShell 5.1 drops the leading backslashes from UNC link Target
+  # metadata. Read the reparse record so an absolute UNC target cannot be
+  # confused with a real relative directory named "UNC".
+  if (-not ('DysonControl.DirectoryLinkReader' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace DysonControl {
+  public static class DirectoryLinkReader {
+    [DllImport("kernel32.dll", EntryPoint = "CreateFileW", CharSet = CharSet.Unicode, ExactSpelling = true, SetLastError = true)]
+    private static extern SafeFileHandle CreateFile(string path, uint access, uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DeviceIoControl(SafeFileHandle handle, uint code, IntPtr input, uint inputSize, byte[] output, uint outputSize, out uint returned, IntPtr overlapped);
+
+    public static string ReadTarget(string linkPath) {
+      string fullLink = Path.GetFullPath(linkPath);
+      // OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS.
+      using (SafeFileHandle handle = CreateFile(fullLink, 0, 7, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero)) {
+        if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+        byte[] buffer = new byte[16384];
+        uint returned;
+        // FSCTL_GET_REPARSE_POINT: inspect the link itself without following it.
+        if (!DeviceIoControl(handle, 0x000900A8, IntPtr.Zero, 0, buffer, (uint)buffer.Length, out returned, IntPtr.Zero))
+          throw new Win32Exception(Marshal.GetLastWin32Error());
+        if (returned < 16) throw new IOException("Incomplete directory-link metadata.");
+        uint tag = BitConverter.ToUInt32(buffer, 0);
+        int end = 8 + BitConverter.ToUInt16(buffer, 4);
+        int pathStart;
+        bool relative = false;
+        if (tag == 0xA000000C) {
+          if (returned < 20) throw new IOException("Incomplete symbolic-link metadata.");
+          uint flags = BitConverter.ToUInt32(buffer, 16);
+          if ((flags & ~1U) != 0) throw new IOException("Unsupported symbolic-link flags.");
+          relative = (flags & 1) != 0;
+          pathStart = 20;
+        } else if (tag == 0xA0000003) {
+          pathStart = 16;
+        } else throw new IOException("The path is not a supported directory link.");
+        int offset = BitConverter.ToUInt16(buffer, 8);
+        int length = BitConverter.ToUInt16(buffer, 10);
+        if (end > returned || end < pathStart || length == 0 || (offset & 1) != 0 || (length & 1) != 0 || pathStart + offset + length > end)
+          throw new IOException("Invalid directory-link target metadata.");
+        string target = Encoding.Unicode.GetString(buffer, pathStart + offset, length);
+        if (target.IndexOf('\0') >= 0) throw new IOException("Invalid directory-link target.");
+        if (relative) {
+          if (Path.IsPathRooted(target)) throw new IOException("A relative link contains a rooted target.");
+          return Path.GetFullPath(Path.Combine(Path.GetDirectoryName(fullLink), target));
+        }
+        if (target.StartsWith(@"\??\UNC\", StringComparison.OrdinalIgnoreCase)) target = @"\\" + target.Substring(8);
+        else if (target.StartsWith(@"\??\", StringComparison.Ordinal)) target = target.Substring(4);
+        if (!Path.IsPathRooted(target)) throw new IOException("An absolute link contains a relative target.");
+        return Path.GetFullPath(target);
+      }
+    }
+  }
+}
+'@
+  }
+  return [DysonControl.DirectoryLinkReader]::ReadTarget($LinkPath)
+}

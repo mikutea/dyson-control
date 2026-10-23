@@ -7,6 +7,7 @@ $pathPolicyScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\windows\
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
 $gameUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
 $gameUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$fixtureLinks = @()
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw $Message }
@@ -220,12 +221,45 @@ try {
   }, $true)
   Assert-True ($null -ne $verificationFunction) 'Unable to locate task registration verification implementation.'
   Invoke-Expression $verificationFunction.Extent.Text
-  foreach ($functionName in @('Get-FullPath', 'Get-PlainDirectory', 'Get-PlainFile', 'Write-NewFile', 'Install-AtomicFile', 'Write-AtomicText', 'Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots')) {
+  foreach ($functionName in @('Get-FullPath', 'Get-PlainDirectory', 'Get-PlainFile', 'Write-NewFile', 'Install-AtomicFile', 'Write-AtomicText', 'Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots', 'Assert-ExactDirectoryLink')) {
     $functionAst = $verificationAst.Find({
       param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
     }, $true)
     Assert-True ($null -ne $functionAst) "Unable to locate $functionName implementation."
     Invoke-Expression $functionAst.Extent.Text
+  }
+  # Native creation permits a disposable dangling directory link: no SMB server
+  # or credentials are needed to exercise the Windows PowerShell 5.1 UNC bug.
+  Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class DysonFixtureDirectoryLink {
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+  private static extern bool CreateSymbolicLink(string link, string target, int flags);
+  public static void Create(string link, string target) {
+    if (!CreateSymbolicLink(link, target, 3) && !CreateSymbolicLink(link, target, 1))
+      throw new Win32Exception(Marshal.GetLastWin32Error());
+  }
+}
+'@
+  function Get-SmbGlobalMapping {
+    [pscustomobject]@{ LocalPath = 'R:'; RemotePath = '\\fixture-storage.example\server-data'; Status = 0 }
+  }
+  $uncLink = Join-Path $fixture 'unc-document-link'
+  $relativeUncLink = Join-Path $fixture 'relative-unc-document-link'
+  $uncTarget = '\\fixture-storage.example\server-data\userdata'
+  [DysonFixtureDirectoryLink]::Create($uncLink, $uncTarget)
+  $fixtureLinks += $uncLink
+  [DysonFixtureDirectoryLink]::Create($relativeUncLink, 'UNC\fixture-storage.example\server-data\userdata')
+  $fixtureLinks += $relativeUncLink
+  Assert-ExactDirectoryLink $uncLink $uncTarget 'SymbolicLink'
+  Assert-ExactDirectoryLink $uncLink 'R:\userdata' 'SymbolicLink'
+  foreach ($wrongLink in @($relativeUncLink, $uncLink)) {
+    $rejectedLink = $false
+    $wrongTarget = if ($wrongLink -ceq $relativeUncLink) { $uncTarget } else { '\\fixture-storage.example\server-data\other' }
+    try { Assert-ExactDirectoryLink $wrongLink $wrongTarget 'SymbolicLink' } catch { $rejectedLink = $true }
+    Assert-True $rejectedLink 'A relative UNC-looking link or wrong absolute target was accepted.'
   }
   $replacementSource = Join-Path $fixture 'replacement-source.bin'
   $replacementTarget = Join-Path $fixture 'replacement target.bin'
@@ -346,6 +380,7 @@ try {
   $junctionPath = Join-Path $junctionParent 'managed-link'
   New-Item -ItemType Directory -Path $junctionParent, $junctionTarget | Out-Null
   New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget | Out-Null
+  Assert-ExactDirectoryLink $junctionPath $junctionTarget 'Junction'
   $junctionChange = [pscustomobject]@{ label = 'junction fixture'; path = $junctionPath; rights = 'Modify'; inheritance = 'none' }
   $junctionSnapshot = New-AclSnapshot $junctionChange
   $junctionParentBefore = (Get-Acl -LiteralPath $junctionParent).Sddl
@@ -532,9 +567,10 @@ try {
   $gameUserProbeResult = Join-Path $fixture 'game-user-probe-result.json'
   $gameUserProbeSpecification = [ordered]@{
     expectedSid = $gameUserSid
+    pathPolicyScript = $pathPolicyScript
     directories = @([ordered]@{ label = 'fixture data'; path = $data; access = 'modify' })
     files = @([ordered]@{ label = 'fixture Bridge'; path = $sourceDll })
-    links = @()
+    links = @([ordered]@{ label = 'UNC document link'; path = $uncLink; target = $uncTarget; linkType = 'SymbolicLink' })
   }
   $encodedGameUserProbeSpecification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($gameUserProbeSpecification | ConvertTo-Json -Depth 6 -Compress)))
   [IO.File]::WriteAllText($gameUserProbeScript, $gameUserProbeSource, $utf8NoBom)
@@ -543,6 +579,12 @@ try {
   Assert-True ($LASTEXITCODE -eq 0) 'The disposable GameUser probe failed against fixture targets.'
   $gameUserProbeOutcome = Get-Content -LiteralPath $gameUserProbeResult -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True ([bool]$gameUserProbeOutcome.ok) 'The disposable GameUser probe did not report success.'
+  $gameUserProbeSpecification.links[0].path = $relativeUncLink
+  $encodedGameUserProbeSpecification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($gameUserProbeSpecification | ConvertTo-Json -Depth 6 -Compress)))
+  & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $gameUserProbeScript `
+    -ResultPath $gameUserProbeResult -EncodedSpecification $encodedGameUserProbeSpecification -ProbeId $gameUserProbeId
+  $rejectedProbe = Get-Content -LiteralPath $gameUserProbeResult -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-True (-not [bool]$rejectedProbe.ok -and [string]$rejectedProbe.error -like '*unexpected link target*') 'The GameUser probe accepted a relative UNC-looking target.'
   Assert-True (@(Get-ChildItem -LiteralPath $data -Force -Filter ".dyson-control-game-user-probe-$gameUserProbeId").Count -eq 0) 'The disposable GameUser probe left its directory behind.'
 
   foreach ($forbidden in @('New-SmbGlobalMapping', 'New-PSDrive', 'cmdkey.exe', 'PSCredential', 'AutoAdminLogon', 'DefaultPassword', 'LsaStorePrivateData', '-LogonType Password')) {
@@ -552,6 +594,12 @@ try {
   'CONFIGURE_GAME_FIXTURE_OK'
 }
 finally {
+  foreach ($link in $fixtureLinks) {
+    $absoluteLink = [IO.Path]::GetFullPath($link)
+    if (-not $absoluteLink.StartsWith(([IO.Path]::GetFullPath($fixture) + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture link cleanup escaped the temporary root.' }
+    $linkItem = Get-Item -LiteralPath $absoluteLink -Force -ErrorAction SilentlyContinue
+    if ($linkItem -and ($linkItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { [IO.Directory]::Delete($absoluteLink, $false) }
+  }
   if (Test-Path -LiteralPath $fixture) {
     $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     & (Join-Path $env:SystemRoot 'System32\icacls.exe') $fixture '/grant:r' "*$sid`:(F)" '/T' '/C' | Out-Null

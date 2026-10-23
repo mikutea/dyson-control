@@ -17,6 +17,8 @@
 
 `game.root`、`game.saveDirectory`、`game.backupDirectory` 和 `game.logFile` 可使用上述全局映射。SQLite 队列所在的 `dataDirectory`、`game.bridgeDirectory`、`game.bridgeSecretFile`、受管 `start-game.ps1`、配套 `path-policy.ps1`、`dataDirectory\game-startup\settings.json` 和 `dataDirectory\save-restore` 必须位于本机 NTFS，因此无需为了接入面板迁移游戏或存档。
 
+文档目录链接的目标从 Windows 原始 reparse 记录读取，并区分绝对 UNC 链接与相对链接。管理员接入和 GameUser 探测使用同一读取方法，避免 Windows PowerShell 5.1 的 `Target` 显示差异造成误判；实际指向其他目录的链接仍会被拒绝。
+
 `-PrepareOnly` 的 `plan.json` 会列明路径边界、解析后的账户/SID、任务的 `Interactive`/`Limited` 主体以及逐路径 ACL 变更，但不会注册任务或修改 ACL。应用模式先保留所有待改路径的原始 SDDL，再运行两个随机命名、无触发器的一次性探测任务：SYSTEM 探测保留面板侧的 create/write/read/rename/delete 与读取能力；GameUser 探测要求该用户的现有交互式会话实际运行、确认同一 SID 与同一 SessionId 中存在正在运行的 `steam.exe`，并验证游戏目录、用户数据、日志和 Bridge 控制目录的写入读回，以及 secret、startup settings、存档恢复状态、受管脚本和文档链接的读取或元数据访问。探测文件、目录和任务随后精确删除。GameUser 探测不运行、Steam 所有者或 SessionId 不匹配、访问失败或清理失败都会终止应用；失败时恢复原 SDDL，并撤销本次创建的文档链接和空目录。
 
 脚本仅为已解析的 GameUser SID 增加运行所需权限：游戏目录、用户数据根目录、日志父目录和 Bridge 控制目录为继承到子项的 `Modify`；独立的 `game-startup` 与 `save-restore` 子目录为继承到子项的 `ReadAndExecute`，使控制器在同目录原子替换后产生的新状态文件仍可读取；Bridge secret 与 startup settings 文件另有直接 `Read`；受管脚本为 `ReadAndExecute`；本机数据目录、secret 父目录、文档根与脚本目录只增加直接遍历/读取；受管 `Dyson Sphere Program` junction 或符号链接本身增加直接 `Modify`。文档链接由管理员在应用阶段创建或验证，目标保持为配置指定的用户数据边界。脚本不会授予 GameUser 控制队列、备份证据或管理员凭据的宽泛访问。

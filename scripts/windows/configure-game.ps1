@@ -600,10 +600,7 @@ function Assert-ExactDirectoryLink([string]$LinkPath, [string]$ExpectedTarget, [
       -not ([string]$item.LinkType).Equals($ExpectedLinkType, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Managed game-data path is not the required $ExpectedLinkType directory link: $LinkPath"
   }
-  $targets = @($item.Target)
-  if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) { throw "Managed game-data link target is invalid: $LinkPath" }
-  $target = [string]$targets[0]
-  if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path -Parent $LinkPath) $target }
+  $target = Get-DysonDirectoryLinkTarget $LinkPath
   if (-not (Test-DysonPathEquals $target $ExpectedTarget)) {
     throw "Managed game-data link points to '$target', but '$ExpectedTarget' is required."
   }
@@ -725,7 +722,7 @@ function Invoke-GameUserPathProbe(
   $resultPath = Join-Path $probeRoot 'result.json'
   $specification = [ordered]@{
     expectedSid = $ResolvedGameUser.Sid; requireSteam = $true; directories = @($DirectoryTargets)
-    files = @($FileTargets); links = @($LinkTargets)
+    files = @($FileTargets); links = @($LinkTargets); pathPolicyScript = $pathPolicyScript
   }
   $encodedSpecification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($specification | ConvertTo-Json -Depth 7 -Compress)))
   $gameUserProbeSource = @'
@@ -747,6 +744,7 @@ try {
   $specification = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedSpecification)) | ConvertFrom-Json
   $actualSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
   if ($actualSid -cne [string]$specification.expectedSid) { throw "Probe ran as unexpected SID: $actualSid" }
+  . ([string]$specification.pathPolicyScript)
   if ([bool]$specification.requireSteam) {
     $ownedSteam = $false
     $currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
@@ -792,10 +790,7 @@ try {
         -not ([string]$item.LinkType).Equals([string]$target.linkType, [StringComparison]::OrdinalIgnoreCase)) {
       throw "Probe found an invalid managed game-data link: $link"
     }
-    $targets = @($item.Target)
-    if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) { throw "Probe found an invalid link target: $link" }
-    $actualTarget = [string]$targets[0]
-    if (-not [IO.Path]::IsPathRooted($actualTarget)) { $actualTarget = Join-Path (Split-Path -Parent $link) $actualTarget }
+    $actualTarget = Get-DysonDirectoryLinkTarget $link
     if (-not ([IO.Path]::GetFullPath($actualTarget)).Equals([IO.Path]::GetFullPath([string]$target.target), [StringComparison]::OrdinalIgnoreCase)) {
       throw "Probe found an unexpected link target: $link"
     }
