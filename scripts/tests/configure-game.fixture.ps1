@@ -220,12 +220,28 @@ try {
   }, $true)
   Assert-True ($null -ne $verificationFunction) 'Unable to locate task registration verification implementation.'
   Invoke-Expression $verificationFunction.Extent.Text
-  foreach ($functionName in @('Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Restore-AclSnapshots')) {
+  foreach ($functionName in @('Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots')) {
     $functionAst = $verificationAst.Find({
       param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
     }, $true)
     Assert-True ($null -ne $functionAst) "Unable to locate $functionName implementation."
     Invoke-Expression $functionAst.Extent.Text
+  }
+  $legacySddl = 'O:SYG:BAD:(A;OICI;FR;;;SY)(A;;FR;;;BA)'
+  $autoInheritedSddl = 'O:SYG:BAD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)'
+  Assert-True ((Get-AclComparisonSddl $legacySddl) -ceq (Get-AclComparisonSddl $autoInheritedSddl)) 'ACL comparison rejected the Windows automatic-inheritance marker.'
+  foreach ($changedSddl in @(
+    'O:SYG:BAD:PAI(A;OICI;FR;;;SY)(A;;FR;;;BA)',
+    'O:SYG:BAD:AI(A;OICI;FW;;;SY)(A;;FR;;;BA)',
+    'O:SYG:BAD:AI(D;OICI;FR;;;SY)(A;;FR;;;BA)',
+    'O:SYG:BAD:AI(A;OICIID;FR;;;SY)(A;;FR;;;BA)',
+    'O:SYG:BAD:AI(A;OICIIO;FR;;;SY)(A;;FR;;;BA)',
+    'O:BAG:BAD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)',
+    'O:SYG:SYD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)',
+    'O:SYG:BAD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)(A;;FR;;;WD)',
+    'O:SYG:BAD:AI(A;;FR;;;BA)(A;OICI;FR;;;SY)'
+  )) {
+    Assert-True ((Get-AclComparisonSddl $legacySddl) -cne (Get-AclComparisonSddl $changedSddl)) 'ACL comparison ignored a changed permission, identity, inheritance rule or ACE order.'
   }
   $aclFixture = Join-Path $fixture 'acl-fixture'
   New-Item -ItemType Directory -Path $aclFixture | Out-Null
@@ -237,7 +253,7 @@ try {
   })
   Assert-True ($aclRules.Count -ge 1) 'GameUser ACL helper did not add a direct Allow rule.'
   Restore-AclSnapshots @($aclSnapshot)
-  Assert-True ((Get-Acl -LiteralPath $aclFixture).Sddl -ceq [string]$aclSnapshot.sddl) 'ACL helper did not restore the original SDDL.'
+  Assert-True ((Get-AclComparisonSddl (Get-Acl -LiteralPath $aclFixture).Sddl) -ceq (Get-AclComparisonSddl ([string]$aclSnapshot.sddl))) 'ACL helper did not restore the original permissions and identities.'
 
   $protectedFixture = Join-Path $fixture 'protected-secret-fixture'
   [IO.File]::WriteAllText($protectedFixture, 'sensitive', $utf8NoBom)
@@ -271,7 +287,7 @@ try {
   foreach ($rule in $gameUserRules) { $gameUserRights = $gameUserRights -bor $rule.FileSystemRights }
   Assert-True (($gameUserRights -band [Security.AccessControl.FileSystemRights]::Read) -eq [Security.AccessControl.FileSystemRights]::Read) 'Protected helper did not allow the scoped GameUser read grant.'
   Restore-AclSnapshots @($protectedSnapshot)
-  Assert-True ((Get-Acl -LiteralPath $protectedFixture).Sddl -ceq [string]$protectedSnapshot.sddl) 'Protected helper ACL did not roll back to the original SDDL.'
+  Assert-True ((Get-AclComparisonSddl (Get-Acl -LiteralPath $protectedFixture).Sddl) -ceq (Get-AclComparisonSddl ([string]$protectedSnapshot.sddl))) 'Protected helper ACL did not roll back to the original permissions and identities.'
 
   $junctionParent = Join-Path $fixture 'junction-parent'
   $junctionTarget = Join-Path $fixture 'junction-target'
@@ -286,7 +302,7 @@ try {
   Assert-True ((Get-Acl -LiteralPath $junctionParent).Sddl -ceq $junctionParentBefore) 'Junction ACL grant changed the parent ACL.'
   Assert-True ((Get-Acl -LiteralPath $junctionTarget).Sddl -ceq $junctionTargetBefore) 'Junction ACL grant changed the target ACL.'
   Restore-AclSnapshots @($junctionSnapshot)
-  Assert-True ((Get-Acl -LiteralPath $junctionPath).Sddl -ceq [string]$junctionSnapshot.sddl) 'Junction ACL helper did not restore the link SDDL.'
+  Assert-True ((Get-AclComparisonSddl (Get-Acl -LiteralPath $junctionPath).Sddl) -ceq (Get-AclComparisonSddl ([string]$junctionSnapshot.sddl))) 'Junction ACL helper did not restore the link permissions and identities.'
   Assert-True ((Get-Acl -LiteralPath $junctionTarget).Sddl -ceq $junctionTargetBefore) 'Junction ACL rollback changed the target ACL.'
 
   $usersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')

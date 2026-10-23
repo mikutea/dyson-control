@@ -680,6 +680,14 @@ function Grant-GameUserAccess([object]$Change, [string]$Sid) {
   if (($allowed -band $rights) -ne $rights) { throw "$($Change.label) did not retain the required GameUser access: $($Change.path)" }
 }
 
+function Get-AclComparisonSddl([string]$Sddl) {
+  $descriptor = [Security.AccessControl.RawSecurityDescriptor]::new($Sddl)
+  # Windows may set AI when applying a legacy DACL. It records automatic
+  # propagation, not an access rule; retain every other flag, ACE and identity.
+  $descriptor.SetFlags($descriptor.ControlFlags -band (-bnot [Security.AccessControl.ControlFlags]::DiscretionaryAclAutoInherited))
+  return $descriptor.GetSddlForm([Security.AccessControl.AccessControlSections]::All)
+}
+
 function Restore-AclSnapshots([object[]]$Snapshots) {
   $ordered = @($Snapshots | Where-Object { [bool]$_.existed })
   [array]::Reverse($ordered)
@@ -694,7 +702,8 @@ function Restore-AclSnapshots([object[]]$Snapshots) {
     else { $item.SetAccessControl($acl) }
   }
   foreach ($snapshot in @($Snapshots | Where-Object { [bool]$_.existed })) {
-    if ((Get-Acl -LiteralPath $snapshot.path -ErrorAction Stop).Sddl -cne [string]$snapshot.sddl) {
+    $actualSddl = (Get-Acl -LiteralPath $snapshot.path -ErrorAction Stop).Sddl
+    if ((Get-AclComparisonSddl $actualSddl) -cne (Get-AclComparisonSddl ([string]$snapshot.sddl))) {
       throw "ACL rollback verification failed: $($snapshot.path)"
     }
   }
