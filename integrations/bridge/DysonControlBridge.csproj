@@ -10,6 +10,9 @@
     <FileVersion>0.1.3.0</FileVersion>
     <InformationalVersion>0.1.3</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+    <!-- Release bundles do not ship symbols; avoid embedding the builder's absolute PDB path. -->
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugSymbols Condition="'$(Configuration)' == 'Release'">false</DebugSymbols>
     <DysonServerRoot Condition="'$(DysonServerRoot)' == ''">$(MSBuildThisFileDirectory)..\..\..\server</DysonServerRoot>
   </PropertyGroup>
   <ItemGroup>

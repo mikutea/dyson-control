@@ -14,6 +14,10 @@ $parameters = New-Object Mono.Cecil.ReaderParameters
 $parameters.AssemblyResolver = $resolver
 $assembly = [Mono.Cecil.AssemblyDefinition]::ReadAssembly([IO.Path]::GetFullPath($BridgeDll), $parameters)
 try {
+    if ($assembly.MainModule.HasDebugHeader) {
+        $codeView = @($assembly.MainModule.GetDebugHeader().Entries | Where-Object { [string]$_.Directory.Type -ceq 'CodeView' })
+        if ($codeView.Count -gt 0) { throw 'The release Bridge must not embed a CodeView PDB path; release bundles do not distribute symbols.' }
+    }
     $plugin = @($assembly.MainModule.Types | Where-Object { $_.FullName -ceq 'DysonControl.Bridge.DysonControlBridgePlugin' })
     if ($plugin.Count -ne 1) { throw 'Expected the compiled Bridge plugin type.' }
     $dependencies = @($plugin[0].CustomAttributes | Where-Object { $_.AttributeType.FullName -ceq 'BepInEx.BepInDependency' })
@@ -28,6 +32,6 @@ try {
         $_.InterfaceType.FullName -in @('NebulaAPI.Interfaces.IMultiplayerMod', 'NebulaAPI.Interfaces.IMultiplayerModWithSettings')
     }).Count -gt 0
     if ($requiresClient) { throw 'The server-only Bridge must not require client installation during the Nebula handshake.' }
-    Write-Output 'PASS: compiled Bridge retains Nebula load order and is excluded from client mod parity checks.'
+    Write-Output 'PASS: compiled Bridge has no PDB path, retains Nebula load order, and is excluded from client mod parity checks.'
 }
 finally { $assembly.Dispose(); $resolver.Dispose() }
