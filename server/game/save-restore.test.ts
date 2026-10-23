@@ -16,10 +16,10 @@ async function fixture(beforeModdsv: string | null, afterModdsv: string | null) 
   const saveDirectory = path.join(root, 'saves')
   const dataDirectory = path.join(root, 'data')
   const sourceDirectory = path.join(root, 'source')
-  const startupSettingsPath = path.join(dataDirectory, 'game-startup.json')
+  const startupSettingsPath = path.join(dataDirectory, 'game-startup', 'settings.json')
   await Promise.all([
     fs.mkdir(saveDirectory, { recursive: true }),
-    fs.mkdir(dataDirectory, { recursive: true }),
+    fs.mkdir(path.dirname(startupSettingsPath), { recursive: true }),
     fs.mkdir(sourceDirectory, { recursive: true })
   ])
   const before = { dsv: 'before-dsv', server: 'before-server', moddsv: beforeModdsv }

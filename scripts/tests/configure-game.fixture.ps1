@@ -2,8 +2,11 @@ $ErrorActionPreference = 'Stop'
 $temporaryRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) { $env:TEMP } else { $env:RUNNER_TEMP }
 $fixture = Join-Path $temporaryRoot ('dyson-control-configure-game-' + [guid]::NewGuid().ToString('N'))
 $script = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\windows\configure-game.ps1'))
+$startScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\windows\start-game.ps1'))
 $pathPolicyScript = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\windows\path-policy.ps1'))
 $utf8NoBom = [Text.UTF8Encoding]::new($false)
+$gameUserName = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+$gameUserSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 
 function Assert-True([bool]$Condition, [string]$Message) {
   if (-not $Condition) { throw $Message }
@@ -20,7 +23,8 @@ function Get-TaskOption([string[]]$Contents, [string]$Name) {
 
 function Invoke-Prepare([string]$ConfigPath, [string]$BuildPath, [string]$Hash, [string]$OutputPath) {
   $raw = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script `
-    -ConfigPath $ConfigPath -BridgeBuildDirectory $BuildPath -BridgeSha256 $Hash -PrepareOnly -OutputDirectory $OutputPath
+    -ConfigPath $ConfigPath -BridgeBuildDirectory $BuildPath -BridgeSha256 $Hash -GameUser $gameUserName `
+    -PrepareOnly -OutputDirectory $OutputPath
   if ($LASTEXITCODE -ne 0) { throw "configure-game.ps1 prepare fixture exited with $LASTEXITCODE." }
   $summary = ($raw -join "`n") | ConvertFrom-Json
   Assert-True ([bool]$summary.prepared) 'Prepare summary did not report success.'
@@ -69,7 +73,7 @@ try {
   $previousErrorPreference = $ErrorActionPreference
   $ErrorActionPreference = 'Continue'
   $guardOutput = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script `
-    -ConfigPath $configPath -BridgeBuildDirectory $build -BridgeSha256 $sourceHash 2>&1
+    -ConfigPath $configPath -BridgeBuildDirectory $build -BridgeSha256 $sourceHash -GameUser $gameUserName 2>&1
   $guardExitCode = $LASTEXITCODE
   $ErrorActionPreference = $previousErrorPreference
   Assert-True ($guardExitCode -ne 0) 'Apply mode succeeded without ConfirmStopped.'
@@ -80,12 +84,24 @@ try {
   $wrongHashOutput = Join-Path $fixture 'wrong-hash-output'
   $ErrorActionPreference = 'Continue'
   $hashFailure = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script `
-    -ConfigPath $configPath -BridgeBuildDirectory $build -BridgeSha256 ('0' * 64) -PrepareOnly -OutputDirectory $wrongHashOutput 2>&1
+    -ConfigPath $configPath -BridgeBuildDirectory $build -BridgeSha256 ('0' * 64) -GameUser $gameUserName `
+    -PrepareOnly -OutputDirectory $wrongHashOutput 2>&1
   $hashExitCode = $LASTEXITCODE
   $ErrorActionPreference = $previousErrorPreference
   Assert-True ($hashExitCode -ne 0) 'Prepare mode accepted the wrong Bridge hash.'
   Assert-True (($hashFailure -join "`n") -like '*does not match BridgeSha256*') 'Wrong-hash guard returned the wrong failure.'
   Assert-True (-not (Test-Path -LiteralPath $wrongHashOutput)) 'Wrong-hash guard created prepare output.'
+
+  $invalidUserOutput = Join-Path $fixture 'invalid-user-output'
+  $ErrorActionPreference = 'Continue'
+  $userFailure = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $script `
+    -ConfigPath $configPath -BridgeBuildDirectory $build -BridgeSha256 $sourceHash `
+    -GameUser ('.\dyson-missing-' + [guid]::NewGuid().ToString('N')) -PrepareOnly -OutputDirectory $invalidUserOutput 2>&1
+  $userExitCode = $LASTEXITCODE
+  $ErrorActionPreference = $previousErrorPreference
+  Assert-True ($userExitCode -ne 0) 'Prepare mode accepted a nonexistent GameUser.'
+  Assert-True (($userFailure -join "`n") -like '*GameUser could not be resolved*') 'Invalid GameUser guard returned the wrong failure.'
+  Assert-True (-not (Test-Path -LiteralPath $invalidUserOutput)) 'Invalid GameUser guard created prepare output.'
 
   $firstOutput = Join-Path $fixture 'prepared-new-secret'
   $firstPlan = Invoke-Prepare $configPath $build $sourceHash $firstOutput
@@ -93,7 +109,8 @@ try {
   Assert-True ([string]$firstPlan.bridge.secretAction -ceq 'create') 'Missing secret did not produce a create action.'
   Assert-True ([string]$firstPlan.bridge.secretCandidate -ceq 'bridge-secret.new') 'Secret candidate was not recorded by file name.'
   Assert-True (-not (Test-Path -LiteralPath $secretFile)) 'Prepare mode created the target secret.'
-  Assert-True (-not (Test-Path -LiteralPath (Join-Path $data 'game-startup.json'))) 'Prepare mode created target startup settings.'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $data 'game-startup\settings.json'))) 'Prepare mode created target startup settings.'
+  Assert-True (-not (Test-Path -LiteralPath (Join-Path $data 'save-restore'))) 'Prepare mode created the target save-restore state directory.'
   Assert-True ([IO.File]::ReadAllText($targetDll, $utf8NoBom) -ceq 'old-dll-sentinel') 'Prepare mode replaced the target DLL.'
   Assert-True ([IO.File]::ReadAllText($targetConfig, $utf8NoBom) -ceq 'old-config-sentinel') 'Prepare mode replaced the target config.'
   Assert-True ([IO.File]::ReadAllText($saveSentinel, $utf8NoBom) -ceq 'save-must-not-move') 'Prepare mode changed the save fixture.'
@@ -120,15 +137,41 @@ try {
 
   Assert-True ([string]$firstPlan.task.name -ceq $taskName) 'Plan task name does not match control.config.'
   Assert-True ([string]$firstPlan.task.description -ceq 'DYSON_CONTROL_MANAGED_GAME_START_V1') 'Plan task ownership marker is wrong.'
-  Assert-True ([string]$firstPlan.task.account -ceq 'SYSTEM') 'Plan task account is not SYSTEM.'
+  Assert-True ([string]$firstPlan.task.account -ceq $gameUserName) 'Plan task account is not the explicit GameUser.'
+  Assert-True ([string]$firstPlan.task.sid -ceq $gameUserSid) 'Plan task SID is not the resolved GameUser SID.'
+  Assert-True ([string]$firstPlan.task.logonType -ceq 'Interactive') 'Plan task logon type is not Interactive.'
+  Assert-True ([string]$firstPlan.task.runLevel -ceq 'Limited') 'Plan task run level is not Limited.'
   Assert-True (-not [bool]$firstPlan.task.startImmediately) 'Plan would start the game immediately.'
+  Assert-True ([string]$firstPlan.access.principalAccount -ceq $gameUserName) 'Plan ACL principal account is wrong.'
+  Assert-True ([string]$firstPlan.access.principalSid -ceq $gameUserSid) 'Plan ACL principal SID is wrong.'
+  $plannedAccess = @{}
+  foreach ($change in @($firstPlan.access.changes)) { $plannedAccess[[string]$change.label] = $change }
+  foreach ($label in @('game.root', 'game user-data root', 'game.logFile parent', 'game.bridgeDirectory')) {
+    Assert-True ([string]$plannedAccess[$label].rights -ceq 'Modify') "Plan does not grant scoped Modify for $label."
+    Assert-True ([string]$plannedAccess[$label].inheritance -ceq 'children') "Plan does not propagate scoped Modify for $label."
+  }
+  foreach ($label in @('game.bridgeSecretFile', 'startup settings')) {
+    Assert-True ([string]$plannedAccess[$label].rights -ceq 'Read') "Plan does not grant scoped Read for $label."
+    Assert-True ([string]$plannedAccess[$label].inheritance -ceq 'none') "Plan unexpectedly propagates Read for $label."
+  }
+  foreach ($label in @('managed start script', 'managed path policy', 'managed scripts directory')) {
+    Assert-True ([string]$plannedAccess[$label].rights -ceq 'ReadAndExecute') "Plan does not grant scoped ReadAndExecute for $label."
+  }
+  Assert-True ([string]$plannedAccess['startup settings directory'].rights -ceq 'ReadAndExecute') 'Plan does not grant startup directory ReadAndExecute.'
+  Assert-True ([string]$plannedAccess['startup settings directory'].inheritance -ceq 'children') 'Plan does not propagate startup directory read access to atomic replacements.'
+  Assert-True ([string]$plannedAccess['save-restore state directory'].rights -ceq 'ReadAndExecute') 'Plan does not grant save-restore state directory ReadAndExecute.'
+  Assert-True ([string]$plannedAccess['save-restore state directory'].inheritance -ceq 'children') 'Plan does not propagate read access to save-restore state files.'
+  Assert-True ([string]$plannedAccess['managed game-data link'].rights -ceq 'Modify') 'Plan does not grant direct Modify on the managed game-data link.'
+  Assert-True ([string]$plannedAccess['managed game-data link'].inheritance -ceq 'none') 'Plan propagates the managed game-data link ACE.'
+  Assert-True ([string]$firstPlan.access.rollback -like '*original SDDL*restored on failure*') 'Plan does not state the ACL rollback contract.'
   Assert-True (@($firstPlan.pathPolicy.localNtfs) -contains 'dataDirectory') 'Plan does not keep dataDirectory on local NTFS.'
   Assert-True (@($firstPlan.pathPolicy.localNtfs) -contains 'game.bridgeSecretFile') 'Plan does not keep the Bridge secret on local NTFS.'
   Assert-True (@($firstPlan.pathPolicy.localNtfs) -contains 'managed path policy') 'Plan does not keep the managed path helper on local NTFS.'
+  Assert-True (@($firstPlan.pathPolicy.localNtfs) -contains 'save-restore state directory') 'Plan does not keep save-restore state on local NTFS.'
   Assert-True (@($firstPlan.pathPolicy.globalSmbEligible) -contains 'game.root') 'Plan does not identify game.root as global-SMB eligible.'
   Assert-True (@($firstPlan.pathPolicy.globalSmbEligible) -contains 'game.saveDirectory') 'Plan does not identify game.saveDirectory as global-SMB eligible.'
   Assert-True ([string]$firstPlan.pathPolicy.globalSmbRequirement -like '*Get-SmbGlobalMapping*no mapping or credentials*') 'Plan does not state the existing-global-mapping boundary.'
-  Assert-True ([string]$firstPlan.pathPolicy.applyProbe -like '*SYSTEM*create/write/read/rename/delete*') 'Plan does not state the apply-time SYSTEM probe.'
+  Assert-True ([string]$firstPlan.pathPolicy.applyProbe -like '*SYSTEM*Interactive GameUser*create/write/read/rename/delete*') 'Plan does not state both apply-time probes.'
   $parseErrors = $null
   $tokens = [Management.Automation.PSParser]::Tokenize([string]$firstPlan.task.arguments, [ref]$parseErrors)
   Assert-True ($null -eq $parseErrors -or $parseErrors.Count -eq 0) 'Task arguments do not parse.'
@@ -142,7 +185,7 @@ try {
   Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-File')).Equals([IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\windows\start-game.ps1')), [StringComparison]::OrdinalIgnoreCase)) 'Task does not use the managed start-game.ps1.'
   Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-GameRoot')).Equals($game, [StringComparison]::OrdinalIgnoreCase)) 'Task game root is wrong.'
   Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-SaveDirectory')).Equals($save, [StringComparison]::OrdinalIgnoreCase)) 'Task save directory is wrong.'
-  Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-SettingsPath')).Equals((Join-Path $data 'game-startup.json'), [StringComparison]::OrdinalIgnoreCase)) 'Task does not use the fixed dataDirectory startup settings path.'
+  Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-SettingsPath')).Equals((Join-Path $data 'game-startup\settings.json'), [StringComparison]::OrdinalIgnoreCase)) 'Task does not use the dedicated startup settings path.'
   Assert-True ([IO.Path]::GetFullPath((Get-TaskOption $contents '-LogFile')).Equals((Join-Path $game 'logs\server.log'), [StringComparison]::OrdinalIgnoreCase)) 'Task log file is wrong.'
 
   if (Get-Command Get-ScheduledTask -ErrorAction SilentlyContinue) {
@@ -177,6 +220,106 @@ try {
   }, $true)
   Assert-True ($null -ne $verificationFunction) 'Unable to locate task registration verification implementation.'
   Invoke-Expression $verificationFunction.Extent.Text
+  foreach ($functionName in @('Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Restore-AclSnapshots')) {
+    $functionAst = $verificationAst.Find({
+      param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
+    }, $true)
+    Assert-True ($null -ne $functionAst) "Unable to locate $functionName implementation."
+    Invoke-Expression $functionAst.Extent.Text
+  }
+  $aclFixture = Join-Path $fixture 'acl-fixture'
+  New-Item -ItemType Directory -Path $aclFixture | Out-Null
+  $aclChange = [pscustomobject]@{ label = 'ACL fixture'; path = $aclFixture; rights = 'ReadAndExecute'; inheritance = 'none' }
+  $aclSnapshot = New-AclSnapshot $aclChange
+  Grant-GameUserAccess $aclChange $gameUserSid
+  $aclRules = @((Get-Acl -LiteralPath $aclFixture).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object {
+    [string]$_.IdentityReference.Value -ceq $gameUserSid -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
+  })
+  Assert-True ($aclRules.Count -ge 1) 'GameUser ACL helper did not add a direct Allow rule.'
+  Restore-AclSnapshots @($aclSnapshot)
+  Assert-True ((Get-Acl -LiteralPath $aclFixture).Sddl -ceq [string]$aclSnapshot.sddl) 'ACL helper did not restore the original SDDL.'
+
+  $protectedFixture = Join-Path $fixture 'protected-secret-fixture'
+  [IO.File]::WriteAllText($protectedFixture, 'sensitive', $utf8NoBom)
+  $everyoneSid = [Security.Principal.SecurityIdentifier]::new('S-1-1-0')
+  $protectedAcl = Get-Acl -LiteralPath $protectedFixture
+  [void]$protectedAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $everyoneSid, [Security.AccessControl.FileSystemRights]::Read, [Security.AccessControl.AccessControlType]::Allow))
+  Set-Acl -LiteralPath $protectedFixture -AclObject $protectedAcl
+  $protectedChange = [pscustomobject]@{ label = 'protected secret fixture'; path = $protectedFixture; rights = 'Read'; inheritance = 'none' }
+  $protectedSnapshot = New-AclSnapshot $protectedChange
+  $protectedOwner = (Get-Acl -LiteralPath $protectedFixture).GetOwner([Security.Principal.SecurityIdentifier]).Value
+  Protect-SystemAdministratorsOnly $protectedFixture $false
+  $exactAcl = Get-Acl -LiteralPath $protectedFixture
+  Assert-True ([bool]$exactAcl.AreAccessRulesProtected) 'Protected helper did not disable ACL inheritance.'
+  Assert-True ($exactAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ceq $protectedOwner) 'Protected helper changed the file owner.'
+  $exactRules = @($exactAcl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+  Assert-True (@($exactRules | Where-Object { [string]$_.IdentityReference.Value -ceq 'S-1-1-0' }).Count -eq 0) 'Protected helper retained explicit Everyone access.'
+  foreach ($requiredSid in @('S-1-5-18', 'S-1-5-32-544')) {
+    $requiredRules = @($exactRules | Where-Object {
+      [string]$_.IdentityReference.Value -ceq $requiredSid -and
+      $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+      $_.FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl
+    })
+    Assert-True ($requiredRules.Count -eq 1) "Protected helper did not retain exact FullControl for $requiredSid."
+  }
+  Grant-GameUserAccess $protectedChange $gameUserSid
+  $gameUserRules = @((Get-Acl -LiteralPath $protectedFixture).GetAccessRules($true, $false, [Security.Principal.SecurityIdentifier]) | Where-Object {
+    [string]$_.IdentityReference.Value -ceq $gameUserSid -and $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
+  })
+  $gameUserRights = [Security.AccessControl.FileSystemRights]0
+  foreach ($rule in $gameUserRules) { $gameUserRights = $gameUserRights -bor $rule.FileSystemRights }
+  Assert-True (($gameUserRights -band [Security.AccessControl.FileSystemRights]::Read) -eq [Security.AccessControl.FileSystemRights]::Read) 'Protected helper did not allow the scoped GameUser read grant.'
+  Restore-AclSnapshots @($protectedSnapshot)
+  Assert-True ((Get-Acl -LiteralPath $protectedFixture).Sddl -ceq [string]$protectedSnapshot.sddl) 'Protected helper ACL did not roll back to the original SDDL.'
+
+  $junctionParent = Join-Path $fixture 'junction-parent'
+  $junctionTarget = Join-Path $fixture 'junction-target'
+  $junctionPath = Join-Path $junctionParent 'managed-link'
+  New-Item -ItemType Directory -Path $junctionParent, $junctionTarget | Out-Null
+  New-Item -ItemType Junction -Path $junctionPath -Target $junctionTarget | Out-Null
+  $junctionChange = [pscustomobject]@{ label = 'junction fixture'; path = $junctionPath; rights = 'Modify'; inheritance = 'none' }
+  $junctionSnapshot = New-AclSnapshot $junctionChange
+  $junctionParentBefore = (Get-Acl -LiteralPath $junctionParent).Sddl
+  $junctionTargetBefore = (Get-Acl -LiteralPath $junctionTarget).Sddl
+  Grant-GameUserAccess $junctionChange $gameUserSid
+  Assert-True ((Get-Acl -LiteralPath $junctionParent).Sddl -ceq $junctionParentBefore) 'Junction ACL grant changed the parent ACL.'
+  Assert-True ((Get-Acl -LiteralPath $junctionTarget).Sddl -ceq $junctionTargetBefore) 'Junction ACL grant changed the target ACL.'
+  Restore-AclSnapshots @($junctionSnapshot)
+  Assert-True ((Get-Acl -LiteralPath $junctionPath).Sddl -ceq [string]$junctionSnapshot.sddl) 'Junction ACL helper did not restore the link SDDL.'
+  Assert-True ((Get-Acl -LiteralPath $junctionTarget).Sddl -ceq $junctionTargetBefore) 'Junction ACL rollback changed the target ACL.'
+
+  $usersSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-545')
+  $currentSid = [Security.Principal.SecurityIdentifier]::new($gameUserSid)
+  $systemSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
+  $administratorsSid = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+  $directoryInheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+  $atomicDirectory = Join-Path $fixture 'startup-atomic-inheritance'
+  New-Item -ItemType Directory -Path $atomicDirectory | Out-Null
+  $atomicDirectoryAcl = Get-Acl -LiteralPath $atomicDirectory
+  $atomicDirectoryAcl.SetAccessRuleProtection($true, $false)
+  foreach ($identity in @($systemSid, $administratorsSid, $currentSid)) {
+    [void]$atomicDirectoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+      $identity, [Security.AccessControl.FileSystemRights]::FullControl, $directoryInheritance,
+      [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+  }
+  [void]$atomicDirectoryAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+    $usersSid, [Security.AccessControl.FileSystemRights]::ReadAndExecute, $directoryInheritance,
+    [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+  Set-Acl -LiteralPath $atomicDirectory -AclObject $atomicDirectoryAcl
+  $atomicTarget = Join-Path $atomicDirectory 'settings.json'
+  $atomicTemporary = Join-Path $atomicDirectory 'settings.json.partial-fixture'
+  $atomicBackup = Join-Path $atomicDirectory 'settings.json.backup-fixture'
+  [IO.File]::WriteAllText($atomicTarget, '{"schema":1}', $utf8NoBom)
+  [IO.File]::WriteAllText($atomicTemporary, '{"schema":2}', $utf8NoBom)
+  [IO.File]::Replace($atomicTemporary, $atomicTarget, $atomicBackup, $true)
+  $inheritedUsersRules = @((Get-Acl -LiteralPath $atomicTarget).GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]) | Where-Object {
+    [string]$_.IdentityReference.Value -ceq 'S-1-5-32-545' -and [bool]$_.IsInherited -and
+    $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow
+  })
+  $inheritedUsersRights = [Security.AccessControl.FileSystemRights]0
+  foreach ($rule in $inheritedUsersRules) { $inheritedUsersRights = $inheritedUsersRights -bor $rule.FileSystemRights }
+  Assert-True (($inheritedUsersRights -band [Security.AccessControl.FileSystemRights]::Read) -eq [Security.AccessControl.FileSystemRights]::Read) 'Same-directory atomic replacement did not inherit read access from the dedicated startup directory.'
   $expectedExecute = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
   $expectedArguments = '-NoProfile -File "fixture.ps1"'
   $expectedWorkingDirectory = $game
@@ -185,7 +328,7 @@ try {
   }
   $validTask = [pscustomobject]@{
     Description = 'DYSON_CONTROL_MANAGED_GAME_START_V1'; State = 'Ready'; Triggers = $null
-    Actions = @($expectedAction); Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
+    Actions = @($expectedAction); Principal = [pscustomobject]@{ UserId = $gameUserName; LogonType = 'Interactive'; RunLevel = 'Limited' }
   }
   $transientState = @{ calls = 0 }
   $transientEvidence = Join-Path $fixture 'task-registration-transient.json'
@@ -194,13 +337,13 @@ try {
     if ($transientState.calls -eq 1) {
       return [pscustomobject]@{
         Description = 'DYSON_CONTROL_MANAGED_GAME_START_V1'; State = 'Ready'; Triggers = $null
-        Actions = $null; Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
+        Actions = $null; Principal = [pscustomobject]@{ UserId = $gameUserName; LogonType = 'Interactive'; RunLevel = 'Limited' }
       }
     }
     return $validTask
-  } 'DYSON_CONTROL_MANAGED_GAME_START_V1' $expectedExecute $expectedArguments $expectedWorkingDirectory `
+  } 'DYSON_CONTROL_MANAGED_GAME_START_V1' $expectedExecute $expectedArguments $expectedWorkingDirectory 'Interactive' 'Limited' `
     { param($actual, $expected) [string]$actual -ceq [string]$expected } `
-    { param($principal) [string]$principal -ceq 'SYSTEM' } $transientEvidence 3 0
+    { param($principal) [string]$principal -ceq $gameUserName } $transientEvidence 3 0
   Assert-True ($verifiedTask -eq $validTask) 'Transient task registration visibility did not return the complete task.'
   Assert-True ($transientState.calls -eq 2) 'Transient task registration visibility was not retried exactly once.'
   $transientRecord = Get-Content -LiteralPath $transientEvidence -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -216,16 +359,16 @@ try {
   }
   $mismatchedTask = [pscustomobject]@{
     Description = 'DYSON_CONTROL_MANAGED_GAME_START_V1'; State = 'Ready'; Triggers = $null
-    Actions = @($mismatchedAction); Principal = [pscustomobject]@{ UserId = 'SYSTEM' }
+    Actions = @($mismatchedAction); Principal = [pscustomobject]@{ UserId = $gameUserName; LogonType = 'Interactive'; RunLevel = 'Limited' }
   }
   $mismatchFailed = $false
   try {
     [void](Wait-ExactTaskRegistration {
       $mismatchState.calls++
       return $mismatchedTask
-    } 'DYSON_CONTROL_MANAGED_GAME_START_V1' $expectedExecute $expectedArguments $expectedWorkingDirectory `
+    } 'DYSON_CONTROL_MANAGED_GAME_START_V1' $expectedExecute $expectedArguments $expectedWorkingDirectory 'Interactive' 'Limited' `
       { param($actual, $expected) [string]$actual -ceq [string]$expected } `
-      { param($principal) [string]$principal -ceq 'SYSTEM' } $mismatchEvidence 3 0)
+      { param($principal) [string]$principal -ceq $gameUserName } $mismatchEvidence 3 0)
   }
   catch {
     $mismatchFailed = $_.Exception.Message -like '*failed post-registration verification*'
@@ -235,6 +378,23 @@ try {
   $mismatchRecord = Get-Content -LiteralPath $mismatchEvidence -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True (@($mismatchRecord.observations).Count -eq 1) 'Mismatch evidence did not retain the first observation.'
   Assert-True (-not [bool]$mismatchRecord.observations[0].argumentsMatch) 'Mismatch evidence did not record the argument failure.'
+
+  $principalEvidence = Join-Path $fixture 'task-registration-principal-mismatch.json'
+  $wrongPrincipalTask = [pscustomobject]@{
+    Description = 'DYSON_CONTROL_MANAGED_GAME_START_V1'; State = 'Ready'; Triggers = $null
+    Actions = @($expectedAction); Principal = [pscustomobject]@{ UserId = $gameUserName; LogonType = 'Interactive'; RunLevel = 'Highest' }
+  }
+  $principalFailed = $false
+  try {
+    [void](Wait-ExactTaskRegistration { return $wrongPrincipalTask } `
+      'DYSON_CONTROL_MANAGED_GAME_START_V1' $expectedExecute $expectedArguments $expectedWorkingDirectory 'Interactive' 'Limited' `
+      { param($actual, $expected) [string]$actual -ceq [string]$expected } `
+      { param($principal) [string]$principal -ceq $gameUserName } $principalEvidence 1 0)
+  }
+  catch { $principalFailed = $_.Exception.Message -like '*failed post-registration verification*' }
+  Assert-True $principalFailed 'Task verification accepted the wrong RunLevel.'
+  $principalRecord = Get-Content -LiteralPath $principalEvidence -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-True ([string]$principalRecord.observations[0].runLevel -ceq 'mismatch') 'Task evidence did not record the RunLevel mismatch.'
 
   $implementation = [IO.File]::ReadAllText($script, $utf8NoBom) + [IO.File]::ReadAllText($pathPolicyScript, $utf8NoBom)
   $probeMatch = [regex]::Match($implementation, "(?ms)\`$probeSource = @'\r?\n(.*?)\r?\n'@")
@@ -259,7 +419,65 @@ try {
   $probeOutcome = Get-Content -LiteralPath $probeResult -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True ([bool]$probeOutcome.ok) 'The disposable path probe did not report success.'
   Assert-True (@(Get-ChildItem -LiteralPath $data -Force -Filter ".dyson-control-system-probe-$probeId").Count -eq 0) 'The disposable path probe left its directory behind.'
-  foreach ($forbidden in @('New-SmbGlobalMapping', 'New-PSDrive', 'cmdkey.exe', 'PSCredential')) {
+
+  $gameUserProbeMatch = [regex]::Match($implementation, "(?ms)\`$gameUserProbeSource = @'\r?\n(.*?)\r?\n'@")
+  Assert-True $gameUserProbeMatch.Success 'Unable to locate the disposable GameUser probe implementation.'
+  $gameUserProbeSource = $gameUserProbeMatch.Groups[1].Value
+  $gameUserProbeTokens = $null
+  $gameUserProbeErrors = $null
+  $gameUserProbeAst = [Management.Automation.Language.Parser]::ParseInput($gameUserProbeSource, [ref]$gameUserProbeTokens, [ref]$gameUserProbeErrors)
+  Assert-True ($null -eq $gameUserProbeErrors -or $gameUserProbeErrors.Count -eq 0) 'The disposable GameUser probe script does not parse.'
+
+  $startTokens = $null
+  $startErrors = $null
+  $startAst = [Management.Automation.Language.Parser]::ParseFile($startScript, [ref]$startTokens, [ref]$startErrors)
+  Assert-True ($null -eq $startErrors -or $startErrors.Count -eq 0) 'start-game.ps1 does not parse.'
+  $accountSeparator = $gameUserName.IndexOf('\')
+  Assert-True ($accountSeparator -gt 0 -and $accountSeparator -lt ($gameUserName.Length - 1)) 'Current Windows account is not domain-qualified.'
+  $script:fixtureOwnerDomain = $gameUserName.Substring(0, $accountSeparator)
+  $script:fixtureOwnerUser = $gameUserName.Substring($accountSeparator + 1)
+  function Invoke-CimMethod {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][object]$InputObject, [Parameter(Mandatory = $true)][string]$MethodName)
+    [pscustomobject]@{ ReturnValue = 0; Domain = $script:fixtureOwnerDomain; User = $script:fixtureOwnerUser }
+  }
+  try {
+    foreach ($entry in @(
+      [pscustomobject]@{ label = 'GameUser probe'; ast = $gameUserProbeAst },
+      [pscustomobject]@{ label = 'managed start'; ast = $startAst }
+    )) {
+      $steamMatchFunction = $entry.ast.Find({
+        param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Test-SteamProcessOwnerAndSession'
+      }, $true)
+      Assert-True ($null -ne $steamMatchFunction) "$($entry.label) does not define the Steam owner/session check."
+      Invoke-Expression $steamMatchFunction.Extent.Text
+      $matchingSession = [pscustomobject]@{ SessionId = 17 }
+      $differentSession = [pscustomobject]@{ SessionId = 18 }
+      Assert-True (Test-SteamProcessOwnerAndSession $matchingSession $gameUserSid 17) "$($entry.label) rejected matching Steam owner SID and SessionId."
+      Assert-True (-not (Test-SteamProcessOwnerAndSession $differentSession $gameUserSid 17)) "$($entry.label) accepted same-owner Steam from another SessionId."
+    }
+  }
+  finally { Remove-Item Function:\Invoke-CimMethod -ErrorAction SilentlyContinue }
+
+  $gameUserProbeId = [guid]::NewGuid().ToString('N')
+  $gameUserProbeScript = Join-Path $fixture 'game-user-probe-runtime.ps1'
+  $gameUserProbeResult = Join-Path $fixture 'game-user-probe-result.json'
+  $gameUserProbeSpecification = [ordered]@{
+    expectedSid = $gameUserSid
+    directories = @([ordered]@{ label = 'fixture data'; path = $data; access = 'modify' })
+    files = @([ordered]@{ label = 'fixture Bridge'; path = $sourceDll })
+    links = @()
+  }
+  $encodedGameUserProbeSpecification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($gameUserProbeSpecification | ConvertTo-Json -Depth 6 -Compress)))
+  [IO.File]::WriteAllText($gameUserProbeScript, $gameUserProbeSource, $utf8NoBom)
+  & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $gameUserProbeScript `
+    -ResultPath $gameUserProbeResult -EncodedSpecification $encodedGameUserProbeSpecification -ProbeId $gameUserProbeId
+  Assert-True ($LASTEXITCODE -eq 0) 'The disposable GameUser probe failed against fixture targets.'
+  $gameUserProbeOutcome = Get-Content -LiteralPath $gameUserProbeResult -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-True ([bool]$gameUserProbeOutcome.ok) 'The disposable GameUser probe did not report success.'
+  Assert-True (@(Get-ChildItem -LiteralPath $data -Force -Filter ".dyson-control-game-user-probe-$gameUserProbeId").Count -eq 0) 'The disposable GameUser probe left its directory behind.'
+
+  foreach ($forbidden in @('New-SmbGlobalMapping', 'New-PSDrive', 'cmdkey.exe', 'PSCredential', 'AutoAdminLogon', 'DefaultPassword', 'LsaStorePrivateData', '-LogonType Password')) {
     Assert-True (-not $implementation.Contains($forbidden)) "Path support contains forbidden mapping or credential operation: $forbidden"
   }
 

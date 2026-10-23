@@ -16,6 +16,17 @@ $logPath = [IO.Path]::GetFullPath($LogFile)
 $gameExe = [IO.Path]::GetFullPath((Join-Path $gameRootPath 'DSPGAME.exe'))
 $canonicalGameExe = ConvertTo-DysonCanonicalPath $gameExe
 
+function Test-SteamProcessOwnerAndSession([object]$Process, [string]$ExpectedSid, [int]$ExpectedSessionId) {
+  if ([int]$Process.SessionId -ne $ExpectedSessionId) { return $false }
+  try {
+    $owner = Invoke-CimMethod -InputObject $Process -MethodName GetOwner -ErrorAction Stop
+    if ([int]$owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$owner.User)) { return $false }
+    $account = [Security.Principal.NTAccount]::new(([string]$owner.Domain + '\' + [string]$owner.User))
+    return $account.Translate([Security.Principal.SecurityIdentifier]).Value -ceq $ExpectedSid
+  }
+  catch { return $false }
+}
+
 foreach ($requiredFile in @($gameExe, $settingsFile)) {
   $item = Get-Item -LiteralPath $requiredFile -Force -ErrorAction Stop
   if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Required plain file is invalid: $requiredFile" }
@@ -23,11 +34,19 @@ foreach ($requiredFile in @($gameExe, $settingsFile)) {
 $saveDirectoryItem = Get-Item -LiteralPath $saveDirectoryPath -Force -ErrorAction Stop
 if (-not $saveDirectoryItem.PSIsContainer -or ($saveDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Save directory is invalid: $saveDirectoryPath" }
 
-$dataDirectoryPath = [IO.Path]::GetFullPath((Split-Path -Parent $settingsFile))
+$startupDirectoryPath = [IO.Path]::GetFullPath((Split-Path -Parent $settingsFile))
+if ([IO.Path]::GetFileName($settingsFile) -cne 'settings.json' -or
+    [IO.Path]::GetFileName($startupDirectoryPath) -cne 'game-startup') {
+  throw 'SettingsPath must be the managed dataDirectory\game-startup\settings.json file.'
+}
+$dataDirectoryPath = [IO.Path]::GetFullPath((Split-Path -Parent $startupDirectoryPath))
 [void](Get-DysonApprovedPathInfo $dataDirectoryPath 'Dyson Control data directory' $false $true)
 $savePathInfo = Get-DysonApprovedPathInfo $saveDirectoryPath 'Save directory' $true $false
 $unfinishedRestorePath = Join-Path $dataDirectoryPath 'save-restore\active'
-if ($null -ne (Get-Item -LiteralPath $unfinishedRestorePath -Force -ErrorAction SilentlyContinue)) {
+$unfinishedRestore = $null
+try { $unfinishedRestore = Get-Item -LiteralPath $unfinishedRestorePath -Force -ErrorAction Stop }
+catch [System.Management.Automation.ItemNotFoundException] { }
+if ($null -ne $unfinishedRestore) {
   throw "An unfinished save restore transaction requires recovery before the game can start: $unfinishedRestorePath"
 }
 
@@ -62,6 +81,15 @@ $runningGame = Get-CimInstance Win32_Process -Filter "Name = 'DSPGAME.exe'" | Wh
   catch { return $false }
 } | Select-Object -First 1
 if ($runningGame) { throw "The managed DSPGAME.exe is already running with PID $($runningGame.ProcessId)." }
+
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$currentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+$sessionSteam = @(Get-CimInstance Win32_Process -Filter "Name = 'steam.exe'" -ErrorAction Stop | Where-Object {
+  Test-SteamProcessOwnerAndSession $_ $currentSid $currentSessionId
+} | Select-Object -First 1)
+if ($sessionSteam.Count -ne 1) {
+  throw "No running Steam client is owned by the current GameUser in interactive session $currentSessionId."
+}
 
 # DSP does not expose a save-folder command-line option. The shipped GameConfig
 # reads Configs/path.txt as its document root and then appends

@@ -37,6 +37,57 @@ async function config(mode: 'demo' | 'windows'): Promise<ControlConfig> {
   }
 }
 
+type SteamFixtureMode = 'matching' | 'absent' | 'different-session'
+
+async function invokeStartGameFixture(
+  fixture: ControlConfig,
+  settingsPath: string,
+  saveDirectory: string,
+  steamMode: SteamFixtureMode
+): Promise<{ stdout: string; stderr: string }> {
+  const argumentsPath = path.join(fixture.dataDirectory, 'start-game-arguments.json')
+  const harness = path.join(fixture.dataDirectory, 'start-game-harness.ps1')
+  await fs.writeFile(argumentsPath, JSON.stringify({
+    gameRoot: fixture.game.root, saveDirectory, settingsPath, logFile: fixture.game.logFile
+  }))
+  await fs.writeFile(harness, String.raw`[CmdletBinding()]
+param(
+  [Parameter(Mandatory = $true)][string]$StartScript,
+  [Parameter(Mandatory = $true)][string]$ArgumentsPath,
+  [Parameter(Mandatory = $true)][ValidateSet('matching', 'absent', 'different-session')][string]$SteamMode
+)
+$ErrorActionPreference = 'Stop'
+$inputObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$separator = $identity.Name.IndexOf('\')
+if ($separator -le 0 -or $separator -ge ($identity.Name.Length - 1)) { throw 'Fixture identity is not domain-qualified.' }
+$ownerDomain = $identity.Name.Substring(0, $separator)
+$ownerUser = $identity.Name.Substring($separator + 1)
+$fixtureSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+function Get-CimInstance {
+  [CmdletBinding()]
+  param([Parameter(Position = 0)][string]$ClassName, [string]$Filter)
+  if ($ClassName -cne 'Win32_Process') { throw "Unexpected fixture CIM class: $ClassName" }
+  if ($Filter -ceq "Name = 'DSPGAME.exe'") { return }
+  if ($Filter -cne "Name = 'steam.exe'") { throw "Unexpected fixture CIM filter: $Filter" }
+  if ($SteamMode -ceq 'absent') { return }
+  $sessionId = if ($SteamMode -ceq 'matching') { $fixtureSessionId } else { $fixtureSessionId + 1 }
+  [pscustomobject]@{ ProcessId = 41001; SessionId = $sessionId }
+}
+function Invoke-CimMethod {
+  [CmdletBinding()]
+  param([Parameter(Mandatory = $true)][object]$InputObject, [Parameter(Mandatory = $true)][string]$MethodName)
+  if ($MethodName -cne 'GetOwner') { throw "Unexpected fixture CIM method: $MethodName" }
+  [pscustomobject]@{ ReturnValue = 0; Domain = $ownerDomain; User = $ownerUser }
+}
+& $StartScript -GameRoot ([string]$inputObject.gameRoot) -SaveDirectory ([string]$inputObject.saveDirectory) -SettingsPath ([string]$inputObject.settingsPath) -LogFile ([string]$inputObject.logFile) -ProcessPriority AboveNormal
+`)
+  return execFileAsync('powershell.exe', [
+    '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
+    '-StartScript', resolveWindowsScript('start-game.ps1'), '-ArgumentsPath', argumentsPath, '-SteamMode', steamMode
+  ], { windowsHide: true })
+}
+
 function sign(secret: string, parts: string[]): string {
   return createHmac('sha256', secret).update(parts.join('\n')).digest('hex')
 }
@@ -643,7 +694,7 @@ describe('Windows adapter fixture behavior', () => {
       settings: { serverName: 'Managed', maxPlayers: null, targetUps: 75, autosaveMinutes: null, backupKeep: 3, address: 'managed.example.test' }
     }, () => undefined, new AbortController().signal)
     expect(result).toMatchObject({ restartRequired: false, unsupportedFields: ['maxPlayers', 'autosaveMinutes'] })
-    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup.json'), 'utf8'))).toEqual({ schema: 1, targetUps: 75, saveName: null })
+    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), 'utf8'))).toEqual({ schema: 1, targetUps: 75, saveName: null })
 
     const secondFixture = await config('windows')
     await fs.mkdir(secondFixture.game.root, { recursive: true })
@@ -656,8 +707,8 @@ describe('Windows adapter fixture behavior', () => {
   it('records actual settings before writes and rollbacks without replacing the current startup save', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
-    await fs.mkdir(fixture.dataDirectory, { recursive: true })
-    await fs.writeFile(path.join(fixture.dataDirectory, 'game-startup.json'), JSON.stringify({ schema: 1, targetUps: 60, saveName: 'World-A' }))
+    await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
+    await fs.writeFile(path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), JSON.stringify({ schema: 1, targetUps: 60, saveName: 'World-A' }))
     await fs.writeFile(path.join(fixture.game.saveDirectory, 'World-B.dsv'), 'world-b-dsv')
     await fs.writeFile(path.join(fixture.game.saveDirectory, 'World-B.server'), 'world-b-server')
     const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({
@@ -681,7 +732,7 @@ describe('Windows adapter fixture behavior', () => {
     const rolledBack = await adapter.run('rollback-settings', { historyId: original.id }, () => undefined, new AbortController().signal)
 
     expect(rolledBack).toMatchObject({ restoredFromHistoryId: original.id, settings: { serverName: 'Fixture Server', targetUps: 60 } })
-    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup.json'), 'utf8'))).toEqual({
+    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), 'utf8'))).toEqual({
       schema: 1, targetUps: 60, saveName: 'World-B'
     })
     expect((await adapter.settingsHistory()).map(entry => entry.operation)).toEqual(['rollback', 'write'])
@@ -697,7 +748,7 @@ describe('Windows adapter fixture behavior', () => {
       tasks: { start: true, startManaged: true, configuredTargetUps: null }
     }) })
     await adapter.settings()
-    const startupPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    const startupPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.rm(startupPath)
     await fs.mkdir(startupPath)
 
@@ -734,7 +785,7 @@ describe('Windows adapter fixture behavior', () => {
       expect(restored).toMatchObject({ saveName: 'World', startupSelectionApplied: true, restarted: false })
     }
 
-    const startup = JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup.json'), 'utf8'))
+    const startup = JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), 'utf8'))
     expect(startup).toEqual({ schema: 1, targetUps: 60, saveName: 'World' })
     const backups = await adapter.backups()
     expect(backups.filter((item) => item.reason === 'automatic-before-restore')).toHaveLength(1)
@@ -807,14 +858,14 @@ describe('Windows adapter fixture behavior', () => {
 
   it('keeps the game stopped when interrupted restore state contains an unknown live hash', async () => {
     const fixture = await config('windows')
-    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(fixture.dataDirectory, { recursive: true })])
+    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })])
     const source = path.join(path.dirname(fixture.dataDirectory), 'restore-source')
     await fs.mkdir(source)
     await fs.writeFile(path.join(fixture.game.saveDirectory, 'World.dsv'), 'before-dsv')
     await fs.writeFile(path.join(fixture.game.saveDirectory, 'World.server'), 'before-server')
     await fs.writeFile(path.join(source, 'World.dsv'), 'after-dsv')
     await fs.writeFile(path.join(source, 'World.server'), 'after-server')
-    const startupPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    const startupPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(startupPath, `${JSON.stringify({ schema: 1, targetUps: 60, saveName: 'Before' }, null, 2)}\n`)
     const digest = (value: string) => createHash('sha256').update(value).digest('hex')
     const interrupted = new SaveRestoreManager({
@@ -1354,7 +1405,7 @@ describe('Windows adapter fixture behavior', () => {
     expect(running).toBe(true)
     expect(reports.indexOf('正在停止服务器')).toBeLessThan(reports.indexOf('正在完整备份存档 World'))
     expect(await fs.readFile(path.join(fixture.game.saveDirectory, 'World.dsv'), 'utf8')).toBe('original-dsv')
-    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup.json'), 'utf8'))).toEqual({ schema: 1, targetUps: 60, saveName: 'World' })
+    expect(JSON.parse(await fs.readFile(path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), 'utf8'))).toEqual({ schema: 1, targetUps: 60, saveName: 'World' })
   })
 
   it('waits for a signed Bridge heartbeat from the exact process started by the task', async () => {
@@ -1511,7 +1562,7 @@ describe('Windows adapter fixture behavior', () => {
     { title: 'a mod', action: 'install-mod' as const, input: { package: 'mods-Feature', version: '2.0.0' }, packageName: 'mods-Feature' }
   ])('checks the complete resolved $title plan against version locks before stopping', async ({ action, input, packageName }) => {
     const fixture = await config('windows')
-    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(fixture.dataDirectory, { recursive: true })])
+    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })])
     const lockedAt = '2026-10-17T00:00:00.000Z'
     await fs.writeFile(path.join(fixture.dataDirectory, 'version-locks.json'), `${JSON.stringify({
       schema: 1, updatedAt: lockedAt, locks: [{ package: 'libs-shared', version: '1.0.0', lockedAt }]
@@ -1546,7 +1597,7 @@ describe('Windows adapter fixture behavior', () => {
 
   it('checks an explicit Steam target lock before stopping even with an update test override', async () => {
     const fixture = await config('windows')
-    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(fixture.dataDirectory, { recursive: true })])
+    await Promise.all([fs.mkdir(fixture.game.root, { recursive: true }), fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })])
     const lockedAt = '2026-10-17T00:00:00.000Z'
     await fs.writeFile(path.join(fixture.dataDirectory, 'version-locks.json'), `${JSON.stringify({
       schema: 1, updatedAt: lockedAt, locks: [{ package: 'steam:1366540', version: '100', lockedAt }]
@@ -1976,8 +2027,8 @@ describe('Windows adapter fixture behavior', () => {
   it.runIf(process.platform === 'win32')('recognizes only the exact managed start-task contract', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
-    await fs.mkdir(fixture.dataDirectory, { recursive: true })
-    const startupSettingsPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
+    const startupSettingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(startupSettingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
     const argumentsPath = path.join(fixture.dataDirectory, 'inspect-arguments.json')
     await fs.writeFile(argumentsPath, JSON.stringify({
@@ -2063,7 +2114,7 @@ function Get-ScheduledTask {
   it.runIf(process.platform === 'win32')('binds DSP Configs/path.txt to the configured managed save directory before launch', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
-    await fs.mkdir(fixture.dataDirectory, { recursive: true })
+    await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
     await fs.mkdir(path.join(fixture.game.root, 'Configs'))
     await fs.writeFile(path.join(fixture.game.root, 'Configs', 'path.txt'), '')
     const userDataRoot = path.dirname(fixture.game.saveDirectory)
@@ -2072,13 +2123,11 @@ function Get-ScheduledTask {
     await fs.mkdir(path.join(userDataRoot, 'Blueprint'))
     await fs.writeFile(path.join(userDataRoot, 'Blueprint', 'existing.txt'), 'existing-blueprint')
     await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
-    const settingsPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
-    await expect(execFileAsync('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', resolveWindowsScript('start-game.ps1'),
-      '-GameRoot', fixture.game.root, '-SaveDirectory', fixture.game.saveDirectory, '-SettingsPath', settingsPath,
-      '-LogFile', fixture.game.logFile, '-ProcessPriority', 'AboveNormal'
-    ], { windowsHide: true })).rejects.toMatchObject({ stderr: expect.stringContaining('DSPGAME.exe exited with code') })
+    await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, 'matching')).rejects.toMatchObject({
+      stderr: expect.stringContaining('DSPGAME.exe exited with code')
+    })
     const configs = path.join(fixture.game.root, 'Configs')
     const documentRoot = await fs.readFile(path.join(configs, 'path.txt'), 'utf8')
     const expectedDocumentRoot = path.join(fixture.dataDirectory, 'dyson-control-documents')
@@ -2097,10 +2146,11 @@ function Get-ScheduledTask {
     const fixture = await config('windows')
     await Promise.all([
       fs.mkdir(fixture.game.root, { recursive: true }),
-      fs.mkdir(path.join(fixture.dataDirectory, 'save-restore', 'active'), { recursive: true })
+      fs.mkdir(path.join(fixture.dataDirectory, 'save-restore', 'active'), { recursive: true }),
+      fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
     ])
     await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
-    const settingsPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
     await expect(execFileAsync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', resolveWindowsScript('start-game.ps1'),
@@ -2111,6 +2161,21 @@ function Get-ScheduledTask {
     })
   })
 
+  it.runIf(process.platform === 'win32')('requires Steam ownership in the same Windows session before changing the game binding', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
+    await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
+    const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
+    await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
+    for (const steamMode of ['absent', 'different-session'] as const) {
+      await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, steamMode)).rejects.toMatchObject({
+        stderr: expect.stringContaining('No running Steam client is owned by the current GameUser in interactive session')
+      })
+    }
+    await expect(fs.lstat(path.join(fixture.game.root, 'Configs'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
   it.runIf(process.platform === 'win32')('binds an arbitrary save directory without moving it', async () => {
     const fixture = await config('windows')
     const customSaveDirectory = path.join(path.dirname(fixture.dataDirectory), 'custom-save-location')
@@ -2118,16 +2183,14 @@ function Get-ScheduledTask {
     const originalDocumentRoot = path.join(path.dirname(fixture.dataDirectory), 'previous-documents')
     await fs.mkdir(customSaveDirectory)
     await fs.mkdir(configs, { recursive: true })
-    await fs.mkdir(fixture.dataDirectory, { recursive: true })
+    await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
     await fs.writeFile(path.join(configs, 'path.txt'), originalDocumentRoot)
     await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
-    const settingsPath = path.join(fixture.dataDirectory, 'game-startup.json')
+    const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
-    await expect(execFileAsync('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', resolveWindowsScript('start-game.ps1'),
-      '-GameRoot', fixture.game.root, '-SaveDirectory', customSaveDirectory, '-SettingsPath', settingsPath,
-      '-LogFile', fixture.game.logFile, '-ProcessPriority', 'AboveNormal'
-    ], { windowsHide: true })).rejects.toMatchObject({ stderr: expect.stringContaining('DSPGAME.exe exited with code') })
+    await expect(invokeStartGameFixture(fixture, settingsPath, customSaveDirectory, 'matching')).rejects.toMatchObject({
+      stderr: expect.stringContaining('DSPGAME.exe exited with code')
+    })
 
     const documentRoot = path.join(fixture.dataDirectory, 'dyson-control-documents')
     expect(path.resolve(await fs.readFile(path.join(configs, 'path.txt'), 'utf8'))).toBe(documentRoot)

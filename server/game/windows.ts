@@ -176,7 +176,7 @@ export class WindowsGameAdapter implements GameAdapter {
       throw new GameAdapterError('LIFECYCLE_TIMING_INVALID', 'Lifecycle timeout and polling interval must be positive integers.')
     }
     this.#settingsPath = path.join(config.dataDirectory, 'game-settings.json')
-    this.#startupSettingsPath = path.join(config.dataDirectory, 'game-startup.json')
+    this.#startupSettingsPath = path.join(config.dataDirectory, 'game-startup', 'settings.json')
     this.#packageDirectory = path.join(config.dataDirectory, 'client-packages')
     this.#downloadDirectory = path.join(config.dataDirectory, 'downloads')
     this.#modConfig = new ModConfigManager({
@@ -226,6 +226,7 @@ export class WindowsGameAdapter implements GameAdapter {
   async #initialize(): Promise<void> {
     await Promise.all([
       fs.mkdir(this.#config.dataDirectory, { recursive: true }),
+      fs.mkdir(path.dirname(this.#startupSettingsPath), { recursive: true }),
       fs.mkdir(this.#config.game.backupDirectory, { recursive: true }),
       fs.mkdir(this.#packageDirectory, { recursive: true }),
       fs.mkdir(this.#downloadDirectory, { recursive: true })

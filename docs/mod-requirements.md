@@ -6,4 +6,8 @@ Thunderstore 的标准包清单包含名称、版本和依赖等信息，没有�
 
 这项设置控制客户端包内容，不移动、不停用服务器上的文件。生成 `.r2z` 时会排除已停用和仅服务器模组，并要求所有已启用模组的适用端已确认、Thunderstore 包身份已识别、安装版本可精确表达。客户端仍须实际导入并入服验证兼容性。
 
+玩家在 r2modman 的配置选择页使用 **Import/Update → Import new profile → From file** 导入下载的 `.r2z`，等待列出的精确版本下载完成。先核对游戏版本与服务器一致，再启动该配置；不要在入服验证前对整个配置执行批量更新。
+
+首次使用全新的游戏用户数据目录时，先启动一次纯净游戏、选择语言并正常退出，让游戏写入初始选项，再启动模组配置。实测 CommonAPI 1.6.7 与 UXAssist 1.5.8 的组合在选项尚未初始化时可能卡在语言选择，并记录数组长度或快捷键索引错误；完成纯净游戏初始化后可正常进入模组主菜单。此步骤不需要删除已有存档或重置其他配置。
+
 依据：[Thunderstore 包格式](https://wiki.thunderstore.io/mods/creating-a-package)、[Nebula 安装说明](https://github.com/NebulaModTeam/nebula/wiki/Installation)。
