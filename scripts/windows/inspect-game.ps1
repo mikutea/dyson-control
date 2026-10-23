@@ -99,6 +99,40 @@ function Test-PathEquals([object]$Actual, [string]$Expected) {
   return Test-DysonPathEquals ([string]$Actual) $Expected
 }
 
+function Test-ManagedStartScript([object]$Actual, [string]$Expected) {
+  if (Test-PathEquals $Actual $Expected) { return $true }
+  if ($null -eq $Actual -or [string]::IsNullOrWhiteSpace([string]$Actual)) { return $false }
+  try {
+    $actualPath = [IO.Path]::GetFullPath([string]$Actual)
+    $expectedPath = [IO.Path]::GetFullPath($Expected)
+    $actualVersion = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $actualPath))
+    $expectedVersion = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $expectedPath))
+    $versionsRoot = Split-Path -Parent $expectedVersion
+    if ((Split-Path -Leaf $versionsRoot) -cne 'versions' -or
+        -not (Test-PathEquals (Split-Path -Parent $actualVersion) $versionsRoot) -or
+        -not (Test-PathEquals $actualPath (Join-Path $actualVersion 'scripts\windows\start-game.ps1')) -or
+        -not (Test-PathEquals $expectedPath (Join-Path $expectedVersion 'scripts\windows\start-game.ps1'))) { return $false }
+    foreach ($version in @($actualVersion, $expectedVersion)) {
+      if ((Split-Path -Leaf $version) -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') { return $false }
+      foreach ($directory in @($version, (Join-Path $version 'scripts'), (Join-Path $version 'scripts\windows'))) {
+        $item = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+        if (-not $item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { return $false }
+      }
+    }
+    # A panel-only upgrade leaves the running game task in place. Accept its
+    # retained version only while both startup implementation files are exact.
+    foreach ($name in @('start-game.ps1', 'path-policy.ps1')) {
+      $oldFile = Get-Item -LiteralPath (Join-Path $actualVersion ('scripts\windows\' + $name)) -Force -ErrorAction Stop
+      $newFile = Get-Item -LiteralPath (Join-Path $expectedVersion ('scripts\windows\' + $name)) -Force -ErrorAction Stop
+      if ($oldFile.PSIsContainer -or $newFile.PSIsContainer -or $oldFile.Length -lt 1 -or
+          ($oldFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or ($newFile.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+          (Get-FileHash -LiteralPath $oldFile.FullName -Algorithm SHA256).Hash -cne (Get-FileHash -LiteralPath $newFile.FullName -Algorithm SHA256).Hash) { return $false }
+    }
+    return $true
+  }
+  catch { return $false }
+}
+
 function Test-ManagedStartArguments([object]$Action) {
   $parseErrors = $null
   $tokens = [Management.Automation.PSParser]::Tokenize([string]$Action.Arguments, [ref]$parseErrors)
@@ -113,7 +147,7 @@ function Test-ManagedStartArguments([object]$Action) {
   return (
     ([string](Get-ActionOption $Action '-ExecutionPolicy')).Equals('Bypass', [StringComparison]::OrdinalIgnoreCase) -and
     ([string](Get-ActionOption $Action '-ProcessPriority')).Equals('AboveNormal', [StringComparison]::OrdinalIgnoreCase) -and
-    (Test-PathEquals (Get-ActionOption $Action '-File') $managedStartScript) -and
+    (Test-ManagedStartScript (Get-ActionOption $Action '-File') $managedStartScript) -and
     (Test-PathEquals (Get-ActionOption $Action '-SettingsPath') $startupSettingsPath) -and
     (Test-PathEquals (Get-ActionOption $Action '-GameRoot') $gameRoot) -and
     (Test-PathEquals (Get-ActionOption $Action '-SaveDirectory') $saveDirectory) -and

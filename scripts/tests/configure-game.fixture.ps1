@@ -252,6 +252,33 @@ try {
   Assert-True ([IO.File]::ReadAllText($replacementText) -ceq '{"version":2}') 'Failed atomic replacement changed the original text.'
   Assert-True (@(Get-ChildItem -LiteralPath $fixture -Filter '.dyson-control-*.tmp' -File).Count -eq 0) 'Atomic replacement left temporary files.'
 
+  $inspectionTokens = $null
+  $inspectionErrors = $null
+  $inspectionAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\windows\inspect-game.ps1'), [ref]$inspectionTokens, [ref]$inspectionErrors)
+  foreach ($functionName in @('Test-PathEquals', 'Test-ManagedStartScript')) {
+    $functionAst = $inspectionAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName}, $true)
+    Assert-True ($null -ne $functionAst) "Unable to locate $functionName inspection implementation."
+    Invoke-Expression $functionAst.Extent.Text
+  }
+  $oldStartup = Join-Path $fixture 'installed\versions\1.0.0\scripts\windows\start-game.ps1'
+  $newStartup = Join-Path $fixture 'installed\versions\1.1.0\scripts\windows\start-game.ps1'
+  $unrelatedStartup = Join-Path $fixture 'other-install\versions\1.0.0\scripts\windows\start-game.ps1'
+  foreach ($startup in @($oldStartup, $newStartup, $unrelatedStartup)) {
+    New-Item -ItemType Directory -Path (Split-Path -Parent $startup) -Force | Out-Null
+    [IO.File]::WriteAllText($startup, 'same-start-implementation', $utf8NoBom)
+    [IO.File]::WriteAllText((Join-Path (Split-Path -Parent $startup) 'path-policy.ps1'), 'same-path-policy', $utf8NoBom)
+  }
+  Assert-True (Test-ManagedStartScript $oldStartup $newStartup) 'Panel upgrade lost the exact retained game-task implementation.'
+  Assert-True (-not (Test-ManagedStartScript $unrelatedStartup $newStartup)) 'Another installation was accepted as the managed game-task source.'
+  [IO.File]::WriteAllText($oldStartup, 'changed-start-implementation', $utf8NoBom)
+  Assert-True (-not (Test-ManagedStartScript $oldStartup $newStartup)) 'A changed retained startup script was accepted.'
+  [IO.File]::WriteAllText($oldStartup, 'same-start-implementation', $utf8NoBom)
+  $oldPolicy = Join-Path (Split-Path -Parent $oldStartup) 'path-policy.ps1'
+  [IO.File]::WriteAllText($oldPolicy, 'changed-path-policy', $utf8NoBom)
+  Assert-True (-not (Test-ManagedStartScript $oldStartup $newStartup)) 'A changed retained path policy was accepted.'
+  Remove-Item -LiteralPath $oldPolicy
+  Assert-True (-not (Test-ManagedStartScript $oldStartup $newStartup)) 'A missing retained path policy was accepted.'
+
   $legacySddl = 'O:SYG:BAD:(A;OICI;FR;;;SY)(A;;FR;;;BA)'
   $autoInheritedSddl = 'O:SYG:BAD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)'
   Assert-True ((Get-AclComparisonSddl $legacySddl) -ceq (Get-AclComparisonSddl $autoInheritedSddl)) 'ACL comparison rejected the Windows automatic-inheritance marker.'
