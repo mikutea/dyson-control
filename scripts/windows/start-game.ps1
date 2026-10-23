@@ -110,10 +110,7 @@ function Assert-ExactDirectoryLink([string]$LinkPath, [string]$ExpectedTarget, [
       -not ([string]$item.LinkType).Equals($ExpectedLinkType, [StringComparison]::OrdinalIgnoreCase)) {
     throw "Managed game-data path is not the required $ExpectedLinkType directory link: $LinkPath"
   }
-  $targets = @($item.Target)
-  if ($targets.Count -ne 1 -or [string]::IsNullOrWhiteSpace([string]$targets[0])) { throw "Managed game-data link target is invalid: $LinkPath" }
-  $target = [string]$targets[0]
-  if (-not [IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path -Parent $LinkPath) $target }
+  $target = Get-DysonDirectoryLinkTarget $LinkPath
   if (-not (Test-DysonPathEquals $target $ExpectedTarget)) {
     throw "Managed game-data link points to '$target', but '$ExpectedTarget' is required."
   }

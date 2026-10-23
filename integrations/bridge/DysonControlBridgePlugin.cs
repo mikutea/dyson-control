@@ -18,7 +18,7 @@ namespace DysonControl.Bridge
     {
         public const string PluginGuid = "net.miyuo.dyson-control.bridge";
         public const string PluginName = "Dyson Control Bridge";
-        public const string PluginVersion = "0.1.6";
+        public const string PluginVersion = "0.1.7";
 
         private ConfigEntry<string> controlDirectory;
         private ConfigEntry<string> secretFile;

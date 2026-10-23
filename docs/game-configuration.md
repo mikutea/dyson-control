@@ -17,7 +17,7 @@
 
 `game.root`、`game.saveDirectory`、`game.backupDirectory` 和 `game.logFile` 可使用上述全局映射。SQLite 队列所在的 `dataDirectory`、`game.bridgeDirectory`、`game.bridgeSecretFile`、受管 `start-game.ps1`、配套 `path-policy.ps1`、`dataDirectory\game-startup\settings.json` 和 `dataDirectory\save-restore` 必须位于本机 NTFS，因此无需为了接入面板迁移游戏或存档。
 
-文档目录链接的目标从 Windows 原始 reparse 记录读取，并区分绝对 UNC 链接与相对链接。管理员接入和 GameUser 探测使用同一读取方法，避免 Windows PowerShell 5.1 的 `Target` 显示差异造成误判；实际指向其他目录的链接仍会被拒绝。
+文档目录链接的目标从 Windows 原始 reparse 记录读取，并区分绝对 UNC 链接与相对链接。管理员接入、GameUser 探测和每次实际启动使用同一读取方法，避免 Windows PowerShell 5.1 的 `Target` 显示差异造成误判；实际指向其他目录的链接仍会被拒绝。
 
 SMB 全局映射使用现有共享身份与服务器权限。接入工具不会修改共享目录 ACL，也不会尝试在远程文件系统写入本机 GameUser SID；`plan.json` 的 `access.existingAccessChecks` 单独列出这些目录，并通过真实 SYSTEM 和 GameUser 文件操作验证访问能力。存档子目录也会单独接受 GameUser 写入、读回、重命名和清理检查；检查失败仍会中止接入。本机路径继续使用下述 ACL 授权和回退。
 

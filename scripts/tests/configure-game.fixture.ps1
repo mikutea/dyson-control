@@ -278,11 +278,22 @@ public static class DysonFixtureDirectoryLink {
   $fixtureLinks += $relativeUncLink
   Assert-ExactDirectoryLink $uncLink $uncTarget 'SymbolicLink'
   Assert-ExactDirectoryLink $uncLink 'R:\userdata' 'SymbolicLink'
+  $startupTokens = $null
+  $startupErrors = $null
+  $startupAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot '..\windows\start-game.ps1'), [ref]$startupTokens, [ref]$startupErrors)
+  $startupLinkAssertion = $startupAst.Find({param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Assert-ExactDirectoryLink'}, $true)
+  Assert-True ($null -ne $startupLinkAssertion) 'Unable to locate the game startup link assertion.'
+  Invoke-Expression ($startupLinkAssertion.Extent.Text.Replace('function Assert-ExactDirectoryLink(', 'function Assert-StartupDirectoryLink('))
+  Assert-StartupDirectoryLink $uncLink $uncTarget 'SymbolicLink'
+  Assert-StartupDirectoryLink $uncLink 'R:\userdata' 'SymbolicLink'
   foreach ($wrongLink in @($relativeUncLink, $uncLink)) {
     $rejectedLink = $false
     $wrongTarget = if ($wrongLink -ceq $relativeUncLink) { $uncTarget } else { '\\fixture-storage.example\server-data\other' }
     try { Assert-ExactDirectoryLink $wrongLink $wrongTarget 'SymbolicLink' } catch { $rejectedLink = $true }
     Assert-True $rejectedLink 'A relative UNC-looking link or wrong absolute target was accepted.'
+    $rejectedStartupLink = $false
+    try { Assert-StartupDirectoryLink $wrongLink $wrongTarget 'SymbolicLink' } catch { $rejectedStartupLink = $true }
+    Assert-True $rejectedStartupLink 'Game startup accepted a relative UNC-looking link or wrong absolute target.'
   }
   $replacementSource = Join-Path $fixture 'replacement-source.bin'
   $replacementTarget = Join-Path $fixture 'replacement target.bin'
