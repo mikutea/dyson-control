@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -180,7 +180,7 @@ describe('Dyson Control API', () => {
       expect(response.statusCode).toBe(200)
       expect(response.headers['cache-control']).toBe('no-store')
       expect(response.json()).toEqual({
-        product: 'dyson-control', version: '0.1.0', processId: process.pid,
+        product: 'dyson-control', version: JSON.parse(await readFile(new URL('../package.json', import.meta.url), 'utf8')).version, processId: process.pid,
         accepting: true, maintenanceToken: null,
       })
       expect((await app.inject({ method: 'GET', url: '/healthz?probe=1' })).statusCode).toBe(400)
