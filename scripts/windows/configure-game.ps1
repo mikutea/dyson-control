@@ -646,7 +646,25 @@ function New-AclSnapshot([object]$Change) {
   }
 }
 
+function Split-GameUserAccessRequirements([object[]]$Requirements) {
+  $changes = @()
+  $existingAccessChecks = @()
+  foreach ($requirement in $Requirements) {
+    $allowGlobalSmb = [string]$requirement.label -cin @('game.root', 'game user-data root', 'game.logFile parent')
+    # Local-only targets are validated in apply mode, so preparation can still
+    # run from a source checkout before the release is installed locally.
+    if (-not $allowGlobalSmb) { $changes += $requirement; continue }
+    $info = Get-DysonApprovedPathInfo ([string]$requirement.path) ([string]$requirement.label) $true $false
+    if ([string]$info.Kind -ceq 'smb-global') { $existingAccessChecks += $requirement }
+    else { $changes += $requirement }
+  }
+  return [pscustomobject]@{ changes = $changes; existingAccessChecks = $existingAccessChecks }
+}
+
 function Grant-GameUserAccess([object]$Change, [string]$Sid) {
+  # A global SMB mapping uses the share's existing identity and permissions.
+  # Never try to persist this machine's local SID on the remote filesystem.
+  [void](Get-DysonApprovedPathInfo ([string]$Change.path) ([string]$Change.label) $false $true)
   $rights = [Security.AccessControl.FileSystemRights][Enum]::Parse([Security.AccessControl.FileSystemRights], [string]$Change.rights)
   $inheritance = if ([string]$Change.inheritance -ceq 'children') {
     [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
@@ -919,7 +937,7 @@ $secretDirectory = Split-Path -Parent $configuration.BridgeSecretFile
 $logDirectory = Split-Path -Parent $configuration.LogFile
 $managedScriptsDirectory = Split-Path -Parent $managedStartScript
 $documentLayout = Get-GameDocumentLayout $configuration $configuration.SaveDirectory
-$accessChanges = @(
+$accessRequirements = @(
   [ordered]@{ label = 'game.root'; path = $configuration.GameRoot; rights = 'Modify'; inheritance = 'children' },
   [ordered]@{ label = 'game user-data root'; path = $documentLayout.UserDataRoot; rights = 'Modify'; inheritance = 'children' },
   [ordered]@{ label = 'game.logFile parent'; path = $logDirectory; rights = 'Modify'; inheritance = 'children' },
@@ -936,11 +954,13 @@ $accessChanges = @(
   [ordered]@{ label = 'managed path policy'; path = $pathPolicyScript; rights = 'ReadAndExecute'; inheritance = 'none' }
 )
 if ($null -ne $documentLayout.LinkPath) {
-  $accessChanges += [ordered]@{ label = 'managed game-data link'; path = $documentLayout.LinkPath; rights = 'Modify'; inheritance = 'none' }
+  $accessRequirements += [ordered]@{ label = 'managed game-data link'; path = $documentLayout.LinkPath; rights = 'Modify'; inheritance = 'none' }
 }
 else {
-  $accessChanges += [ordered]@{ label = 'managed game document directory'; path = $documentLayout.ManagedGameDocument; rights = 'Modify'; inheritance = 'children' }
+  $accessRequirements += [ordered]@{ label = 'managed game document directory'; path = $documentLayout.ManagedGameDocument; rights = 'Modify'; inheritance = 'children' }
 }
+$accessPlan = Split-GameUserAccessRequirements $accessRequirements
+$accessChanges = @($accessPlan.changes)
 
 $plan = [ordered]@{
   schema = 1
@@ -965,6 +985,7 @@ $plan = [ordered]@{
   access = [ordered]@{
     principalAccount = $resolvedGameUser.Account; principalSid = $resolvedGameUser.Sid
     changes = $accessChanges
+    existingAccessChecks = @($accessPlan.existingAccessChecks)
     rollback = 'original SDDL is recorded for every existing changed path and restored on failure'
   }
   documentBinding = [ordered]@{
@@ -1207,10 +1228,12 @@ try {
     }
   }
   $gameUserProbeDirectories = @(
-    $accessChanges | Where-Object {
+    $accessRequirements | Where-Object {
       [string]$_.rights -ceq 'Modify' -and [string]$_.label -cne 'managed game-data link'
     } | ForEach-Object { [ordered]@{ label = $_.label; path = $_.path; access = 'modify' } }
   )
+  # The save directory can have permissions different from its user-data parent.
+  $gameUserProbeDirectories += [ordered]@{ label = 'game.saveDirectory'; path = $configuration.SaveDirectory; access = 'modify' }
   $gameUserProbeDirectories += @(
     $accessChanges | Where-Object {
       [string]$_.rights -ceq 'ReadAndExecute' -and (Test-Path -LiteralPath $_.path -PathType Container)

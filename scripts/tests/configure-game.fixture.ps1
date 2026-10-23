@@ -221,12 +221,35 @@ try {
   }, $true)
   Assert-True ($null -ne $verificationFunction) 'Unable to locate task registration verification implementation.'
   Invoke-Expression $verificationFunction.Extent.Text
-  foreach ($functionName in @('Get-FullPath', 'Get-PlainDirectory', 'Get-PlainFile', 'Write-NewFile', 'Install-AtomicFile', 'Write-AtomicText', 'Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots', 'Assert-ExactDirectoryLink')) {
+  foreach ($functionName in @('Get-FullPath', 'Get-PlainDirectory', 'Get-PlainFile', 'Write-NewFile', 'Install-AtomicFile', 'Write-AtomicText', 'Protect-SystemAdministratorsOnly', 'Split-GameUserAccessRequirements', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots', 'Assert-ExactDirectoryLink')) {
     $functionAst = $verificationAst.Find({
       param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
     }, $true)
     Assert-True ($null -ne $functionAst) "Unable to locate $functionName implementation."
     Invoke-Expression $functionAst.Extent.Text
+  }
+  & {
+    # Model a healthy mapped share whose ACL cannot represent a local SID.
+    # Local ACL grants and mapped access checks must remain distinct.
+    function Get-DysonApprovedPathInfo([string]$PathValue, [string]$Label, [bool]$AllowGlobalSmb, [bool]$RequireNtfs) {
+      if ($PathValue.StartsWith('R:\', [StringComparison]::OrdinalIgnoreCase)) {
+        if (-not $AllowGlobalSmb) { throw 'Network path is not allowed here.' }
+        return [pscustomobject]@{ Kind = 'smb-global' }
+      }
+      return [pscustomobject]@{ Kind = 'local-fixed' }
+    }
+    $split = Split-GameUserAccessRequirements @(
+      [pscustomobject]@{ label = 'game.root'; path = 'R:\game'; rights = 'Modify'; inheritance = 'children' },
+      [pscustomobject]@{ label = 'game user-data root'; path = 'R:\userdata'; rights = 'Modify'; inheritance = 'children' },
+      [pscustomobject]@{ label = 'game.logFile parent'; path = 'R:\logs'; rights = 'Modify'; inheritance = 'children' },
+      [pscustomobject]@{ label = 'game.bridgeDirectory'; path = 'C:\bridge'; rights = 'Modify'; inheritance = 'children' }
+    )
+    Assert-True (@($split.changes).Count -eq 1 -and $split.changes[0].label -ceq 'game.bridgeDirectory') 'Mapped share paths were included in ACL mutations.'
+    Assert-True (@($split.existingAccessChecks).Count -eq 3) 'Mapped paths lost their mandatory access checks.'
+    $rejected = $false
+    try { Grant-GameUserAccess ([pscustomobject]@{ label = 'game.root'; path = 'R:\game' }) $gameUserSid }
+    catch { $rejected = $_.Exception.Message -ceq 'Network path is not allowed here.' }
+    Assert-True $rejected 'A direct ACL mutation accepted a remote share.'
   }
   # Native creation permits a disposable dangling directory link: no SMB server
   # or credentials are needed to exercise the Windows PowerShell 5.1 UNC bug.
@@ -585,6 +608,13 @@ public static class DysonFixtureDirectoryLink {
     -ResultPath $gameUserProbeResult -EncodedSpecification $encodedGameUserProbeSpecification -ProbeId $gameUserProbeId
   $rejectedProbe = Get-Content -LiteralPath $gameUserProbeResult -Raw -Encoding UTF8 | ConvertFrom-Json
   Assert-True (-not [bool]$rejectedProbe.ok -and [string]$rejectedProbe.error -like '*unexpected link target*') 'The GameUser probe accepted a relative UNC-looking target.'
+  $gameUserProbeSpecification.links[0].path = $uncLink
+  $gameUserProbeSpecification.directories[0].path = Join-Path $fixture 'missing-save-directory'
+  $encodedGameUserProbeSpecification = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($gameUserProbeSpecification | ConvertTo-Json -Depth 6 -Compress)))
+  & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $gameUserProbeScript `
+    -ResultPath $gameUserProbeResult -EncodedSpecification $encodedGameUserProbeSpecification -ProbeId $gameUserProbeId
+  $rejectedAccess = Get-Content -LiteralPath $gameUserProbeResult -Raw -Encoding UTF8 | ConvertFrom-Json
+  Assert-True (-not [bool]$rejectedAccess.ok) 'A failed GameUser directory-access check was accepted.'
   Assert-True (@(Get-ChildItem -LiteralPath $data -Force -Filter ".dyson-control-game-user-probe-$gameUserProbeId").Count -eq 0) 'The disposable GameUser probe left its directory behind.'
 
   foreach ($forbidden in @('New-SmbGlobalMapping', 'New-PSDrive', 'cmdkey.exe', 'PSCredential', 'AutoAdminLogon', 'DefaultPassword', 'LsaStorePrivateData', '-LogonType Password')) {
