@@ -17,6 +17,7 @@ internal static class Program
         Request("stop");
         PlayerActionRequest();
         Snapshots();
+        MetricsSampling();
         Versions();
         PlayerEvents();
         PlayerLifecycle();
@@ -78,6 +79,65 @@ internal static class Program
             State = "unavailable", Ups = -1, Tps = -1, GameTick = -1
         }, Secret);
         Check(unavailable.Contains("state=unavailable\nups=-1\ntps=-1\ngameTick=-1", StringComparison.Ordinal), "unavailable metrics use fixed sentinels");
+    }
+
+    private static void MetricsSampling()
+    {
+        var fixture = Path.Combine(Path.GetTempPath(), "dyson-metrics-tests-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(fixture);
+        var secretFile = Path.Combine(fixture, "secret");
+        File.WriteAllText(secretFile, Secret, new UTF8Encoding(false));
+        try
+        {
+            var root = Path.Combine(fixture, "control");
+            var store = new BridgeFileStore(root, secretFile);
+            var ready = true;
+            var publisher = new MetricsPublisher(store, "33333333-4444-4555-8666-777777777777", 1234, () => ready);
+            var seconds = 0L;
+            string Sample(long gameTick)
+            {
+                GameMain.gameTick = gameTick;
+                publisher.Tick(1792040000000 + seconds * 1000, seconds * Stopwatch.Frequency);
+                seconds += 2;
+                return File.ReadAllText(Path.Combine(root, "metrics"), Encoding.UTF8);
+            }
+
+            GameMain.isPaused = true;
+            FPSController.currentUPS = 60;
+            NebulaWorld.Multiplayer.Session = new NebulaWorld.MultiplayerSession { CanPause = false };
+            Check(Value(Sample(1000), "state") == "unavailable", "metrics require a first sampling baseline");
+            var active = Sample(1120);
+            Check(Value(active, "state") == "active" && Value(active, "tps") == "60" && Value(active, "ups") == "60",
+                "Nebula continues simulation when its session overrides the local pause flag");
+
+            NebulaWorld.Multiplayer.Session.CanPause = true;
+            Check(Value(Sample(1120), "state") == "unavailable", "a permitted game pause invalidates metrics");
+            NebulaWorld.Multiplayer.Session.CanPause = false;
+            Check(Value(Sample(1240), "state") == "unavailable", "resume discards the pre-pause baseline");
+            Check(Value(Sample(1360), "tps") == "60", "resume measures only the new active interval");
+
+            NebulaWorld.Multiplayer.Session = null;
+            Check(Value(Sample(1360), "state") == "unavailable", "a paused game without a session stays unavailable");
+            GameMain.isPaused = false;
+            Sample(1480);
+            Check(Value(Sample(1600), "tps") == "60", "ordinary unpaused simulation remains measurable");
+            ready = false;
+            Check(Value(Sample(1720), "state") == "unavailable", "runtime readiness still gates metrics");
+            ready = true;
+            FPSController.currentUPS = double.NaN;
+            Check(Value(Sample(1840), "state") == "unavailable", "invalid engine counters remain unavailable");
+            FPSController.currentUPS = 60;
+            Sample(1960);
+            Check(Value(Sample(100), "state") == "unavailable", "a reset game tick starts a new baseline");
+        }
+        finally
+        {
+            NebulaWorld.Multiplayer.Session = null;
+            var resolved = Path.GetFullPath(fixture);
+            if (!resolved.StartsWith(Path.GetFullPath(Path.GetTempPath()), StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("Unsafe metrics fixture cleanup path.");
+            Directory.Delete(resolved, true);
+        }
     }
 
     private static void Versions()

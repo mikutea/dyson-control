@@ -24,7 +24,11 @@ namespace DysonControl.Bridge
         {
             if (nowMonotonic < nextPublishMonotonic) return;
             nextPublishMonotonic = nowMonotonic + Stopwatch.Frequency * 2;
-            var ready = runtimeReady() && !GameMain.isPaused;
+            // Nebula's FixedUpdate patch ignores the local pause flag while CanPause is false.
+            // Dedicated hosts may keep that flag set even as the world continues ticking.
+            var session = NebulaWorld.Multiplayer.Session;
+            var paused = GameMain.isPaused && (session == null || session.CanPause);
+            var ready = runtimeReady() && !paused;
             var gameTick = ready ? GameMain.gameTick : -1;
             var ups = ready ? FPSController.currentUPS : -1;
             if (!ready || gameTick < 0 || double.IsNaN(ups) || double.IsInfinity(ups) || ups < 0)

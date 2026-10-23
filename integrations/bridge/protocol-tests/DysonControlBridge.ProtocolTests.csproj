@@ -12,5 +12,6 @@
     <Compile Include="..\DirectoryIdentity.cs" Link="DirectoryIdentity.cs" />
     <Compile Include="..\SaveVerification.cs" Link="SaveVerification.cs" />
     <Compile Include="..\PlayerSessionState.cs" Link="PlayerSessionState.cs" />
+    <Compile Include="..\MetricsPublisher.cs" Link="MetricsPublisher.cs" />
   </ItemGroup>
 </Project>
