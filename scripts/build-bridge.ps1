@@ -12,6 +12,17 @@ $serverRoot = [IO.Path]::GetFullPath($DysonServerRoot)
 $project = Join-Path $projectRoot 'integrations\bridge\DysonControlBridge.csproj'
 $tests = Join-Path $projectRoot 'integrations\bridge\protocol-tests\DysonControlBridge.ProtocolTests.csproj'
 $output = [IO.Path]::GetFullPath($OutputDirectory)
+$packageVersion = [string](Get-Content -LiteralPath (Join-Path $projectRoot 'package.json') -Raw -Encoding UTF8 | ConvertFrom-Json).version
+$projectProperties = ([xml](Get-Content -LiteralPath $project -Raw -Encoding UTF8)).Project.PropertyGroup
+$pluginSource = Get-Content -LiteralPath (Join-Path $projectRoot 'integrations\bridge\DysonControlBridgePlugin.cs') -Raw -Encoding UTF8
+$pluginVersion = [regex]::Match($pluginSource, 'public const string PluginVersion = "([^"]+)";').Groups[1].Value
+if ($packageVersion -cnotmatch '^\d+\.\d+\.\d+$' -or $pluginVersion -cne $packageVersion -or
+    [string]$projectProperties.Version -cne $packageVersion -or
+    [string]$projectProperties.InformationalVersion -cne $packageVersion -or
+    [string]$projectProperties.AssemblyVersion -cne "$packageVersion.0" -or
+    [string]$projectProperties.FileVersion -cne "$packageVersion.0") {
+    throw 'Package, Bridge plugin, and Bridge assembly versions must match a numeric major.minor.patch version supported by BepInEx.'
+}
 $references = [ordered]@{
     BepInEx = 'BepInEx\core\BepInEx.dll'
     AssemblyCSharp = 'DSPGAME_Data\Managed\Assembly-CSharp.dll'
@@ -51,7 +62,7 @@ $referenceEvidence = foreach ($entry in $references.GetEnumerator()) {
 $candidate = Get-Item -LiteralPath (Join-Path $output 'DysonControlBridge.dll')
 $manifest = [ordered]@{
     schema = 1
-    pluginVersion = '0.1.0'
+    pluginVersion = $packageVersion
     builtAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
     dll = [ordered]@{ file = $candidate.Name; bytes = $candidate.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate.FullName).Hash.ToLowerInvariant() }
     references = @($referenceEvidence)
