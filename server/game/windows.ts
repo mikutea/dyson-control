@@ -674,6 +674,12 @@ export class WindowsGameAdapter implements GameAdapter {
     return { state: 'running', pid: processId, bridgeReady: true }
   }
 
+  async #startWithTimeout(report: ReportStep): Promise<Record<string, unknown>> {
+    // Completing a mutation or recovering an interrupted operation must allow
+    // the same cold-start interval as a direct start, plus task setup time.
+    return this.#start(report, AbortSignal.timeout(this.#startupTimeoutMs + this.#lifecycleTimeoutMs))
+  }
+
   async #stop(report: ReportStep, signal: AbortSignal, saveFirst: boolean): Promise<Record<string, unknown>> {
     const before = await this.#inspect(true)
     if (!before.process) return { alreadyStopped: true, state: 'stopped' }
@@ -916,7 +922,7 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         if (stopped) {
           report('恢复尚未开始，正在恢复服务器运行状态')
-          try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+          try { await this.#startWithTimeout(report) } catch (restartError) {
             throw new GameAdapterError('RESTORE_STOP_RECOVERY_START_FAILED', 'Stopping for restore failed after the server exited, and the server could not be restarted.', {
               cause: new AggregateError([error, restartError])
             })
@@ -959,7 +965,7 @@ export class WindowsGameAdapter implements GameAdapter {
       }
       if (stoppedForRestore && (!(error instanceof GameAdapterError) || error.code !== 'RESTORE_ROLLBACK_FAILED')) {
         report('恢复未完成，正在恢复服务器运行状态')
-        try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+        try { await this.#startWithTimeout(report) } catch (restartError) {
           throw new GameAdapterError('RESTORE_RECOVERY_START_FAILED', 'Restore failed and the previously running server could not be restarted.', {
             cause: new AggregateError([error, restartError])
           })
@@ -971,7 +977,7 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#currentSave = startupSelectionApplied && restoredSave ? { name: manifest.saveName, savedAt: restoredSave.modifiedAt } : null
     let restarted = false
     if (wasRunning) {
-      try { await this.#start(report, AbortSignal.timeout(75_000)); restarted = true } catch (error) {
+      try { await this.#startWithTimeout(report); restarted = true } catch (error) {
         throw new GameAdapterError('RESTORE_START_FAILED', 'The backup was restored, but the server could not be restarted.', { cause: error })
       }
     }
@@ -1306,7 +1312,7 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         if (stopped) {
           report(`${operationLabel}尚未开始，正在恢复服务器运行状态`)
-          try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+          try { await this.#startWithTimeout(report) } catch (restartError) {
             let stopError: unknown = null
             try { await this.#confirmStoppedForUpdateRecovery(operationLabel, report) } catch (recoveryStopError) { stopError = recoveryStopError }
             throw new GameAdapterError('UPDATE_STOP_RECOVERY_START_FAILED', `Stopping for ${operationLabel} failed after the server exited, and the server could not be restarted.`, {
@@ -1333,7 +1339,7 @@ export class WindowsGameAdapter implements GameAdapter {
         if (!stopped) throw error
         report(`${operationLabel}未完成，正在恢复服务器运行状态`)
         try {
-          const start = await this.#start(report, AbortSignal.timeout(75_000))
+          const start = await this.#startWithTimeout(report)
           if (start.alreadyRunning === true) throw new GameAdapterError('UPDATE_RECOVERY_PROCESS_PRESENT', 'A game process appeared before the recovery start task could run.')
         } catch (restartError) {
           let stopError: unknown = null
@@ -1350,7 +1356,7 @@ export class WindowsGameAdapter implements GameAdapter {
     if (wasRunning) {
       report(`${operationLabel}已完成，正在重新启动服务器`)
       try {
-        const start = await this.#start(report, AbortSignal.timeout(75_000))
+        const start = await this.#startWithTimeout(report)
         if (start.alreadyRunning === true) throw new GameAdapterError('UPDATE_START_PROCESS_PRESENT', 'A game process appeared before the post-update start task could run.')
         restarted = true
       } catch (startError) {
@@ -1369,7 +1375,7 @@ export class WindowsGameAdapter implements GameAdapter {
         report('已恢复安装前版本，正在重新启动服务器')
         try {
           await this.#confirmStoppedForUpdateRecovery(operationLabel, report)
-          const recoveryStart = await this.#start(report, AbortSignal.timeout(75_000))
+          const recoveryStart = await this.#startWithTimeout(report)
           if (recoveryStart.alreadyRunning === true) {
             throw new GameAdapterError('UPDATE_RECOVERY_PROCESS_PRESENT', 'A game process appeared before the restored-version start task could run.')
           }
@@ -1506,7 +1512,7 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         if (stopped) {
           report(`${operationLabel}尚未开始，正在恢复服务器运行状态`)
-          try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+          try { await this.#startWithTimeout(report) } catch (restartError) {
             throw new GameAdapterError('MOD_REMOVAL_STOP_RECOVERY_START_FAILED', `Stopping for ${operationLabel} failed after the server exited, and the server could not be restarted.`, {
               cause: new AggregateError([error, restartError])
             })
@@ -1526,7 +1532,7 @@ export class WindowsGameAdapter implements GameAdapter {
       const rollbackIncomplete = error instanceof GameAdapterError && ['MOD_REMOVAL_ROLLBACK_FAILED', 'MOD_RESTORE_ROLLBACK_FAILED'].includes(error.code)
       if (stoppedForOperation && !rollbackIncomplete) {
         report(`${operationLabel}未完成，正在恢复服务器运行状态`)
-        try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+        try { await this.#startWithTimeout(report) } catch (restartError) {
           throw new GameAdapterError('MOD_REMOVAL_RECOVERY_START_FAILED', `${operationLabel} failed and the previously running server could not be restarted.`, {
             cause: new AggregateError([error, restartError])
           })
@@ -1539,7 +1545,7 @@ export class WindowsGameAdapter implements GameAdapter {
     if (wasRunning) {
       report(`${operationLabel}已完成，正在重新启动服务器`)
       try {
-        await this.#start(report, AbortSignal.timeout(75_000))
+        await this.#startWithTimeout(report)
         restarted = true
       } catch (startError) {
         report(`服务器未能在${operationLabel}后启动，正在恢复操作前的模组状态`)
@@ -1553,7 +1559,7 @@ export class WindowsGameAdapter implements GameAdapter {
           })
         }
         report('操作前的模组状态已恢复，正在恢复服务器运行状态')
-        try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (recoveryStartError) {
+        try { await this.#startWithTimeout(report) } catch (recoveryStartError) {
           throw new GameAdapterError('MOD_REMOVAL_RECOVERY_START_FAILED', `${operationLabel} was rolled back after a restart failure, but the server still could not be started.`, {
             cause: new AggregateError([startError, recoveryStartError])
           })
@@ -1609,7 +1615,7 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         if (stopped) {
           report(`${operationLabel}尚未开始，正在恢复服务器运行状态`)
-          try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+          try { await this.#startWithTimeout(report) } catch (restartError) {
             throw new GameAdapterError('MOD_CONFIG_STOP_RECOVERY_START_FAILED', `Stopping for ${operationLabel} failed after the server exited, and the server could not be restarted.`, {
               cause: new AggregateError([error, restartError])
             })
@@ -1626,7 +1632,7 @@ export class WindowsGameAdapter implements GameAdapter {
     } catch (error) {
       if (stoppedForOperation) {
         report(`${operationLabel}未完成，正在恢复服务器运行状态`)
-        try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (restartError) {
+        try { await this.#startWithTimeout(report) } catch (restartError) {
           throw new GameAdapterError('MOD_CONFIG_RECOVERY_START_FAILED', `${operationLabel} failed and the previously running server could not be restarted.`, {
             cause: new AggregateError([error, restartError])
           })
@@ -1639,7 +1645,7 @@ export class WindowsGameAdapter implements GameAdapter {
     if (wasRunning) {
       report(`${operationLabel}已完成，正在重新启动服务器`)
       try {
-        await this.#start(report, AbortSignal.timeout(75_000))
+        await this.#startWithTimeout(report)
         restarted = true
       } catch (startError) {
         report('服务器未能以新配置启动，正在恢复修改前的配置')
@@ -1653,7 +1659,7 @@ export class WindowsGameAdapter implements GameAdapter {
           })
         }
         report('修改前的配置已恢复，正在恢复服务器运行状态')
-        try { await this.#start(report, AbortSignal.timeout(75_000)) } catch (recoveryStartError) {
+        try { await this.#startWithTimeout(report) } catch (recoveryStartError) {
           throw new GameAdapterError('MOD_CONFIG_RECOVERY_START_FAILED', `${operationLabel} was rolled back after a restart failure, but the server still could not be started.`, {
             cause: new AggregateError([startError, recoveryStartError])
           })

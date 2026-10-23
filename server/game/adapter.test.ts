@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ControlConfig } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 import { createGameAdapter } from './index.js'
@@ -790,6 +790,61 @@ describe('Windows adapter fixture behavior', () => {
     const backups = await adapter.backups()
     expect(backups.filter((item) => item.reason === 'automatic-before-restore')).toHaveLength(1)
     expect(backups.some((item) => item.id === backup.backupId && item.reason === 'manual')).toBe(true)
+  })
+
+  it('waits through a slow restored-game start for the configured startup budget', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    for (const extension of ['dsv', 'server', 'moddsv']) {
+      await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `original-${extension}`)
+    }
+    let running = false
+    let processId = 4242
+    let lateReady = Promise.resolve()
+    const adapter = new WindowsGameAdapter(fixture, {
+      lifecycleTimeoutMs: 500,
+      startupTimeoutMs: 200_000,
+      pollIntervalMs: 5,
+      inspect: async () => ({
+        process: running ? { pid: processId, startedAt: new Date(Date.now() - 1_000).toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave: 'World' } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: true, configuredTargetUps: 60 }
+      }),
+      runScript: async <T>() => {
+        running = true
+        processId += 1
+        lateReady = (async () => {
+          await new Promise(resolve => setTimeout(resolve, 1_250))
+          await prepareBridge(fixture, processId)
+        })()
+        return {} as T
+      }
+    })
+    const backup = await adapter.run('backup', { saveId: (await adapter.saves())[0]!.id }, () => undefined, new AbortController().signal)
+    for (const extension of ['dsv', 'server', 'moddsv']) {
+      await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `changed-${extension}`)
+    }
+    running = true
+    const secret = await prepareBridge(fixture, processId)
+    // Compress explicit abort deadlines 100x: readiness arrives after the old
+    // 75-second allowance but within the configured 200-second startup budget.
+    const nativeTimeout = AbortSignal.timeout.bind(AbortSignal)
+    const timeout = vi.spyOn(AbortSignal, 'timeout').mockImplementation(milliseconds => nativeTimeout(Math.max(1, Math.ceil(milliseconds / 100))))
+    const workers = Promise.all([
+      bridgeSaveWorker(fixture, secret, 'World'),
+      bridgeStopWorker(fixture, secret, () => { running = false })
+    ])
+    try {
+      await expect(adapter.run('restore', { backupId: backup.backupId }, () => undefined, new AbortController().signal))
+        .resolves.toMatchObject({ saveName: 'World', restarted: true })
+      for (const extension of ['dsv', 'server', 'moddsv']) {
+        await expect(fs.readFile(path.join(fixture.game.saveDirectory, `World.${extension}`), 'utf8')).resolves.toBe(`original-${extension}`)
+      }
+    } finally {
+      timeout.mockRestore()
+      await workers
+      await lateReady
+    }
   })
 
   it('pins both saves protected by one running restore when backupKeep is one', async () => {
