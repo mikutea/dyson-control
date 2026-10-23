@@ -239,7 +239,8 @@ function Install-AtomicFile([string]$Source, [string]$Target) {
     Write-NewFile $temporary ([IO.File]::ReadAllBytes($Source))
     if (Test-Path -LiteralPath $Target) {
       [void](Get-PlainFile $Target 'Existing deployment target')
-      [IO.File]::Replace($temporary, $Target, $null, $true)
+      # PowerShell converts $null to an empty string for this .NET parameter.
+      [IO.File]::Replace($temporary, $Target, [NullString]::Value, $true)
     }
     else { [IO.File]::Move($temporary, $Target) }
   }
@@ -253,7 +254,7 @@ function Write-AtomicText([string]$Text, [string]$Target) {
     Write-NewFile $temporary $utf8NoBom.GetBytes($Text)
     if (Test-Path -LiteralPath $Target) {
       [void](Get-PlainFile $Target 'Existing text target')
-      [IO.File]::Replace($temporary, $Target, $null, $true)
+      [IO.File]::Replace($temporary, $Target, [NullString]::Value, $true)
     }
     else { [IO.File]::Move($temporary, $Target) }
   }

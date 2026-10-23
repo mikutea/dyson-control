@@ -37,7 +37,7 @@ if ($bridgeHash -cne [string]$bridgeManifest.dll.sha256) { throw 'Bridge SHA-256
   -ConfigPath $config `
   -BridgeBuildDirectory $bridgeBuild `
   -BridgeSha256 $bridgeHash `
-  -GameUser 'DYSON\DysonServer' `
+  -GameUser 'GAMEHOST\GameRunner' `
   -PrepareOnly `
   -OutputDirectory 'C:\Temp\dyson-game-plan'
 ```
@@ -72,7 +72,7 @@ ExpectedSaveDirectory = D:\DysonData\Save
   -ConfigPath $config `
   -BridgeBuildDirectory $bridgeBuild `
   -BridgeSha256 $bridgeHash `
-  -GameUser 'DYSON\DysonServer' `
+  -GameUser 'GAMEHOST\GameRunner' `
   -ConfirmStopped
 ```
 

@@ -220,13 +220,38 @@ try {
   }, $true)
   Assert-True ($null -ne $verificationFunction) 'Unable to locate task registration verification implementation.'
   Invoke-Expression $verificationFunction.Extent.Text
-  foreach ($functionName in @('Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots')) {
+  foreach ($functionName in @('Get-FullPath', 'Get-PlainDirectory', 'Get-PlainFile', 'Write-NewFile', 'Install-AtomicFile', 'Write-AtomicText', 'Protect-SystemAdministratorsOnly', 'New-AclSnapshot', 'Grant-GameUserAccess', 'Get-AclComparisonSddl', 'Restore-AclSnapshots')) {
     $functionAst = $verificationAst.Find({
       param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $functionName
     }, $true)
     Assert-True ($null -ne $functionAst) "Unable to locate $functionName implementation."
     Invoke-Expression $functionAst.Extent.Text
   }
+  $replacementSource = Join-Path $fixture 'replacement-source.bin'
+  $replacementTarget = Join-Path $fixture 'replacement target.bin'
+  $replacementBackup = Join-Path $fixture 'replacement-original.bin'
+  [IO.File]::WriteAllBytes($replacementSource, [byte[]](0, 127, 255, 42))
+  [IO.File]::WriteAllBytes($replacementBackup, [byte[]](1, 2, 3))
+  Install-AtomicFile $replacementBackup $replacementTarget
+  Assert-True ((Get-FileHash -LiteralPath $replacementTarget).Hash -ceq (Get-FileHash -LiteralPath $replacementBackup).Hash) 'Atomic install did not create the absent target.'
+  Install-AtomicFile $replacementSource $replacementTarget
+  Assert-True ((Get-FileHash -LiteralPath $replacementTarget).Hash -ceq (Get-FileHash -LiteralPath $replacementSource).Hash) 'Atomic install did not replace the existing target.'
+  Install-AtomicFile $replacementBackup $replacementTarget
+  Assert-True ((Get-FileHash -LiteralPath $replacementTarget).Hash -ceq (Get-FileHash -LiteralPath $replacementBackup).Hash) 'Atomic rollback did not restore the original file.'
+  $replacementText = Join-Path $fixture 'replacement text.json'
+  Write-AtomicText '{"version":1}' $replacementText
+  Write-AtomicText '{"version":2}' $replacementText
+  Assert-True ([IO.File]::ReadAllText($replacementText) -ceq '{"version":2}') 'Atomic text replacement failed.'
+  $lockedTarget = [IO.File]::Open($replacementText, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+  $replacementRejected = $false
+  try {
+    try { Write-AtomicText '{"version":3}' $replacementText } catch { $replacementRejected = $true }
+  }
+  finally { $lockedTarget.Dispose() }
+  Assert-True $replacementRejected 'Atomic replacement did not reject a locked destination.'
+  Assert-True ([IO.File]::ReadAllText($replacementText) -ceq '{"version":2}') 'Failed atomic replacement changed the original text.'
+  Assert-True (@(Get-ChildItem -LiteralPath $fixture -Filter '.dyson-control-*.tmp' -File).Count -eq 0) 'Atomic replacement left temporary files.'
+
   $legacySddl = 'O:SYG:BAD:(A;OICI;FR;;;SY)(A;;FR;;;BA)'
   $autoInheritedSddl = 'O:SYG:BAD:AI(A;OICI;FR;;;SY)(A;;FR;;;BA)'
   Assert-True ((Get-AclComparisonSddl $legacySddl) -ceq (Get-AclComparisonSddl $autoInheritedSddl)) 'ACL comparison rejected the Windows automatic-inheritance marker.'
