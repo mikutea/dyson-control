@@ -1120,6 +1120,40 @@ describe('Windows adapter fixture behavior', () => {
     sampledAt += 2_500
     processorSeconds += 5
     expect((await adapter.overview()).metrics.cpuPercent).toBe(50)
+    sampledAt += 250
+    expect((await adapter.overview()).metrics.cpuPercent).toBe(50)
+    sampledAt += 2_250
+    processorSeconds += 5
+    expect((await adapter.overview()).metrics.cpuPercent).toBe(50)
+  })
+
+  it('uses the process sample time and resets CPU rates when a PID is reused', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    let requestedAt = 100_000
+    let measuredAt = 99_000
+    let processorSeconds = 20
+    let startedAt = new Date(90_000).toISOString()
+    const adapter = new WindowsGameAdapter(fixture, {
+      logicalProcessorCount: 4,
+      clock: () => requestedAt,
+      inspect: async () => ({
+        sampledAtUnixMs: measuredAt,
+        process: { pid: 4242, startedAt, workingSetBytes: 1024, totalProcessorSeconds: processorSeconds, targetUps: 60, selectedSave: null },
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: true, configuredTargetUps: null }
+      })
+    })
+    expect((await adapter.overview()).metrics.cpuPercent).toBeNull()
+    requestedAt += 3_500
+    measuredAt += 2_500
+    processorSeconds += 5
+    expect((await adapter.overview()).metrics.cpuPercent).toBe(50)
+    requestedAt += 2_500
+    measuredAt += 2_500
+    startedAt = new Date(104_000).toISOString()
+    processorSeconds = 1
+    expect((await adapter.overview()).metrics.cpuPercent).toBeNull()
   })
 
   it('refuses to disable a package required by another enabled package', async () => {

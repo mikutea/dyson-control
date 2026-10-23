@@ -34,22 +34,24 @@ function normalize(sample: HostNetworkCounterSample | null | undefined): Normali
 /** Converts host-wide cumulative physical-adapter counters into rates without bridging adapter/reset boundaries. */
 export class HostNetworkRateTracker {
   #previous: NormalizedSample | null = null
+  #rates: HostNetworkRates = { receiveBytesPerSecond: null, sendBytesPerSecond: null }
 
   update(sample: HostNetworkCounterSample | null | undefined): HostNetworkRates {
     const current = normalize(sample)
     if (!current) {
       this.#previous = null
-      return { receiveBytesPerSecond: null, sendBytesPerSecond: null }
+      return this.#rates = { receiveBytesPerSecond: null, sendBytesPerSecond: null }
     }
     const previous = this.#previous
     if (!previous) {
       this.#previous = current
-      return { receiveBytesPerSecond: null, sendBytesPerSecond: null }
+      return this.#rates = { receiveBytesPerSecond: null, sendBytesPerSecond: null }
     }
     if (current.sampledAtUnixMs === previous.sampledAtUnixMs) {
-      return { receiveBytesPerSecond: null, sendBytesPerSecond: null }
+      return this.#rates
     }
     this.#previous = current
+    this.#rates = { receiveBytesPerSecond: null, sendBytesPerSecond: null }
     const elapsedSeconds = (current.sampledAtUnixMs - previous.sampledAtUnixMs) / 1000
     if (elapsedSeconds <= 0 || current.adapters.size !== previous.adapters.size) {
       return { receiveBytesPerSecond: null, sendBytesPerSecond: null }
@@ -64,7 +66,7 @@ export class HostNetworkRateTracker {
       receivedDelta += counters.receivedBytes - prior.receivedBytes
       sentDelta += counters.sentBytes - prior.sentBytes
     }
-    return {
+    return this.#rates = {
       receiveBytesPerSecond: Number(receivedDelta) / elapsedSeconds,
       sendBytesPerSecond: Number(sentDelta) / elapsedSeconds
     }

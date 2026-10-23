@@ -16,6 +16,8 @@
 
 CPU 和内存来自受管游戏进程，磁盘表示存档卷剩余空间；UPS、TPS 来自 Bridge 的实际游戏采样。不可用的数据返回空值，不用目标 UPS 代替实际值。运行采样保留 7 天，长时间范围按时间分组展示。
 
+CPU 使用实际读取进程计数器的时间计算，并按逻辑处理器数量归一化。页面与后台监控读取同一个短期缓存样本时，保留该样本已计算的 CPU 和网络速率；重复读取不会生成一个新的零值样本。游戏进程替换后，CPU 从新的基线重新计算。
+
 网络显示主机处于 Up 状态的物理网卡收发总速率，通过 `Get-NetAdapter -Physical` 和 `Get-NetAdapterStatistics` 的累计字节差计算；不表示游戏进程专属流量。首次采样、网卡集合变化、计数器重置、没有符合条件的网卡或读取失败时显示不可用。虚拟网卡与隧道不参与合计；若虚拟机只暴露虚拟接口，此项可能没有数据。采集口径依据 [Get-NetAdapter](https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapter) 与 [Get-NetAdapterStatistics](https://learn.microsoft.com/en-us/powershell/module/netadapter/get-netadapterstatistics)。
 
 默认磁盘低于 5 GiB，或实际 UPS 连续一分钟低于 30 时告警。后台还会显示 Bridge 未就绪、读取失败、备份失败、游戏意外停止和恢复暂停。告警目前在管理页面呈现，没有外部邮件或手机推送。

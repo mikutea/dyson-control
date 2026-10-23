@@ -26,6 +26,7 @@ import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
 import { SteamGameUpdateBackend } from './steam-update.js'
 
 interface InspectResult {
+  sampledAtUnixMs?: number
   process: null | { pid: number; startedAt: string; workingSetBytes: number; totalProcessorSeconds: number; targetUps: number | null; selectedSave: string | null }
   versions: { game: string | null; nebula: string | null; bepinex: string | null }
   tasks: { start: boolean; startManaged: boolean; configuredTargetUps: number | null }
@@ -154,8 +155,8 @@ export class WindowsGameAdapter implements GameAdapter {
   #settings: StoredSettings
   #startupSettings: StartupSettings
   #initialization: Promise<void>
-  #inspectCache: { at: number; value: InspectResult } | null = null
-  #lastCpu: { at: number; seconds: number; pid: number } | null = null
+  #inspectCache: { at: number; value: InspectResult & { sampledAtUnixMs: number } } | null = null
+  #lastCpu: { at: number; seconds: number; pid: number; startedAt: string; percent: number | null } | null = null
   #currentSave: { name: string; savedAt: string } | null = null
   #lastSaveReceipt: SaveReceipt | null = null
 
@@ -279,7 +280,7 @@ export class WindowsGameAdapter implements GameAdapter {
     return expired.length
   }
 
-  async #inspect(fresh = false): Promise<InspectResult> {
+  async #inspect(fresh = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
     await this.#initialization
     if (!fresh && this.#inspectCache && this.#clock() - this.#inspectCache.at < 2_000) return this.#inspectCache.value
     const value = this.#inspectOverride
@@ -292,8 +293,9 @@ export class WindowsGameAdapter implements GameAdapter {
           startupSettingsPath: this.#startupSettingsPath,
           startTaskName: this.#config.game.startTaskName
         })
-    this.#inspectCache = { at: this.#clock(), value }
-    return value
+    const snapshot = { ...value, sampledAtUnixMs: value.sampledAtUnixMs ?? this.#clock() }
+    this.#inspectCache = { at: this.#clock(), value: snapshot }
+    return snapshot
   }
 
   async overview(): Promise<Overview> {
@@ -339,12 +341,19 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     let cpuPercent: number | null = null
     if (process) {
-      const sampledAt = this.#clock()
-      if (this.#lastCpu?.pid === process.pid) {
-        const elapsed = (sampledAt - this.#lastCpu.at) / 1000
-        if (elapsed > 0) cpuPercent = Math.max(0, Math.min(100, ((process.totalProcessorSeconds - this.#lastCpu.seconds) / elapsed / this.#logicalProcessorCount) * 100))
+      const sampledAt = inspection.sampledAtUnixMs
+      const previous = this.#lastCpu
+      const sameProcess = previous?.pid === process.pid && previous.startedAt === process.startedAt
+      if (sameProcess && sampledAt === previous.at) {
+        cpuPercent = previous.percent
+      } else if (!sameProcess || sampledAt > previous.at) {
+        if (sameProcess) {
+          const elapsed = (sampledAt - previous.at) / 1000
+          const delta = process.totalProcessorSeconds - previous.seconds
+          if (elapsed > 0 && Number.isFinite(delta) && delta >= 0) cpuPercent = Math.min(100, (delta / elapsed / this.#logicalProcessorCount) * 100)
+        }
+        this.#lastCpu = { at: sampledAt, seconds: process.totalProcessorSeconds, pid: process.pid, startedAt: process.startedAt, percent: cpuPercent }
       }
-      this.#lastCpu = { at: sampledAt, seconds: process.totalProcessorSeconds, pid: process.pid }
     } else this.#lastCpu = null
     const networkRates = this.#networkRates.update(inspection.network)
     const currentName = process?.selectedSave ?? this.#currentSave?.name ?? (inspection.tasks.startManaged ? this.#startupSettings.saveName : null)

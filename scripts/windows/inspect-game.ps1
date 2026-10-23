@@ -45,6 +45,9 @@ if ($null -ne $process) {
   }
 }
 
+# Stamp the CPU counter when it is read, before the remaining host/task queries.
+$processSampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+
 # Host-wide traffic counters. Restricting the set to active physical adapters avoids
 # double-counting Hyper-V/tunnel interfaces; these counters are not process-specific.
 $networkResult = $null
@@ -189,5 +192,6 @@ $result = [ordered]@{
     configuredTargetUps = $configuredTargetUps
   }
   network = $networkResult
+  sampledAtUnixMs = $processSampledAtUnixMs
 }
 $result | ConvertTo-Json -Depth 6 -Compress

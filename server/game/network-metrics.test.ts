@@ -52,6 +52,12 @@ describe('host network rate tracker', () => {
     expect(tracker.update(sample(2_000, [{ id: 'ethernet', receivedBytes: '250', sentBytes: '300' }]))).toEqual({
       receiveBytesPerSecond: 150, sendBytesPerSecond: 200
     })
+    expect(tracker.update(sample(2_000, [{ id: 'ethernet', receivedBytes: '250', sentBytes: '300' }]))).toEqual({
+      receiveBytesPerSecond: 150, sendBytesPerSecond: 200
+    })
+    expect(tracker.update(sample(3_000, [{ id: 'ethernet', receivedBytes: '350', sentBytes: '400' }]))).toEqual({
+      receiveBytesPerSecond: 100, sendBytesPerSecond: 100
+    })
   })
 
   it('rejects malformed and duplicate counters without retaining a stale baseline', () => {
