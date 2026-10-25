@@ -27,6 +27,34 @@ async function fixture(content: string) {
 }
 
 describe('Windows game log tail', () => {
+  it('omits NUL padding rows without consuming the 500-message limit or changing the file', async () => {
+    const lines = Array.from({ length: 500 }, (_, index) => `[Info] Message ${index}`)
+    const content = `${lines.join('\r\n')}\r\n${'\0'.repeat(8000)}\r\n\0 \t\0\r\n\0\0`
+    const { adapter, logFile } = await fixture(content)
+    const entries = await adapter.logs()
+    expect(entries).toHaveLength(500)
+    expect(entries[0]?.message).toBe('[Info] Message 499')
+    expect(entries[499]?.message).toBe('[Info] Message 0')
+    expect(entries.every(entry => !entry.message.includes('\0'))).toBe(true)
+    expect(await fs.readFile(logFile, 'utf8')).toBe(content)
+  })
+
+  it('removes NUL padding before parsing and truncating a meaningful record', async () => {
+    const line = '[2026-10-25T10:07:09Z] Warning: 保留中文\t与缩进'
+    const { adapter, logFile } = await fixture(`${'\0'.repeat(2500)}${line}\0\r\n${line}\r\n`)
+    const before = await adapter.logs()
+    expect(before).toHaveLength(2)
+    expect(before[0]?.id).not.toBe(before[1]?.id)
+    for (const entry of before) expect(entry).toMatchObject({ time: '2026-10-25T10:07:09.000Z', level: 'warning', message: line })
+    await fs.appendFile(logFile, '\0\0\0')
+    expect(await adapter.logs()).toEqual(before)
+  })
+
+  it('returns no messages for a file containing only NUL padding', async () => {
+    const { adapter } = await fixture('\0'.repeat(4096))
+    expect(await adapter.logs()).toEqual([])
+  })
+
   it.each([
     '[Info   :Nebula] Started server',
     '[18:07:09] Started server',

@@ -24,6 +24,7 @@ import { SettingsHistory } from './SettingsHistory'
 import { VersionLockButton } from './VersionLockButton'
 import { ModSideControl } from './ModSideControl'
 import { ControlUpdates } from './ControlUpdates'
+import { ComponentVersionCard } from './ComponentVersionCard'
 
 interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void }
 
@@ -119,10 +120,8 @@ function VersionsPage({ refreshToken, runAction }: PagesProps) {
     <ControlUpdates refreshToken={refreshToken} />
     <Panel className="table-panel">
       <ResourceBody resource={versions} emptyTitle="没有版本信息" emptyDescription="检查服务器配置后再试一次">
-        {(items) => <div className="version-list">{items.map((component) => {
-          const update = component.latest && component.latest !== component.current
-          return <article key={component.id}><div className="version-icon"><PackageCheck /></div><div className="version-copy"><div><h2>{component.name}</h2>{update ? <span className="update-label">可更新</span> : <span className="quiet-label">{component.latest ? '已是最新版本' : '未检查更新'}</span>}</div><p>{component.note}</p><dl><div><dt>当前版本</dt><dd>{component.current}</dd></div><div><dt>最新版本</dt><dd>{component.latest || '尚未检查'}</dd></div><div><dt>更新通道</dt><dd>{component.channel}</dd></div><div><dt>检查时间</dt><dd>{formatDate(component.checkedAt)}</dd></div></dl></div><div className="version-action"><VersionLockButton packageId={component.id === 'game' ? 'steam:1366540' : component.id === 'nebula' ? 'nebula-NebulaMultiplayerMod' : 'xiaoye97-BepInEx'} component={component.id} currentVersion={component.current} locks={locks.error ? null : locks.data} disabled={component.id === 'game' && !component.canInstall} runAction={runAction} />{component.canInstall && update && <Button variant="primary" icon={<CloudDownload />} onClick={() => runAction('install-update', { component: component.id, version: component.latest }, { title: `安装 ${component.name} 更新？`, description: '安装期间服务器可能会重新启动，在线玩家会暂时断开。', label: '安装更新', danger: true })}>安装更新</Button>}</div></article>
-        })}</div>}
+        {(items) => <div className="version-list">{items.map(component => <ComponentVersionCard key={component.id}
+          component={component} locks={locks.error ? null : locks.data} runAction={runAction} />)}</div>}
       </ResourceBody>
     </Panel><UpdateHistory refreshToken={refreshToken} runAction={runAction} /></>
 }

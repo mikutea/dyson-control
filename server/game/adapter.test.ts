@@ -555,6 +555,38 @@ describe('Windows adapter fixture behavior', () => {
     }
   })
 
+  it('exposes verified runtime versions separately when the installed package version is missing', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    const processId = 4242
+    let running = true
+    let inspectedAt = Date.now()
+    const adapter = new WindowsGameAdapter(fixture, {
+      clock: () => inspectedAt,
+      inspect: async () => ({
+        process: running ? { pid: processId, startedAt: new Date().toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave: null } : null,
+        versions: { game: null, nebula: null, bepinex: 'unverified-file-version' },
+        tasks: { start: true, startManaged: true, configuredTargetUps: null }
+      }),
+      updates: updateFixture({
+        installedPackageVersion: async () => null,
+        versions: async current => [{ id: 'bepinex', name: 'BepInEx', current: current.bepinex, latest: '5.4.17', checkedAt: null, channel: 'fixture', canInstall: true, note: 'fixture' }]
+      })
+    })
+    const secret = await prepareBridge(fixture, processId)
+    await publishBridgeVersions(fixture, secret, processId)
+    expect(await adapter.versions()).toEqual([expect.objectContaining({ current: 'unknown', runtimeVersion: '5.4.17.0' })])
+    await expect(adapter.run('set-version-lock', { component: 'bepinex', locked: true }, () => undefined, new AbortController().signal)).rejects.toMatchObject({ code: 'VERSION_UNKNOWN' })
+    await publishBridgeVersions(fixture, secret, processId, { game: '0.10.34.28470', nebula: '0.9.24.0', bepinex: 'unknown', bridge: '0.1.0' })
+    expect(await adapter.versions()).toEqual([expect.objectContaining({ current: 'unknown', runtimeVersion: null })])
+    await publishBridgeVersions(fixture, secret, processId + 1)
+    expect(await adapter.versions()).toEqual([expect.objectContaining({ current: 'unknown', runtimeVersion: null })])
+    await publishBridgeVersions(fixture, secret, processId)
+    running = false
+    inspectedAt += 2_001
+    expect(await adapter.versions()).toEqual([expect.objectContaining({ current: 'unknown', runtimeVersion: null })])
+  })
+
   it('reads the last signed player event batch after the game has stopped', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })

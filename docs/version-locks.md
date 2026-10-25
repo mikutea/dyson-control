@@ -4,6 +4,8 @@
 
 The existing `BepInEx/.dyson-control-packages.json` file is installed-package inventory. It records what an installer operation placed on disk, including archive hashes used by update and rollback checks. Its presence does not mean that the administrator pinned those versions. Do not use it as the version-lock file or infer locks from it.
 
+The component version API keeps `current` as the installed package version and exposes `runtimeVersion` separately from the current process's signed Bridge snapshot. For example, a running BepInEx assembly may report `5.4.17.0` while its Thunderstore package is `5.4.17`. The version page displays both when available. A runtime version never fills a missing package record, establishes an update comparison, or enables a package lock. A missing package version is shown as unrecorded; explicit installation of a catalog version remains available with the normal restart confirmation.
+
 ## Identities and file format
 
 The game uses the fixed identity `steam:1366540`. Thunderstore packages use their `Owner-Package` full name. Identity matching is case-insensitive; the store returns and writes the canonical lowercase form. Versions are exact, case-sensitive strings.

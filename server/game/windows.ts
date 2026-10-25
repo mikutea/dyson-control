@@ -408,10 +408,14 @@ export class WindowsGameAdapter implements GameAdapter {
       this.#installedComponentPackageVersion('nebula'),
       this.#installedComponentPackageVersion('bepinex')
     ])
-    return this.#updates.versions({
+    const versions = await this.#updates.versions({
       game: runtime?.game ?? 'unknown',
       nebula: nebula ?? 'unknown',
       bepinex: bepinex ?? 'unknown'
+    })
+    return versions.map(component => {
+      const value = runtime?.[component.id]
+      return { ...component, runtimeVersion: value && value !== 'unknown' ? value : null }
     })
   }
 
