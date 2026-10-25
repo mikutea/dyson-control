@@ -45,7 +45,14 @@ export interface UpdateHistoryEntry {
   state: 'prepared' | 'installed' | 'rolled-back' | 'rollback-failed' | 'invalid'
   packages: Array<{ package: string; version: string; sha256: string }>; changeCount: number; canRollback: boolean; error?: string
 }
-export interface ComponentVersion { id: 'game' | 'nebula' | 'bepinex'; name: string; current: string; latest: string | null; checkedAt: string | null; channel: string; canInstall: boolean; note: string }
+export interface ComponentVersion {
+  id: 'game' | 'nebula' | 'bepinex'; name: string
+  /** Installed package version (Steam build for game updates); never inferred from a runtime assembly version. */
+  current: string
+  /** Current-process Bridge evidence, for display only. */
+  runtimeVersion?: string | null
+  latest: string | null; checkedAt: string | null; channel: string; canInstall: boolean; note: string
+}
 export interface ControlVersion { product: 'dyson-control'; version: string }
 
 export type ControlUpdateAvailability = 'available' | 'current' | 'unknown' | 'unavailable'

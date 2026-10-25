@@ -39,10 +39,14 @@ export async function readGameLogs(filePath: string): Promise<LogEntry[]> {
       const contentEnd = data[end - 1] === 0x0d ? end - 1 : end
       if (contentEnd > start) {
         const raw = data.subarray(start, contentEnd)
-        const line = raw.toString('utf8')
-        const level: LogEntry['level'] = /\b(?:error|fatal|exception)\b/i.test(line) ? 'error' : /\b(?:warn|warning)\b/i.test(line) ? 'warning' : 'info'
-        const id = createHash('sha256').update(`${identity}:${position + BigInt(start)}:`).update(raw).digest('hex')
-        entries.push({ id, time: recordedTime(line), level, message: line.slice(0, 2000) })
+        // Ignore NUL padding in the display, preserving the source bytes and
+        // offsets for identity. Padding-only rows must not displace real logs.
+        const line = raw.toString('utf8').replace(/\0/g, '')
+        if (line.trim()) {
+          const level: LogEntry['level'] = /\b(?:error|fatal|exception)\b/i.test(line) ? 'error' : /\b(?:warn|warning)\b/i.test(line) ? 'warning' : 'info'
+          const id = createHash('sha256').update(`${identity}:${position + BigInt(start)}:`).update(raw).digest('hex')
+          entries.push({ id, time: recordedTime(line), level, message: line.slice(0, 2000) })
+        }
       }
       end = newline
     }
