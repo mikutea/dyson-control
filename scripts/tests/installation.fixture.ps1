@@ -103,6 +103,17 @@ function Get-FixtureProcesses {
   })
 }
 
+function Wait-FixtureProcessesAbsent([int]$TimeoutSeconds) {
+  $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+  do {
+    $remaining = @(Get-FixtureProcesses)
+    if ($remaining.Count -eq 0) { return }
+    Start-Sleep -Milliseconds 250
+  } while ([DateTime]::UtcNow -lt $deadline)
+  $details = @($remaining | ForEach-Object { "$($_.Name) (PID $($_.ProcessId))" }) -join ', '
+  throw "Fixture processes remained after the bounded uninstall wait: $details"
+}
+
 function Assert-Utf8JsonWithoutBom([string]$PathValue, [string]$Label) {
   $bytes = [IO.File]::ReadAllBytes($PathValue)
   if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
@@ -385,14 +396,16 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
   $steps.Add('failed-startup-restores-prior-task-version-and-service')
 
   & (Join-Path $sourceRoot 'scripts\windows\uninstall-control.ps1') -InstallRoot $installRoot -TaskName $taskName -HealthCheckTimeoutSeconds 30 -OperationDrainTimeoutSeconds 30
+  $installed = $false
   if ($null -ne (Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue)) { throw 'Fixture task remains after uninstall.' }
-  if (@(Get-FixtureProcesses).Count -ne 0) { throw 'A fixture process remains after uninstall.' }
+  # Windows can briefly retain a task host after the managed Node process exits.
+  # Require every matching process to disappear, without excluding system hosts.
+  Wait-FixtureProcessesAbsent 15
   if (Test-FixtureListener) { throw 'The fixture listener remains reachable after uninstall.' }
   if (Test-Path -LiteralPath (Join-Path $privateRoot 'data\.control-maintenance.json')) { throw 'Maintenance marker remained after uninstall.' }
   if (@(Get-ChildItem -LiteralPath (Join-Path $privateRoot 'data\uploads') -Filter '*.part' -File -ErrorAction SilentlyContinue).Count -ne 0) { throw 'A partial upload remained after uninstall.' }
   if ((Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash -cne $configHash -or (Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash -cne $sentinelHash) { throw 'Uninstall changed private user files.' }
   if (-not (Test-Path -LiteralPath (Join-Path $installRoot ('versions\' + $originalVersion)))) { throw 'Uninstall removed retained program versions.' }
-  $installed = $false
   $steps.Add('uninstall-stops-service-and-preserves-config-data-and-program-versions')
   [ordered]@{schema=1;passed=$true;releaseSha256=$expected;controlUpdateReleaseSha256=$controlUpdateExpected;originalVersion=$originalVersion;scope=$scope;cleanupVerified=$true;steps=@($steps.ToArray());completedAt=[DateTime]::UtcNow.ToString('o')} | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $reportPath -Encoding UTF8
   Write-Output "Installation lifecycle fixture passed. Report: $reportPath"
