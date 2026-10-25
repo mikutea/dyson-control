@@ -128,6 +128,8 @@ $config = 'C:\ProgramData\Dyson Control\control.config.json'
 
 安装失败不会删除私有配置或 `dataDirectory`。脚本只清理本次创建且尚未启用的随机暂存目录；若失败发生在版本目录改名之后，同一发布内容再次安装时会核验 `.installing.json` 中的安装根、版本和内容指纹，确认没有进程使用后才清理该目录。已有安装状态、同名任务、不同内容的同版本目录或无法证明归属的目录都会被拒绝。
 
+npm 的嵌套依赖可能使文件路径超过 260 字符。安装与升级统一使用已验证的 Node.js 运行时清理这类失败暂存目录，避免 Windows PowerShell 5.1 的递归删除限制；不需要修改系统长路径开关或缩短 TEMP。清理只接受指定 `versions` 下的直接子目录，拒绝清理根或其父路径经过目录链接；目录内部的链接只移除链接本身。若清理另有失败，会同时保留原始安装/升级错误。卸载仍保留所有版本与用户数据。
+
 若 Node.js 或 npm 不在 PATH 中，可显式传入 `-NodePath` 和 `-NpmPath`。`-TaskName` 只接受字母、数字、空格、点、下划线和连字符，安装状态会记录精确名称供升级和卸载核对。
 
 服务首次安装后，再按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`。完整包可直接把版本目录中的 `dist\bridge` 作为候选；面板包需要另行构建并提供候选目录。先运行 `-PrepareOnly` 审查计划和待部署文件；真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。脚本默认不启动游戏，也不迁移存档。

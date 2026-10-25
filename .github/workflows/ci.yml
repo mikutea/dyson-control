@@ -109,6 +109,10 @@ jobs:
         shell: powershell
         run: .\scripts\tests\configure-game.fixture.ps1
 
+      - name: Exercise long-path installation cleanup guards
+        shell: powershell
+        run: .\scripts\tests\install-directory.fixture.ps1 -NodePath (Get-Command node.exe).Source
+
       - name: Exercise complete release fixture
         shell: powershell
         run: .\scripts\tests\release.fixture.ps1
@@ -142,6 +146,7 @@ jobs:
             'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1',
             'scripts/windows/uninstall-control.ps1', 'docs/installation.md',
             'scripts/windows/configure-game.ps1', 'docs/game-configuration.md',
+            'scripts/windows/remove-install-directory.ps1',
             'release-manifest.json'
           )
           foreach ($requiredFile in $required) {
@@ -183,7 +188,8 @@ jobs:
           .\scripts\tests\installation.fixture.ps1 `
             -ReleaseArchive $zip[0].FullName `
             -NodePath (Get-Command node.exe).Source `
-            -NpmPath (Get-Command npm.cmd).Source
+            -NpmPath (Get-Command npm.cmd).Source `
+            -LongPaths
 
       - name: Upload release candidate
         uses: actions/upload-artifact@v4

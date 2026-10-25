@@ -183,7 +183,7 @@ function Read-SourcePackage([string]$Root) {
     'package.json', 'package-lock.json', 'control.config.example.json', 'release-manifest.json', 'LICENSE',
     'dist\server\index.js', 'dist\server\admin.js', 'dist\shared\contracts.js', 'dist\web\index.html',
     'scripts\windows\install-control.ps1', 'scripts\windows\upgrade-control.ps1', 'scripts\windows\uninstall-control.ps1',
-    'scripts\windows\configure-game.ps1'
+    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1'
   )) {
     [void](Get-ExistingFile (Join-Path $Root $relativePath) "Release file $relativePath")
   }
@@ -395,7 +395,7 @@ function Remove-AbandonedVersionRoot(
     ([string]$_.CommandLine).IndexOf($expectedIndex, [StringComparison]::OrdinalIgnoreCase) -ge 0
   }
   if ($processes) { throw "Abandoned version directory is still in use by process $(@($processes)[0].ProcessId): $Root" }
-  Remove-Item -LiteralPath $Root -Recurse -Force
+  & (Join-Path $PSScriptRoot 'remove-install-directory.ps1') -Directory $Root -VersionsRoot (Join-Path $InstallRootPath 'versions') -NodePath $NodeExecutable
 }
 
 function Write-InstallState([string]$Path, [object]$State) {
@@ -440,6 +440,7 @@ $stageRoot = Join-Path $versionsRoot ('.install-' + [string]$package.version + '
 $registered = $false
 $versionRootCreated = $false
 $health = $null
+$installError = $null
 try {
   Copy-Release $sourceRoot $stageRoot $package
   Install-ProductionDependencies $stageRoot $npmExecutable
@@ -504,5 +505,11 @@ catch {
   throw $installError
 }
 finally {
-  if ($null -ne $stageRoot -and (Test-Path -LiteralPath $stageRoot)) { Remove-Item -LiteralPath $stageRoot -Recurse -Force }
+  if ($null -ne $stageRoot -and (Test-Path -LiteralPath $stageRoot)) {
+    try { & (Join-Path $PSScriptRoot 'remove-install-directory.ps1') -Directory $stageRoot -VersionsRoot $versionsRoot -NodePath $nodeExecutable }
+    catch {
+      if ($null -ne $installError) { throw "Installation failed: $($installError.Exception.Message) Staging cleanup also failed: $($_.Exception.Message)" }
+      throw
+    }
+  }
 }
