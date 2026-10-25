@@ -24,7 +24,7 @@ export interface PlayerHistoryEntry {
 export interface PlayerHistory {
   entries: PlayerHistoryEntry[]; total: number; status: 'waiting' | 'available' | 'unavailable'; lastReadAt: string | null
 }
-export interface LogEntry { id: string; time: string; level: 'info' | 'warning' | 'error'; message: string }
+export interface LogEntry { id: string; time: string | null; level: 'info' | 'warning' | 'error'; message: string }
 export type ModSide = 'both' | 'server' | 'client' | 'unknown'
 export interface Mod { id: string; name: string; version: string; enabled: boolean; required: boolean; description: string; side: ModSide; sideSource?: 'builtin' | 'administrator' | 'unverified'; updateVersion?: string }
 export interface ModCatalogEntry {

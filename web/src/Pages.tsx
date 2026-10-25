@@ -91,7 +91,7 @@ function OverviewPage({ refreshToken, overview: streamedOverview, onOverview, ru
           </Panel>
         </div>
         <Panel title="最近活动" icon={<Activity />}>
-          {logs.loading && !logs.data ? <LoadingBlock /> : logs.error && !logs.data ? <ErrorBlock message={logs.error} retry={logs.reload} /> : !logs.data?.length ? <EmptyBlock title="暂时没有活动" description="服务器的新消息会显示在这里" /> : <div className="activity-list">{logs.data.slice(0, 6).map((entry) => <div key={entry.id}><StatusDot state={entry.level === 'error' ? 'bad' : entry.level === 'warning' ? 'warning' : 'good'} /><p>{entry.message}</p><time>{formatDate(entry.time)}</time></div>)}</div>}
+          {logs.loading && !logs.data ? <LoadingBlock /> : logs.error && !logs.data ? <ErrorBlock message={logs.error} retry={logs.reload} /> : !logs.data?.length ? <EmptyBlock title="暂时没有活动" description="服务器的新消息会显示在这里" /> : <div className="activity-list">{logs.data.slice(0, 6).map((entry) => <div key={entry.id}><StatusDot state={entry.level === 'error' ? 'bad' : entry.level === 'warning' ? 'warning' : 'good'} /><p>{entry.message}</p><time>{entry.time ? formatDate(entry.time) : '时间未记录'}</time></div>)}</div>}
         </Panel>
       </div>
     </>
@@ -200,7 +200,7 @@ function ServerPage({ refreshToken, overview: streamedOverview, onOverview, runA
     <Panel title="运行记录" icon={<Activity />} action={<a className="button button-quiet" href="/api/logs/download"><Download /><span>下载日志</span></a>}>
       <div className="log-filters"><label><span>级别</span><select value={logLevel} onChange={(event) => setLogLevel(event.target.value)}><option value="all">全部级别</option><option value="info">信息</option><option value="warning">提醒</option><option value="error">错误</option></select></label><label><span>搜索日志</span><input type="search" value={logSearch} onChange={(event) => setLogSearch(event.target.value)} placeholder="输入关键词" /></label><small>每 5 秒刷新</small></div>
       <ResourceBody resource={logs} emptyTitle="暂无运行记录" emptyDescription="服务器开始运行后会显示新消息">
-        {() => filteredLogs.length ? <div className="log-list">{filteredLogs.map((entry) => <div key={entry.id}><time>{formatFullDate(entry.time)}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div> : <EmptyBlock title="没有匹配的记录" description="调整级别或关键词查看其他记录" />}
+        {() => filteredLogs.length ? <div className="log-list">{filteredLogs.map((entry) => <div key={entry.id}><time>{entry.time ? formatFullDate(entry.time) : '时间未记录'}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div> : <EmptyBlock title="没有匹配的记录" description="调整级别或关键词查看其他记录" />}
       </ResourceBody>
     </Panel>
   </>
@@ -246,7 +246,7 @@ function ActivityPage({ refreshToken }: PagesProps) {
   return <><PageHeader title="活动" description="查看管理操作和服务器消息" actions={<div className="segmented"><button className={tab === 'operations' ? 'selected' : ''} onClick={() => setTab('operations')}>管理操作</button><button className={tab === 'logs' ? 'selected' : ''} onClick={() => setTab('logs')}>服务器消息</button></div>} />
     <Panel className="table-panel">
       {tab === 'operations' ? <ResourceBody resource={jobs} emptyTitle="还没有管理操作" emptyDescription="启动、保存或备份后会记录在这里">{(items) => <div className="job-history">{items.map((job) => <article key={job.id}><div className="job-history-head"><span className={`operation-icon operation-${job.state}`}>{job.state === 'succeeded' ? <CheckCircle2 /> : job.state === 'failed' || job.state === 'interrupted' ? <Square /> : <RefreshCw />}</span><div><h2>{actionLabels[job.action]}</h2><p>{formatJobResult(job) || job.message || jobStateLabels[job.state]}</p></div><span className={`job-state state-${job.state}`}>{jobStateLabels[job.state]}</span><time>{formatFullDate(job.createdAt)}</time></div>{job.steps.length > 0 && <details><summary>查看 {job.steps.length} 个步骤</summary><ol>{job.steps.map((step, index) => <li key={`${step.time}-${index}`}><time>{formatDate(step.time)}</time><span>{step.message}</span></li>)}</ol></details>}</article>)}</div>}</ResourceBody>
-        : <ResourceBody resource={logs} emptyTitle="暂无服务器消息" emptyDescription="服务器的新消息会显示在这里">{(items) => <div className="log-list">{items.map((entry) => <div key={entry.id}><time>{formatFullDate(entry.time)}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div>}</ResourceBody>}
+        : <ResourceBody resource={logs} emptyTitle="暂无服务器消息" emptyDescription="服务器的新消息会显示在这里">{(items) => <div className="log-list">{items.map((entry) => <div key={entry.id}><time>{entry.time ? formatFullDate(entry.time) : '时间未记录'}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div>}</ResourceBody>}
     </Panel></>
 }
 

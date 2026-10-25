@@ -13,6 +13,7 @@ import {
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
 } from './bridge.js'
 import { GameAdapterError, invalidInput, unsupported } from './errors.js'
+import { readGameLogs } from './logs.js'
 import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
@@ -395,23 +396,7 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async logs(): Promise<LogEntry[]> {
     await this.#initialization
-    const filePath = this.#config.game.logFile
-    const stat = await fs.stat(filePath).catch(() => null)
-    if (!stat?.isFile()) return []
-    const bytesToRead = Math.min(stat.size, 512 * 1024)
-    const handle = await fs.open(filePath, 'r')
-    try {
-      const buffer = Buffer.alloc(bytesToRead)
-      await handle.read(buffer, 0, bytesToRead, stat.size - bytesToRead)
-      const text = buffer.toString('utf8')
-      const lines = text.split(/\r?\n/).filter(Boolean).slice(bytesToRead < stat.size ? 1 : 0).slice(-500)
-      return lines.map((line, index) => {
-        const timeMatch = /(?:\[)?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)/.exec(line)
-        const parsed = timeMatch ? Date.parse(timeMatch[1]!) : NaN
-        const level: LogEntry['level'] = /\b(?:error|fatal|exception)\b/i.test(line) ? 'error' : /\b(?:warn|warning)\b/i.test(line) ? 'warning' : 'info'
-        return { id: `${stat.mtimeMs}-${index}-${createHash('sha1').update(line).digest('hex').slice(0, 8)}`, time: Number.isFinite(parsed) ? new Date(parsed).toISOString() : stat.mtime.toISOString(), level, message: line.slice(0, 2000) }
-      }).reverse()
-    } finally { await handle.close() }
+    return readGameLogs(this.#config.game.logFile)
   }
 
   async versions(): Promise<ComponentVersion[]> {
@@ -591,6 +576,7 @@ export class WindowsGameAdapter implements GameAdapter {
         const selected = input.saveId === undefined ? await this.#selectBackupDefault() : saveNameFromId(String(input.saveId))
         const reason = input.automatic === true ? 'automatic-scheduled' : 'manual'
         const manifest = await this.#createBackup(selected, reason, report, expectedReceipt?.saveName === selected ? expectedReceipt : null)
+        if (input.automatic === true) await this.#enforceAutomaticBackupRetention(report, new Set([manifest.id]))
         return { backupId: manifest.id, saveName: manifest.saveName, members: manifest.members.map((member) => member.fileName) }
       }
       case 'restore': return this.#restore(input, report, signal)
