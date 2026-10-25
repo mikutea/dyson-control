@@ -223,7 +223,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     if (adapter.source === 'demo') {
       assertNoQuery(request)
       reply.header('content-type', 'text/plain; charset=utf-8').header('content-disposition', 'attachment; filename="dyson-demo.log"')
-      return (await adapter.logs()).map((entry) => `${entry.time} [${entry.level}] ${entry.message}`).join('\n') + '\n'
+      return (await adapter.logs()).map((entry) => `${entry.time ? `${entry.time} ` : ''}[${entry.level}] ${entry.message}`).join('\n') + '\n'
     }
     return sendLogDownload(options.config.game.logFile, request, reply)
   })

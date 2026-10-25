@@ -997,6 +997,159 @@ describe('Windows adapter fixture behavior', () => {
     expect((await adapter.backups()).find((backup) => backup.id === result.backupId)?.reason).toBe('automatic-scheduled')
   })
 
+  it.each([undefined, 2])('enforces scheduled backup retention without restarting with backupKeep=%s', async (configuredKeep) => {
+    const fixture = await config('windows')
+    const keep = configuredKeep ?? 20
+    const extensions = ['dsv', 'server', 'moddsv']
+    for (const extension of extensions) await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `protected-${extension}`)
+    if (configuredKeep !== undefined) {
+      await fs.mkdir(fixture.dataDirectory, { recursive: true })
+      await fs.writeFile(path.join(fixture.dataDirectory, 'game-settings.json'), JSON.stringify({
+        schema: 1, serverName: fixture.game.serverName, backupKeep: configuredKeep, address: fixture.game.address
+      }))
+    }
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({
+      process: null,
+      versions: { game: null, nebula: null, bepinex: null },
+      tasks: { start: true, startManaged: true, configuredTargetUps: null }
+    }) })
+    const signal = new AbortController().signal
+    const manual = await adapter.run('backup', {}, () => undefined, signal)
+    const manualId = String(manual.backupId)
+    const manualRoot = path.join(fixture.game.backupDirectory, manualId)
+    const importedRoot = path.join(fixture.game.backupDirectory, 'imported-backup')
+    await fs.cp(manualRoot, importedRoot, { recursive: true })
+    const imported = JSON.parse(await fs.readFile(path.join(importedRoot, 'manifest.json'), 'utf8'))
+    await fs.writeFile(path.join(importedRoot, 'manifest.json'), JSON.stringify({ ...imported, id: 'imported-backup', reason: 'imported' }))
+    const unmanagedRoot = path.join(fixture.game.backupDirectory, 'automatic-unmanaged')
+    await fs.mkdir(unmanagedRoot)
+    await fs.writeFile(path.join(unmanagedRoot, 'keep.txt'), 'unmanaged content')
+    for (const id of [manualId, 'imported-backup', 'unrelated']) {
+      await fs.writeFile(path.join(fixture.dataDirectory, 'downloads', `${id}.zip`), `protected-cache-${id}`)
+    }
+
+    const scheduledIds: string[] = []
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      for (let attempt = 0; attempt < keep + 2; attempt++) {
+        vi.setSystemTime(new Date(Date.UTC(2026, 0, 1, 0, attempt)))
+        for (const extension of extensions) await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `scheduled-${attempt}-${extension}`)
+        const result = await adapter.run('backup', { automatic: true }, () => undefined, signal)
+        const id = String(result.backupId)
+        scheduledIds.push(id)
+        const root = path.join(fixture.game.backupDirectory, id)
+        expect(result.members).toEqual(extensions.map(extension => `World.${extension}`))
+        const manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8'))
+        expect(manifest).toMatchObject({ id, reason: 'automatic-scheduled' })
+        expect(manifest.members).toEqual(extensions.map(extension => {
+          const content = `scheduled-${attempt}-${extension}`
+          return { fileName: `World.${extension}`, bytes: Buffer.byteLength(content), sha256: createHash('sha256').update(content).digest('hex') }
+        }))
+        for (const extension of extensions) {
+          await expect(fs.readFile(path.join(root, `World.${extension}`), 'utf8')).resolves.toBe(`scheduled-${attempt}-${extension}`)
+        }
+        await fs.writeFile(path.join(fixture.dataDirectory, 'downloads', `${id}.zip`), `cached-${id}`)
+        const automatic = (await adapter.backups()).filter(backup => backup.reason.startsWith('automatic-'))
+        expect(automatic.map(backup => backup.id)).toEqual(scheduledIds.slice(-keep).reverse())
+        for (const expiredId of scheduledIds.slice(0, Math.max(0, scheduledIds.length - keep))) {
+          await expect(fs.lstat(path.join(fixture.game.backupDirectory, expiredId))).rejects.toMatchObject({ code: 'ENOENT' })
+          await expect(fs.lstat(path.join(fixture.dataDirectory, 'downloads', `${expiredId}.zip`))).rejects.toMatchObject({ code: 'ENOENT' })
+        }
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+
+    expect((await adapter.backups()).filter(backup => !backup.reason.startsWith('automatic-'))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: manualId, reason: 'manual' }),
+      expect.objectContaining({ id: 'imported-backup', reason: 'imported' })
+    ]))
+    for (const root of [manualRoot, importedRoot]) {
+      for (const extension of extensions) await expect(fs.readFile(path.join(root, `World.${extension}`), 'utf8')).resolves.toBe(`protected-${extension}`)
+    }
+    await expect(fs.readFile(path.join(unmanagedRoot, 'keep.txt'), 'utf8')).resolves.toBe('unmanaged content')
+    for (const id of [manualId, 'imported-backup', 'unrelated']) {
+      await expect(fs.readFile(path.join(fixture.dataDirectory, 'downloads', `${id}.zip`), 'utf8')).resolves.toBe(`protected-cache-${id}`)
+    }
+    if (configuredKeep === undefined) await expect(fs.lstat(path.join(fixture.dataDirectory, 'game-settings.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('keeps the newly completed scheduled backup when the clock moves backwards', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.dataDirectory, { recursive: true })
+    await fs.writeFile(path.join(fixture.dataDirectory, 'game-settings.json'), JSON.stringify({
+      schema: 1, serverName: fixture.game.serverName, backupKeep: 1, address: fixture.game.address
+    }))
+    for (const extension of ['dsv', 'server', 'moddsv']) await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `current-${extension}`)
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({
+      process: null,
+      versions: { game: null, nebula: null, bepinex: null },
+      tasks: { start: true, startManaged: true, configuredTargetUps: null }
+    }) })
+    const signal = new AbortController().signal
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-01-02T00:00:00.000Z'))
+      const first = await adapter.run('backup', { automatic: true }, () => undefined, signal)
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'))
+      const second = await adapter.run('backup', { automatic: true }, () => undefined, signal)
+      expect((await adapter.backups()).map(backup => backup.id)).toEqual([first.backupId, second.backupId])
+      for (const extension of ['dsv', 'server', 'moddsv']) {
+        await expect(fs.readFile(path.join(fixture.game.backupDirectory, String(second.backupId), `World.${extension}`), 'utf8')).resolves.toBe(`current-${extension}`)
+      }
+      vi.setSystemTime(new Date('2026-01-03T00:00:00.000Z'))
+      const third = await adapter.run('backup', { automatic: true }, () => undefined, signal)
+      expect((await adapter.backups()).map(backup => backup.id)).toEqual([third.backupId])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps all existing automatic backups when a scheduled copy fails before completion', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.dataDirectory, { recursive: true })
+    await fs.writeFile(path.join(fixture.dataDirectory, 'game-settings.json'), JSON.stringify({
+      schema: 1, serverName: fixture.game.serverName, backupKeep: 1, address: fixture.game.address
+    }))
+    for (const extension of ['dsv', 'server', 'moddsv']) await fs.writeFile(path.join(fixture.game.saveDirectory, `World.${extension}`), `current-${extension}`)
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({
+      process: null,
+      versions: { game: null, nebula: null, bepinex: null },
+      tasks: { start: true, startManaged: true, configuredTargetUps: null }
+    }) })
+    const signal = new AbortController().signal
+    const first = await adapter.run('backup', { automatic: true }, () => undefined, signal)
+    const firstId = String(first.backupId)
+    const firstRoot = path.join(fixture.game.backupDirectory, firstId)
+    // Seed an over-limit inventory after initialization, as on a long-running older installation.
+    const olderId = 'older-automatic'
+    const olderRoot = path.join(fixture.game.backupDirectory, olderId)
+    await fs.cp(firstRoot, olderRoot, { recursive: true })
+    const older = JSON.parse(await fs.readFile(path.join(olderRoot, 'manifest.json'), 'utf8'))
+    await fs.writeFile(path.join(olderRoot, 'manifest.json'), JSON.stringify({ ...older, id: olderId, createdAt: '2020-01-01T00:00:00.000Z' }))
+    for (const id of [firstId, olderId]) await fs.writeFile(path.join(fixture.dataDirectory, 'downloads', `${id}.zip`), `cached-${id}`)
+    const copyFile = fs.copyFile.bind(fs)
+    const copied: string[] = []
+    const copy = vi.spyOn(fs, 'copyFile').mockImplementation(async (source, destination, mode) => {
+      if (String(source).endsWith('World.moddsv')) throw new Error('simulated save member copy failure')
+      await copyFile(source, destination, mode)
+      copied.push(path.basename(String(source)))
+    })
+    try {
+      await expect(adapter.run('backup', { automatic: true }, () => undefined, signal)).rejects.toThrow('simulated save member copy failure')
+    } finally {
+      copy.mockRestore()
+    }
+    expect(copied).toEqual(['World.dsv', 'World.server'])
+    expect((await fs.readdir(fixture.game.backupDirectory)).sort()).toEqual([firstId, olderId].sort())
+    for (const id of [firstId, olderId]) {
+      for (const extension of ['dsv', 'server', 'moddsv']) {
+        await expect(fs.readFile(path.join(fixture.game.backupDirectory, id, `World.${extension}`), 'utf8')).resolves.toBe(`current-${extension}`)
+      }
+      await expect(fs.readFile(path.join(fixture.dataDirectory, 'downloads', `${id}.zip`), 'utf8')).resolves.toBe(`cached-${id}`)
+    }
+  })
+
   it('saves, backs up, stops, writes and rolls back mod configuration before restarting', async () => {
     const fixture = await config('windows')
     const configRoot = path.join(fixture.game.root, 'BepInEx', 'config')
