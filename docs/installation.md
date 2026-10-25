@@ -132,7 +132,7 @@ npm 的嵌套依赖可能使文件路径超过 260 字符。安装与升级统�
 
 若 Node.js 或 npm 不在 PATH 中，可显式传入 `-NodePath` 和 `-NpmPath`。`-TaskName` 只接受字母、数字、空格、点、下划线和连字符，安装状态会记录精确名称供升级和卸载核对。
 
-服务首次安装后，再按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`。完整包可直接把版本目录中的 `dist\bridge` 作为候选；面板包需要另行构建并提供候选目录。先运行 `-PrepareOnly` 审查计划和待部署文件；真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。脚本默认不启动游戏，也不迁移存档。
+服务首次安装后，完整包用户可打开[安装与授权](server-setup.md)，在空游戏目录中一键安装服务器。现有游戏接入仍按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`：先运行 `-PrepareOnly` 审查计划，真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。面板包可修复 Steam 授权，但首次安装服务器需要完整包。两个接入流程都不自动启动游戏或迁移存档。
 
 ## 升级与自动回退
 

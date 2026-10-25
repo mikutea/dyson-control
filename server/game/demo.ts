@@ -194,6 +194,8 @@ export class DemoGameAdapter implements GameAdapter {
       case 'write-mod-config': return this.#changeModConfig(input, report, false)
       case 'rollback-mod-config': return this.#changeModConfig(input, report, true)
       case 'create-client-package': return this.#createClientPackage(report)
+      case 'prepare-steamcmd':
+      case 'install-server': throw new GameAdapterError('WINDOWS_REQUIRED', '首次安装需要 Windows 服务器。')
     }
   }
 

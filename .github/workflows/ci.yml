@@ -43,6 +43,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Exercise native Steam authorization console
+        shell: powershell
+        run: .\scripts\tests\steam-terminal.fixture.ps1
+
       - name: Parse Windows scripts
         shell: powershell
         run: |
@@ -108,6 +112,10 @@ jobs:
       - name: Exercise game configuration prepare fixture
         shell: powershell
         run: .\scripts\tests\configure-game.fixture.ps1
+
+      - name: Exercise first-world startup guards
+        shell: powershell
+        run: .\scripts\tests\first-world.fixture.ps1
 
       - name: Exercise long-path installation cleanup guards
         shell: powershell

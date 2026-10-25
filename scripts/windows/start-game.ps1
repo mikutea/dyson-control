@@ -212,9 +212,33 @@ if (-not $bindingMatches) {
   }
 }
 
+function Get-DysonInitialWorldArguments([string]$Root, [string]$Saves, [AllowNull()][string]$SelectedSave) {
+  $pending = Join-Path $Root '.dyson-first-world.json'
+  $consumed = Join-Path $Root '.dyson-first-world-consumed.json'
+  $load = if ([string]::IsNullOrEmpty($SelectedSave)) { @('-load-latest') } else { @('-load', $SelectedSave) }
+  if (-not (Test-Path -LiteralPath $pending)) { return $load }
+  $item = Get-Item -LiteralPath $pending -Force -ErrorAction Stop
+  if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 4096 -or (Test-Path -LiteralPath $consumed)) {
+    throw 'The first-world authorization marker is invalid or already consumed.'
+  }
+  $authorization = Get-Content -LiteralPath $pending -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($authorization.schema -ne 1 -or $authorization.mode -cne 'default' -or [string]$authorization.installationId -notmatch '^first-install-[0-9a-f-]{36}$') {
+    throw 'The first-world authorization marker is invalid.'
+  }
+  $files = @(Get-ChildItem -LiteralPath $Saves -File -Force -ErrorAction Stop)
+  $hasSave = @($files | Where-Object { $_.Extension -ieq '.dsv' }).Count -gt 0
+  $hasSidecar = @($files | Where-Object { $_.Extension -iin @('.server', '.moddsv') }).Count -gt 0
+  if (-not $hasSave -and $hasSidecar) { throw 'Save companions exist without a .dsv; refusing to create a new world.' }
+  # Consume this explicit first-install authorization once. A later loss of saves must
+  # never silently create another world during automatic recovery.
+  [IO.File]::Move($pending, $consumed)
+  if ([string]::IsNullOrEmpty($SelectedSave) -and -not $hasSave) { return @('-newgame-default') }
+  return $load
+}
+
 New-Item -ItemType Directory -Path (Split-Path -Parent $logPath) -Force | Out-Null
 $arguments = @('-batchmode', '-nographics', '-nebula-server', '-ups', [string]$targetUps, '-logFile', $logPath)
-if ($null -eq $saveName) { $arguments += '-load-latest' } else { $arguments += @('-load', $saveName) }
+$arguments += @(Get-DysonInitialWorldArguments $gameRootPath $saveDirectoryPath $saveName)
 $quotedArguments = foreach ($argument in $arguments) {
   if ([string]$argument -match '"') { throw "Unsupported double quote in process argument: $argument" }
   '"{0}"' -f [string]$argument

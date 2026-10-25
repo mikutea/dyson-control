@@ -18,6 +18,7 @@ export const navItems: NavItem[] = [
   { page: 'clients', label: '客户端', icon: CloudCog },
   { page: 'server', label: '服务器', icon: Server },
   { page: 'settings', label: '设置', icon: Settings },
+  { page: 'setup', label: '安装与授权', icon: CloudCog },
   { page: 'activity', label: '活动', icon: Activity },
 ]
 

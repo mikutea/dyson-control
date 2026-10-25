@@ -25,6 +25,8 @@ import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, 
 import { GameUpdateManager } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
 import { SteamGameUpdateBackend } from './steam-update.js'
+import { steamExecutable } from '../steam-auth.js'
+import { acquireSteamProcess } from './steam-process.js'
 
 interface InspectResult {
   sampledAtUnixMs?: number
@@ -200,9 +202,9 @@ export class WindowsGameAdapter implements GameAdapter {
     })
     this.#versionLocks = new VersionLockStore(path.join(config.dataDirectory, 'version-locks.json'))
     this.#updateOverrideConfigured = options.updates !== undefined
-    this.#steamUpdates = config.game.steam ? new SteamGameUpdateBackend({
-      steamCmdPath: config.game.steam.executable,
-      accountName: config.game.steam.accountName,
+    this.#steamUpdates = new SteamGameUpdateBackend({
+      steamCmdPath: steamExecutable(config),
+      accountName: () => config.game.steam?.accountName ?? '',
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'steam-updates', 'work'),
       backupDirectory: path.join(config.dataDirectory, 'steam-updates', 'backups'),
@@ -211,7 +213,7 @@ export class WindowsGameAdapter implements GameAdapter {
         if ((await this.#inspect(true)).process) throw new GameAdapterError('GAME_RUNNING', 'Stop the game before replacing Steam files.')
       },
       versionLocks: this.#versionLocks,
-    }) : null
+    })
     this.#updates = options.updates ?? new GameUpdateManager({
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'updates', 'work'),
@@ -1247,9 +1249,11 @@ export class WindowsGameAdapter implements GameAdapter {
     const component = input.component
     const version = typeof input.version === 'string' ? input.version.trim() : undefined
     if (component === 'game') {
-      if (!this.#steamUpdates && !this.#updateOverrideConfigured) {
+      if (!this.#config.game.steam && !this.#updateOverrideConfigured) {
         throw new GameAdapterError('UPDATE_BACKEND_REQUIRED', 'Game updates require an explicitly configured and authorized Steam update backend.')
       }
+      // Fail before saving/stopping players when login or a version query already owns SteamCMD.
+      const release = acquireSteamProcess(steamExecutable(this.#config)); release()
       if (version) await this.#versionLocks.assertPlan([{ package: GAME_VERSION_LOCK_ID, version }])
     } else {
       const plan = await this.#updates.resolvePackagePlan(componentPackageIds[component], version, signal)

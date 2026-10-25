@@ -7,6 +7,7 @@ import type { ReportStep, UpdateHistoryEntry } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 import type { GameUpdateBackend } from './updates.js'
 import type { VersionLockStore } from './version-locks.js'
+import { acquireSteamProcess } from './steam-process.js'
 
 const appId = '1366540'
 const steamPackage = `steam:${appId}`
@@ -42,7 +43,7 @@ export type SteamCommandRunner = (invocation: SteamCommandInvocation) => Promise
 
 export interface SteamUpdateBackendOptions {
   steamCmdPath: string
-  accountName: string
+  accountName: string | (() => string)
   gameRoot: string
   workDirectory: string
   backupDirectory: string
@@ -354,7 +355,7 @@ function valueFromVdf(text: string, key: string): string | null {
   return match?.[1] ?? null
 }
 
-function parseAppManifest(text: string, expectedBuild?: string): string {
+export function parseAppManifest(text: string, expectedBuild?: string): string {
   const appState = findBlock(text, 'AppState') ?? text
   const manifestAppId = valueFromVdf(appState, 'appid')
   const buildId = valueFromVdf(appState, 'buildid')
@@ -367,7 +368,7 @@ function parseAppManifest(text: string, expectedBuild?: string): string {
   return buildId
 }
 
-function parsePublicBuild(text: string): string {
+export function parsePublicBuild(text: string): string {
   const branches = findBlock(text, 'branches')
   const publicBranch = branches && findBlock(branches, 'public')
   const buildId = publicBranch && valueFromVdf(publicBranch, 'buildid')
@@ -381,7 +382,8 @@ function authFailure(text: string): boolean {
 
 export const runSteamCommand: SteamCommandRunner = async ({ executable, args, cwd, signal, timeoutMs }) => {
   signal.throwIfAborted()
-  return await new Promise<SteamCommandResult>((resolve, reject) => {
+  const release = acquireSteamProcess(executable)
+  try { return await new Promise<SteamCommandResult>((resolve, reject) => {
     const child = spawn(executable, args, {
       cwd,
       shell: false,
@@ -446,7 +448,7 @@ export const runSteamCommand: SteamCommandRunner = async ({ executable, args, cw
       if (terminalError) reject(terminalError)
       else resolve({ exitCode, stdout: Buffer.concat(stdout).toString('utf8'), stderr: Buffer.concat(stderr).toString('utf8'), timedOut })
     }))
-  })
+  }) } finally { release() }
 }
 
 export class SteamGameUpdateBackend implements GameUpdateBackend {
@@ -464,7 +466,7 @@ export class SteamGameUpdateBackend implements GameUpdateBackend {
       backupDirectory: path.resolve(options.backupDirectory),
       protectedPaths: options.protectedPaths.map((item) => path.resolve(item))
     }
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(options.accountName)) {
+    if (typeof options.accountName === 'string' && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(options.accountName)) {
       throw steamError('STEAM_ACCOUNT_INVALID', 'Steam account name contains unsupported characters.')
     }
     for (const protectedPath of this.#options.protectedPaths) {
@@ -610,7 +612,7 @@ export class SteamGameUpdateBackend implements GameUpdateBackend {
       report(`正在通过 SteamCMD 暂存 Steam public build ${expectedBuild}`)
       const result = await this.#run({
         executable: this.#options.steamCmdPath,
-        args: ['+force_install_dir', stageRoot, '+login', this.#options.accountName, '+app_update', appId, 'validate', '+quit'],
+        args: ['+force_install_dir', stageRoot, '+login', this.#accountName(), '+app_update', appId, 'validate', '+quit'],
         cwd: this.#steamRoot,
         signal,
         timeoutMs: commandTimeoutMs
@@ -799,10 +801,17 @@ export class SteamGameUpdateBackend implements GameUpdateBackend {
   }
 
   async #validatePrerequisites(): Promise<void> {
+    this.#accountName()
     await regularFile(this.#options.steamCmdPath, 'SteamCMD executable')
     const session = path.join(this.#steamRoot, 'config', 'config.vdf')
     const stat = await regularFile(session, 'SteamCMD authorized session file', 16 * 1024 * 1024)
     if (stat.size === 0) throw steamError('STEAM_SESSION_REQUIRED', 'SteamCMD has no existing authorized login session.')
+  }
+
+  #accountName(): string {
+    const value = typeof this.#options.accountName === 'function' ? this.#options.accountName() : this.#options.accountName
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(value)) throw steamError('STEAM_ACCOUNT_REQUIRED', '请先在“安装与授权”中登录 Steam 账号。')
+    return value
   }
 
   async #readCurrentBuild(): Promise<string> {
@@ -821,13 +830,13 @@ export class SteamGameUpdateBackend implements GameUpdateBackend {
   async #latestBuild(signal: AbortSignal): Promise<string> {
     const result = await this.#run({
       executable: this.#options.steamCmdPath,
-      args: ['+login', this.#options.accountName, '+app_info_update', '1', '+app_info_print', appId, '+quit'],
+      args: ['+login', this.#accountName(), '+app_info_update', '1', '+app_info_print', appId, '+quit'],
       cwd: this.#steamRoot,
       signal,
       timeoutMs: commandTimeoutMs
     })
     const output = `${result.stdout}\n${result.stderr}`
-    if (authFailure(output)) throw steamError('STEAM_AUTH_REQUIRED', 'SteamCMD requires interactive login or Steam Guard authorization; authorize it outside Dyson Control and retry.')
+    if (authFailure(output)) throw steamError('STEAM_AUTH_REQUIRED', 'SteamCMD 需要登录或 Steam Guard 验证，请前往“安装与授权”完成后重试。')
     if (result.timedOut) throw steamError('STEAM_COMMAND_TIMEOUT', 'SteamCMD app-info lookup timed out.')
     if (result.exitCode !== 0) throw steamError('STEAM_COMMAND_FAILED', `SteamCMD app-info lookup exited with code ${result.exitCode ?? 'unknown'}.`)
     return parsePublicBuild(output)
@@ -835,7 +844,7 @@ export class SteamGameUpdateBackend implements GameUpdateBackend {
 
   #assertInstallCommand(result: SteamCommandResult): void {
     const output = `${result.stdout}\n${result.stderr}`
-    if (authFailure(output)) throw steamError('STEAM_AUTH_REQUIRED', 'SteamCMD requires interactive login or Steam Guard authorization; authorize it outside Dyson Control and retry.')
+    if (authFailure(output)) throw steamError('STEAM_AUTH_REQUIRED', 'SteamCMD 需要登录或 Steam Guard 验证，请前往“安装与授权”完成后重试。')
     if (result.timedOut) throw steamError('STEAM_COMMAND_TIMEOUT', 'SteamCMD update timed out.')
     if (result.exitCode !== 0) throw steamError('STEAM_COMMAND_FAILED', `SteamCMD update exited with code ${result.exitCode ?? 'unknown'}.`)
     if (!output.split(/\r?\n/).some((line) => line.trim() === `Success! App '${appId}' fully installed.`)) {

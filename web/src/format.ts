@@ -1,6 +1,8 @@
 import type { Action, Job, JobState, ServerState } from '../../shared/contracts'
 
 export const actionLabels: Record<Action, string> = {
+  'prepare-steamcmd': '准备 SteamCMD',
+  'install-server': '首次安装服务器',
   start: '启动服务器',
   save: '保存游戏',
   stop: '停止服务器',
@@ -89,6 +91,8 @@ export function formatJobResult(job: Job): string | null {
   if (job.state !== 'succeeded' || !job.result) return null
   const text = (key: string) => typeof job.result?.[key] === 'string' ? String(job.result[key]) : null
   switch (job.action) {
+    case 'prepare-steamcmd': return 'SteamCMD 已就绪，可继续授权'
+    case 'install-server': return '服务器安装完成，等待手动首次启动'
     case 'start': return '服务器已启动'
     case 'stop': return '服务器已安全停止'
     case 'restart': return '服务器已重新启动'

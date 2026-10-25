@@ -25,8 +25,9 @@ import { VersionLockButton } from './VersionLockButton'
 import { ModSideControl } from './ModSideControl'
 import { ControlUpdates } from './ControlUpdates'
 import { ComponentVersionCard } from './ComponentVersionCard'
+import { ServerSetup } from './ServerSetup'
 
-interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void }
+interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void; operationActive: boolean }
 
 export function Pages(props: PagesProps) {
   switch (props.page) {
@@ -39,6 +40,7 @@ export function Pages(props: PagesProps) {
     case 'server': return <ServerPage {...props} />
     case 'settings': return <SettingsPage {...props} />
     case 'activity': return <ActivityPage {...props} />
+    case 'setup': return <ServerSetup refreshToken={props.refreshToken} runAction={props.runAction} operationActive={props.operationActive} />
   }
 }
 
@@ -116,7 +118,7 @@ function PlayersPage({ refreshToken, overview, runAction }: PagesProps) {
 function VersionsPage({ refreshToken, runAction }: PagesProps) {
   const versions = useResource<ComponentVersion[]>('/versions', refreshToken)
   const locks = useResource<VersionLock[]>('/version-locks', refreshToken)
-  return <><PageHeader title="版本" description="查看游戏、联机组件和管理面板的版本" />
+  return <><PageHeader title="版本" description="查看游戏、联机组件和管理面板的版本" actions={<a className="button button-secondary" href="#/setup">Steam 授权</a>} />
     <ControlUpdates refreshToken={refreshToken} />
     <Panel className="table-panel">
       <ResourceBody resource={versions} emptyTitle="没有版本信息" emptyDescription="检查服务器配置后再试一次">
