@@ -49,6 +49,7 @@ const requiredFiles = [
   'scripts/windows/upgrade-control.ps1',
   'scripts/windows/uninstall-control.ps1',
   'scripts/windows/configure-game.ps1',
+  'scripts/windows/remove-install-directory.ps1',
 ]
 for (const file of requiredFiles) await requirePlainFile(file)
 

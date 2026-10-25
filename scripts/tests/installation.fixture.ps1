@@ -9,7 +9,8 @@ param(
   [Parameter(Mandatory = $true)][string]$ReleaseArchive,
   [string]$ControlUpdateArchive = '',
   [Parameter(Mandatory = $true)][string]$NodePath,
-  [Parameter(Mandatory = $true)][string]$NpmPath
+  [Parameter(Mandatory = $true)][string]$NpmPath,
+  [switch]$LongPaths
 )
 
 $ErrorActionPreference = 'Stop'
@@ -34,6 +35,7 @@ $npm = (Resolve-Path -LiteralPath $NpmPath).Path
 $fixtureId = [guid]::NewGuid().ToString('N')
 $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\')
 $root = [IO.Path]::GetFullPath((Join-Path $tempRoot ('dyson-install-fixture-' + $fixtureId)))
+if ($LongPaths -and $root.Length -lt 120) { $root += '-' + ('x' * (119 - $root.Length)) }
 if (-not $root.StartsWith($tempRoot + '\', [StringComparison]::OrdinalIgnoreCase)) { throw 'Fixture escaped the temporary directory.' }
 New-Item -ItemType Directory -Path $root | Out-Null
 $taskName = 'Dyson-Control-Fixture-' + $fixtureId
@@ -53,6 +55,7 @@ $listener.Stop()
 $scope = [ordered]@{
   fixtureId = $fixtureId; taskName = $taskName; fixtureRoot = $root; installRoot = $installRoot;
   configPath = $configPath; dataDirectory = (Join-Path $privateRoot 'data'); loopbackPort = $port
+  longPathMode = $LongPaths.IsPresent
 }
 $installed = $false
 $bootstrapTaskName = $null
@@ -167,6 +170,14 @@ function Wait-FixtureTaskAbsent([string]$Name, [int]$TimeoutSeconds) {
   throw "Fixture task remained registered: $Name"
 }
 
+function Assert-NoStagingDirectories {
+  $versionsRoot = Join-Path $installRoot 'versions'
+  if (Test-Path -LiteralPath $versionsRoot) {
+    $stages = @(Get-ChildItem -LiteralPath $versionsRoot -Directory -Force | Where-Object { $_.Name -match '^\.(install|upgrade)-' })
+    if ($stages.Count -ne 0) { throw 'Failed preparation left an owned staging directory behind.' }
+  }
+}
+
 try {
   Expand-Archive -LiteralPath $archivePath -DestinationPath $sourceRoot
   if (-not [string]::IsNullOrWhiteSpace($ControlUpdateArchive)) {
@@ -195,6 +206,19 @@ fs.mkdirSync(config.dataDirectory,{recursive:true}); fs.writeFileSync(path.join(
   $configHash = (Get-FileHash -LiteralPath $configPath -Algorithm SHA256).Hash
   $sentinelPath = Join-Path $privateRoot 'data\preserved-user-file.txt'
   $sentinelHash = (Get-FileHash -LiteralPath $sentinelPath -Algorithm SHA256).Hash
+  $invalidConfigPath = Join-Path $privateRoot 'invalid-control.config.json'
+  $invalidConfig = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+  $invalidConfig.mode = 'invalid-fixture-mode'
+  Write-Utf8Json $invalidConfigPath $invalidConfig
+  $preparationFailure = $null
+  try {
+    & (Join-Path $sourceRoot 'scripts\windows\install-control.ps1') -SourcePath $sourceRoot -InstallRoot $installRoot -ConfigPath $invalidConfigPath -TaskName $taskName -NodePath $node -NpmPath $npm -HealthCheckTimeoutSeconds 30
+  } catch { $preparationFailure = $_.Exception.Message }
+  if ([string]::IsNullOrWhiteSpace($preparationFailure)) { throw 'The invalid runtime configuration unexpectedly installed.' }
+  Assert-NoStagingDirectories
+  if ((Test-Path -LiteralPath (Join-Path $installRoot 'install-state.json')) -or
+      $null -ne (Get-ScheduledTask -TaskName $taskName -TaskPath '\' -ErrorAction SilentlyContinue)) { throw 'Failed preparation activated an installation.' }
+  $steps.Add('failed-install-preparation-cleans-dependencies-and-allows-retry')
   & (Join-Path $sourceRoot 'scripts\windows\install-control.ps1') -SourcePath $sourceRoot -InstallRoot $installRoot -ConfigPath $configPath -TaskName $taskName -NodePath $node -NpmPath $npm -HealthCheckTimeoutSeconds 30
   $installed = $true
   $first = Get-FixtureHealth
@@ -202,6 +226,14 @@ fs.mkdirSync(config.dataDirectory,{recursive:true}); fs.writeFileSync(path.join(
   Assert-Utf8JsonWithoutBom (Join-Path $installRoot 'install-state.json') 'Initial install state'
   $task = Get-ScheduledTask -TaskName $taskName -TaskPath '\'
   if ($task.Principal.UserId -notin @('SYSTEM', 'S-1-5-18') -or $task.Description -cne 'Dyson Control managed startup task.') { throw 'Unexpected fixture task identity.' }
+  $inspectPaths = @'
+const fs=require('node:fs'),path=require('node:path');let maximum=0,files=0;
+function walk(root){for(const entry of fs.readdirSync(root,{withFileTypes:true})){const file=path.join(root,entry.name);if(entry.isDirectory()&&!entry.isSymbolicLink())walk(file);else{files++;maximum=Math.max(maximum,file.length);}}}
+walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:maximum}));
+'@
+  $pathEvidence = (& $node -e $inspectPaths (Join-Path $installRoot ('versions\' + $originalVersion))) | ConvertFrom-Json
+  if ($LASTEXITCODE -ne 0 -or ($LongPaths -and $pathEvidence.maximumPathCharacters -le 260)) { throw 'The long-path lifecycle did not exercise paths beyond MAX_PATH.' }
+  $scope['installedPathEvidence'] = $pathEvidence
   $steps.Add('install-system-task-and-health')
 
   $operationId = [guid]::NewGuid().ToString()
@@ -318,6 +350,23 @@ fs.mkdirSync(config.dataDirectory,{recursive:true}); fs.writeFileSync(path.join(
   if ($second.version -cne $nextVersion -or $second.processId -eq $first.processId -or [int]$helperStatus.processId -ne [int]$second.processId) { throw 'SYSTEM helper upgrade did not replace the fixture instance.' }
   if ($null -ne (Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$first.processId)" -ErrorAction SilentlyContinue)) { throw 'The pre-upgrade fixture process remains after helper success.' }
   $steps.Add('system-helper-handoff-receipt-cleanup-and-new-pid')
+
+  $invalidSource = New-Candidate (Join-Path $root 'invalid-source') ($versionPrefix + '-fixture.prepare-fail') $false
+  [IO.File]::WriteAllText((Join-Path $invalidSource 'dist\server\admin.js'), "throw new Error('Intentional fixture preparation failure');", $utf8)
+  $priorStateHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'install-state.json') -Algorithm SHA256).Hash
+  $priorTaskXml = Export-ScheduledTask -TaskName $taskName -TaskPath '\'
+  $preparationFailure = $null
+  try {
+    & (Join-Path $sourceRoot 'scripts\windows\upgrade-control.ps1') -SourcePath $invalidSource -InstallRoot $installRoot -TaskName $taskName -HealthCheckTimeoutSeconds 10 -OperationDrainTimeoutSeconds 30
+  } catch { $preparationFailure = $_.Exception.Message }
+  if ([string]::IsNullOrWhiteSpace($preparationFailure)) { throw 'The invalid prepared upgrade unexpectedly succeeded.' }
+  Assert-NoStagingDirectories
+  $unchanged = Get-FixtureHealth
+  if ($unchanged.processId -ne $second.processId -or $unchanged.version -cne $nextVersion -or
+      (Get-FileHash -LiteralPath (Join-Path $installRoot 'install-state.json') -Algorithm SHA256).Hash -cne $priorStateHash -or
+      (Export-ScheduledTask -TaskName $taskName -TaskPath '\') -cne $priorTaskXml -or
+      (Test-Path -LiteralPath (Join-Path $privateRoot 'data\.control-maintenance.json'))) { throw 'Failed preparation changed the active installation.' }
+  $steps.Add('failed-upgrade-preparation-cleans-dependencies-without-interrupting-service')
 
   $badSource = New-Candidate (Join-Path $root 'failed-source') $failedVersion $true
   $expectedFailure = $false
