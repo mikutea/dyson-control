@@ -83,8 +83,6 @@ export class SteamAuthManager {
     if (this.#clock() - this.#lastStart < 3000) throw new ApiError(429, 'steam_auth_rate_limit', '请稍等片刻再重新授权。')
     this.#lastStart = this.#clock()
     const executable = steamExecutable(this.#config)
-    const stat = await fs.lstat(executable).catch(() => null)
-    if (!stat?.isFile() || stat.isSymbolicLink()) throw new ApiError(409, 'steamcmd_missing', '请先准备 SteamCMD。')
     const release = acquireSteamProcess(executable)
     let finish!: () => void
     const done = new Promise<void>(resolve => { finish = resolve })
@@ -100,6 +98,11 @@ export class SteamAuthManager {
     this.#verifiedAt = null
     this.#latestBuild = null
     try {
+      // Reserve ownership before asynchronous filesystem checks so logout or shutdown
+      // can cancel preparation before any console process is launched.
+      const stat = await fs.lstat(executable).catch(() => null)
+      attempt.controller.signal.throwIfAborted()
+      if (!stat?.isFile() || stat.isSymbolicLink()) throw new ApiError(409, 'steamcmd_missing', '请先准备 SteamCMD。')
       const child = this.#options.spawn
         ? this.#options.spawn(executable, ['+login', account, '+quit'], path.dirname(executable))
         : spawn(process.execPath, [fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './steam-terminal.ts' : './steam-terminal.js', import.meta.url)), executable, account], {
@@ -111,9 +114,11 @@ export class SteamAuthManager {
       child.stderr.on('data', (chunk: Buffer) => this.#output(attempt, chunk))
       child.once('error', () => this.#stop(attempt, 'failed', 'SteamCMD 未能启动。'))
       child.once('close', code => { void this.#exited(attempt, code) })
-    } catch {
+    } catch (error) {
       release(); attempt.release = null; clearTimeout(attempt.timer)
-      this.#set(attempt, 'failed', 'SteamCMD 未能启动。'); finish()
+      if (!attempt.stopping) this.#set(attempt, 'failed', 'SteamCMD 未能启动。')
+      finish()
+      if (error instanceof ApiError) throw error
     }
     return this.status(owner)
   }

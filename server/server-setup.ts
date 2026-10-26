@@ -116,6 +116,7 @@ export class ServerSetupManager {
     catch { response.blockers.push('首次安装需要包含已校验 Bridge 的完整面板安装包。') }
     if (!host.gameUsers.some(user => user.activeSteam)) response.blockers.push('请先在服务器上登录 Windows，并在该用户下登录拥有游戏的桌面 Steam。')
     try { this.#assertSeparatedPaths() } catch { response.blockers.push('游戏目录必须与面板数据、存档、备份和 SteamCMD 目录分开。') }
+    try { await this.#assertStoragePaths() } catch { response.blockers.push('存档或备份路径不是普通目录，请检查配置。') }
     return response
   }
 
@@ -232,6 +233,19 @@ export class ServerSetupManager {
       await fs.writeFile(path.join(stagedGame, '.dyson-first-world.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: id }) + '\n', { flag: 'wx' })
       await this.#assertNewRoot(gameUser)
       signal.throwIfAborted()
+      // The Windows configurator needs these directories even on an entirely new host.
+      // Keep any newly created empty directories on failure; never remove user storage.
+      const createdStorageDirectories: string[] = []
+      record.createdStorageDirectories = createdStorageDirectories
+      for (const directory of [this.#config.game.saveDirectory, this.#config.game.backupDirectory]) {
+        if (!await stat(directory)) {
+          await fs.mkdir(directory, { recursive: true })
+          createdStorageDirectories.push(directory)
+        }
+      }
+      await this.#assertStoragePaths()
+      await saveRecord()
+      signal.throwIfAborted()
       if (await stat(root)) await fs.rmdir(root)
       await fs.rename(stagedGame, root); promoted = true
       record.phase = 'configuring'; await saveRecord()
@@ -273,8 +287,16 @@ export class ServerSetupManager {
     }
   }
   #host(): Promise<HostStatus> { return this.#runScript('inspect-server-setup.ps1', { gameRoot: this.#config.game.root, taskName: this.#config.game.startTaskName }) }
+  async #assertStoragePaths(): Promise<void> {
+    for (const directory of [this.#config.game.saveDirectory, this.#config.game.backupDirectory]) {
+      await noLinks(directory)
+      const entry = await stat(directory)
+      if (entry && !entry.isDirectory()) fail('SETUP_STORAGE_INVALID', '存档和备份路径必须是普通目录，不能覆盖已有文件。')
+    }
+  }
   async #assertNewRoot(gameUser: string): Promise<void> {
     if (!await emptyDirectory(this.#config.game.root)) fail('SETUP_TARGET_NOT_EMPTY', '目标目录已有内容，首次安装不会覆盖现有文件。')
+    await this.#assertStoragePaths()
     const host = await this.#host()
     if (host.running || host.taskExists) fail('SETUP_ALREADY_CONFIGURED', '已存在游戏进程或启动任务，不能执行首次安装。')
     if (!host.gameUsers.some(user => user.name === gameUser && user.activeSteam)) fail('SETUP_STEAM_DESKTOP_REQUIRED', '请选择已在服务器上登录桌面 Steam 的 Windows 用户。')

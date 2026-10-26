@@ -20,15 +20,17 @@ const references: Record<string, string> = {
 }
 const sha = (value: string) => createHash('sha256').update(value).digest('hex')
 async function write(file: string, content: string) { await fs.mkdir(path.dirname(file), { recursive: true }); await fs.writeFile(file, content) }
-async function fixture() {
+async function fixture(options: { freshStorage?: boolean } = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-new-server-')); roots.push(root)
   const config: ControlConfig = {
     host: '127.0.0.1', port: 13020, mode: 'windows', dataDirectory: path.join(root, 'control-data'), adminPasswordHash: 'test-hash',
     game: { root: path.join(root, 'game'), saveDirectory: path.join(root, 'saves'), backupDirectory: path.join(root, 'backups'), logFile: path.join(root, 'game', 'BepInEx', 'LogOutput.log'), bridgeDirectory: path.join(root, 'bridge'), bridgeSecretFile: path.join(root, 'private', 'secret'), startTaskName: 'Fixture-Game', address: 'localhost:8469', serverName: 'Fixture', steam: { executable: path.join(root, 'steam', 'steamcmd.exe'), accountName: 'fixture_account' } },
   }
   await write(config.game.steam!.executable, 'TEST FIXTURE ONLY')
-  await write(path.join(config.game.saveDirectory, 'existing.dsv'), 'UNRELATED SAVE')
-  await write(path.join(config.game.backupDirectory, 'keep.txt'), 'UNRELATED BACKUP')
+  if (!options.freshStorage) {
+    await write(path.join(config.game.saveDirectory, 'existing.dsv'), 'UNRELATED SAVE')
+    await write(path.join(config.game.backupDirectory, 'keep.txt'), 'UNRELATED BACKUP')
+  }
   const releaseRoot = path.join(root, 'release')
   await write(path.join(releaseRoot, 'package.json'), JSON.stringify({ version: '0.1.10' }))
   const bridgeBytes = 'MZ-TEST-BRIDGE-NOT-EXECUTABLE'
@@ -41,6 +43,10 @@ async function fixture() {
   const runScript = vi.fn(async (name: string) => {
     if (name === 'inspect-server-setup.ps1') return { ...host }
     if (name === 'configure-new-server.ps1') {
+      // configure-game.ps1 reads both directories before it can prepare Windows access.
+      for (const directory of [config.game.saveDirectory, config.game.backupDirectory]) {
+        if (!(await fs.stat(directory)).isDirectory()) throw new Error('Configuration requires a storage directory')
+      }
       if (configureFails) { host.taskExists = leaveTask; throw new Error('synthetic configuration failure') }
       host.taskExists = true
       return { configured: true, taskStarted: false, taskName: config.game.startTaskName, bridgeSha256: manifest.dll.sha256 }
@@ -78,6 +84,30 @@ it('installs only into an empty target after dependency validation, without star
   expect(f.run).toHaveBeenCalledOnce()
   expect(f.runScript.mock.calls.map(call => call[0])).not.toContain('invoke-scheduled-task.ps1')
   expect((await f.manager.status('owner')).taskExists).toBe(true)
+})
+
+it('prepares absent save and backup directories for a first installation', async () => {
+  const f = await fixture({ freshStorage: true })
+  expect(await f.manager.install('FixtureUser', () => {}, new AbortController().signal)).toMatchObject({ installed: true, gameStarted: false })
+  expect(await fs.readdir(f.config.game.saveDirectory)).toEqual([])
+  expect(await fs.readdir(f.config.game.backupDirectory)).toEqual([])
+})
+
+it.each(['saveDirectory', 'backupDirectory'] as const)('rejects a file at %s before downloading or overwriting storage', async field => {
+  const f = await fixture({ freshStorage: true })
+  await write(f.config.game[field], 'UNRELATED FILE')
+  await expect(f.manager.install('FixtureUser', () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'SETUP_STORAGE_INVALID' })
+  expect(f.run).not.toHaveBeenCalled()
+  expect(await fs.readFile(f.config.game[field], 'utf8')).toBe('UNRELATED FILE')
+  expect((await f.manager.status('owner')).blockers).toContain('存档或备份路径不是普通目录，请检查配置。')
+})
+
+it('does not create storage directories for a Bridge-incompatible first download', async () => {
+  const f = await fixture({ freshStorage: true }); f.mismatch()
+  await expect(f.manager.install('FixtureUser', () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'SETUP_BRIDGE_INCOMPATIBLE' })
+  for (const directory of [f.config.game.saveDirectory, f.config.game.backupDirectory]) {
+    await expect(fs.access(directory)).rejects.toHaveProperty('code', 'ENOENT')
+  }
 })
 
 it.each(['DSPGAME.exe', 'unrelated.txt'])('rejects a populated target containing %s before download or mutation', async file => {

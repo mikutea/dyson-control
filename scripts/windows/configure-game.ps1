@@ -17,6 +17,8 @@ Create a plan and staged files only.
 New directory to create for PrepareOnly output.
 .PARAMETER ConfirmStopped
 Required acknowledgement for apply mode after the managed game has been stopped.
+.PARAMETER RequireNewTask
+First installation only: reject an existing task, including one created during configuration.
 #>
 [CmdletBinding()]
 param(
@@ -26,7 +28,8 @@ param(
   [Parameter(Mandatory = $true)][string]$GameUser,
   [switch]$PrepareOnly,
   [string]$OutputDirectory,
-  [switch]$ConfirmStopped
+  [switch]$ConfirmStopped,
+  [switch]$RequireNewTask
 )
 
 $ErrorActionPreference = 'Stop'
@@ -903,6 +906,14 @@ if (-not $result.ok) { exit 1 }
   if ($null -ne $probeError) { throw $probeError }
 }
 
+function Register-GameStartTask([string]$Name, [object]$Definition, [switch]$RequireNewTask) {
+  # Do not force replacement in first-install mode; the earlier absence check can race
+  # another administrator registering a task while access probes are running.
+  $taskRegistration = @{ TaskName = $Name; TaskPath = '\'; InputObject = $Definition; ErrorAction = 'Stop' }
+  if (-not $RequireNewTask) { $taskRegistration.Force = $true }
+  Register-ScheduledTask @taskRegistration | Out-Null
+}
+
 function Copy-OriginalOrRecordAbsent([string]$Source, [string]$BackupPath, [System.Collections.IDictionary]$Record, [string]$Name) {
   if (Test-Path -LiteralPath $Source) {
     $plain = Get-PlainFile $Source "Existing $Name"
@@ -1065,6 +1076,7 @@ if ($null -ne $nonRootTask) {
   throw "A scheduled task with the configured name exists outside the root task path and would make inspection ambiguous: $($nonRootTask.TaskPath)$($nonRootTask.TaskName)"
 }
 $existingTask = $namedTasks | Where-Object { $_.TaskPath -eq '\' } | Select-Object -First 1
+if ($RequireNewTask -and $null -ne $existingTask) { throw 'First installation cannot replace an existing game task.' }
 if ($null -ne $existingTask -and [string]$existingTask.Description -cne $managedTaskDescription) {
   throw "The exact scheduled task already exists without the Dyson Control ownership marker: $($configuration.StartTaskName)"
 }
@@ -1296,7 +1308,7 @@ try {
   if ([IO.File]::ReadAllText($bridgeConfigTarget, $utf8NoBom) -cne $bridgeConfiguration) { throw 'Deployed Bridge configuration failed exact verification.' }
 
   $taskDefinition = New-GameTask $configuration $managedStartScript $startupSettingsPath $resolvedGameUser
-  Register-ScheduledTask -TaskName $configuration.StartTaskName -TaskPath '\' -InputObject $taskDefinition -Force | Out-Null
+  Register-GameStartTask -Name $configuration.StartTaskName -Definition $taskDefinition -RequireNewTask:$RequireNewTask
   $taskMutated = $true
   $taskVerificationPath = Join-Path $backupRoot 'task-registration-verification.json'
   $installedTask = Wait-ExactTaskRegistration `

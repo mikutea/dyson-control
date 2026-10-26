@@ -8,4 +8,4 @@ if(Get-ScheduledTask -TaskName ([string]$config.game.startTaskName) -TaskPath '\
 # backs up its targets, protects the Bridge secret, and registers a task without starting it.
 & (Join-Path $PSScriptRoot 'configure-game.ps1') -ConfigPath ([string]$inputData.configPath) `
   -BridgeBuildDirectory ([string]$inputData.bridgeDirectory) -BridgeSha256 ([string]$inputData.bridgeSha256) `
-  -GameUser ([string]$inputData.gameUser) -ConfirmStopped
+  -GameUser ([string]$inputData.gameUser) -ConfirmStopped -RequireNewTask

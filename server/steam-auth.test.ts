@@ -109,6 +109,34 @@ it('cancels authentication on session loss and releases the SteamCMD lease only 
   expect(f.run).not.toHaveBeenCalled()
 })
 
+it.each(['session-loss', 'shutdown'] as const)('does not start SteamCMD after %s during executable validation', async reason => {
+  const f = await fixture()
+  const metadata = await fs.lstat(steamExecutable(f.config))
+  let completeLookup!: () => void
+  const lookup = vi.spyOn(fs, 'lstat').mockImplementationOnce(() => new Promise(resolve => {
+    completeLookup = () => resolve(metadata as never)
+  }))
+  try {
+    const starting = f.manager.start('owner', 'fixture_account')
+    const closed = reason === 'shutdown' ? f.manager.close() : Promise.resolve(f.manager.invalidate('owner'))
+    completeLookup()
+    await Promise.all([starting, closed])
+    expect(f.spawn).not.toHaveBeenCalled()
+    expect(f.run).not.toHaveBeenCalled()
+    expect(f.manager.busy).toBe(false)
+    const release = acquireSteamProcess(steamExecutable(f.config)); release()
+  } finally { lookup.mockRestore() }
+})
+
+it('releases a preparation reservation when SteamCMD is missing', async () => {
+  const f = await fixture()
+  await fs.unlink(steamExecutable(f.config))
+  await expect(f.manager.start('owner', 'fixture_account')).rejects.toMatchObject({ code: 'steamcmd_missing', statusCode: 409 })
+  expect(f.spawn).not.toHaveBeenCalled()
+  expect(f.manager.busy).toBe(false)
+  const release = acquireSteamProcess(steamExecutable(f.config)); release()
+})
+
 it('times out and stops its child without exposing console text', async () => {
   const f = await fixture({ timeoutMs: 15 })
   await f.manager.start('owner', 'fixture_account')

@@ -117,6 +117,10 @@ jobs:
         shell: powershell
         run: .\scripts\tests\first-world.fixture.ps1
 
+      - name: Exercise first-install task collision handling
+        shell: powershell
+        run: .\scripts\tests\first-install-task.fixture.ps1
+
       - name: Exercise long-path installation cleanup guards
         shell: powershell
         run: .\scripts\tests\install-directory.fixture.ps1 -NodePath (Get-Command node.exe).Source
