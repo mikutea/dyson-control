@@ -173,6 +173,27 @@ it('does not require Steam login to inspect setup status', async () => {
   expect(f.run).not.toHaveBeenCalled(); expect(f.fetcher).not.toHaveBeenCalled()
 })
 
+it.each([
+  { builtAtUtc: '2026-10-26T15:51:47.2718057+00:00', bom: false },
+  { builtAtUtc: '2026-10-26T15:51:47.2718057+00:00', bom: true },
+  { builtAtUtc: '2026-10-26T23:51:47.2718057+08:00', bom: false },
+])('accepts a Windows-generated Bridge manifest: $builtAtUtc, BOM=$bom', async ({ builtAtUtc, bom }) => {
+  const f = await fixture({ freshStorage: true })
+  f.manifest.builtAtUtc = builtAtUtc
+  await write(path.join(f.releaseRoot, 'dist', 'bridge', 'bridge-manifest.json'), (bom ? '\ufeff' : '') + JSON.stringify(f.manifest))
+  expect((await f.manager.status('owner')).bridgeAvailable).toBe(true)
+  expect(await f.manager.install('FixtureUser', () => {}, new AbortController().signal)).toMatchObject({ installed: true, gameStarted: false })
+})
+
+it('still rejects an invalid Bridge build timestamp before download', async () => {
+  const f = await fixture()
+  f.manifest.builtAtUtc = 'invalid-build-time'
+  await write(path.join(f.releaseRoot, 'dist', 'bridge', 'bridge-manifest.json'), JSON.stringify(f.manifest))
+  expect((await f.manager.status('owner')).bridgeAvailable).toBe(false)
+  await expect(f.manager.install('FixtureUser', () => {}, new AbortController().signal)).rejects.toThrow()
+  expect(f.run).not.toHaveBeenCalled()
+})
+
 it('prepares SteamCMD from the fixed official archive without issuing app_update', async () => {
   const f = await fixture(); await fs.unlink(f.config.game.steam!.executable)
   const result = await f.manager.prepareSteam(() => {}, new AbortController().signal)

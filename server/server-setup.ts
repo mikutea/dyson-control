@@ -21,7 +21,7 @@ const referencePaths: Record<string, string> = {
 }
 const digestSchema = z.string().regex(/^[0-9a-f]{64}$/)
 const bridgeManifestSchema = z.object({
-  schema: z.literal(1), pluginVersion: z.string().min(1), builtAtUtc: z.string().datetime(),
+  schema: z.literal(1), pluginVersion: z.string().min(1), builtAtUtc: z.string().datetime({ offset: true }),
   dll: z.object({ file: z.literal('DysonControlBridge.dll'), bytes: z.number().int().min(2).max(16 * 1024 * 1024), sha256: digestSchema }).strict(),
   references: z.array(z.object({ name: z.string(), file: z.string(), assemblyVersion: z.string(), bytes: z.number().int().positive().max(1024 * 1024 * 1024), sha256: digestSchema }).strict()).length(9),
 }).strict()
@@ -308,7 +308,7 @@ export class ServerSetupManager {
     await noLinks(manifestFile)
     const entry = await stat(manifestFile)
     if (!entry?.isFile() || entry.size > 64 * 1024) fail('SETUP_BRIDGE_MISSING', '请安装包含 Bridge 的完整面板安装包。')
-    const manifest = bridgeManifestSchema.parse(JSON.parse(await fs.readFile(manifestFile, 'utf8')))
+    const manifest = bridgeManifestSchema.parse(JSON.parse((await fs.readFile(manifestFile, 'utf8')).replace(/^\ufeff/, '')))
     if (new Set(manifest.references.map(ref => ref.name)).size !== 9 || manifest.references.some(ref => ref.file.replaceAll('\\', '/') !== referencePaths[ref.name])) fail('SETUP_BRIDGE_INVALID', 'Bridge 编译清单无效。')
     const dll = path.join(directory, 'DysonControlBridge.dll')
     await noLinks(dll)
