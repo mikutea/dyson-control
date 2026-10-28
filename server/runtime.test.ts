@@ -144,6 +144,58 @@ describe('background runtime monitoring', () => {
     expect(f.monitor.status().alerts.find(alert => alert.code === 'monitor-unavailable')?.active).toBe(true)
   })
 
+  it('warns about zero simulation progress despite healthy engine UPS without restarting the game', async () => {
+    const f = await fixture()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.current.metrics.ups = 58.9
+    f.current.metrics.tps = 0
+    await f.monitor.sample()
+    f.advance(59_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.some(alert => alert.code === 'simulation-stalled' && alert.active)).toBe(false)
+    f.advance(1_000); await f.monitor.sample()
+    const first = f.monitor.status().alerts.find(alert => alert.code === 'simulation-stalled')!
+    expect(first).toMatchObject({ active: true, severity: 'warning', resolvedAt: null })
+    expect(f.calls).toEqual([])
+    f.advance(15_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.find(alert => alert.code === 'simulation-stalled')!.firstSeenAt).toBe(first.firstSeenAt)
+    f.current.metrics.tps = 58.4
+    f.advance(15_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.find(alert => alert.code === 'simulation-stalled')).toMatchObject({ active: false, resolvedAt: expect.any(String) })
+    expect(f.monitor.history().at(-1)).toMatchObject({ ups: 58.9, tps: 58.4 })
+    expect(f.calls).toEqual([])
+  })
+
+  it.each([
+    { ups: null, tps: null },
+    { ups: 58, tps: null },
+    { ups: 0, tps: 0 },
+  ])('does not call paused or unavailable telemetry a simulation stall: %j', async metrics => {
+    const f = await fixture()
+    f.current.metrics.ups = metrics.ups
+    f.current.metrics.tps = metrics.tps
+    await f.monitor.sample(); f.advance(61_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.some(alert => alert.code === 'simulation-stalled' && alert.active)).toBe(false)
+  })
+
+  it.each(['failed-read', 'process-change', 'game-operation'] as const)('starts a fresh stall window after %s', async interruption => {
+    const f = await fixture()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0 })
+    f.current.metrics.ups = 58
+    f.current.metrics.tps = 0
+    await f.monitor.sample(); f.advance(45_000); await f.monitor.sample()
+    if (interruption === 'failed-read') {
+      f.setSampleFails(true)
+      await expect(f.monitor.sample()).rejects.toThrow('Fixture sample unavailable')
+      f.setSampleFails(false)
+    } else if (interruption === 'process-change') f.current.pid = 5678
+    else { f.queue.enqueue({ requestId: 'save-between-stall-samples', action: 'save', input: {} }); await f.idle() }
+    f.advance(60_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.some(alert => alert.code === 'simulation-stalled' && alert.active)).toBe(false)
+    f.advance(60_000); await f.monitor.sample()
+    expect(f.monitor.status().alerts.find(alert => alert.code === 'simulation-stalled')?.active).toBe(true)
+    expect(f.calls.map(call => call.action)).toEqual(interruption === 'game-operation' ? ['save'] : [])
+  })
+
   it('does not restart an intentionally stopped game or start a stopped game just because recovery was enabled', async () => {
     const f = await fixture()
     await f.monitor.sample()
