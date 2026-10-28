@@ -967,7 +967,9 @@ $accessRequirements = @(
 if ($null -ne $documentLayout.LinkPath) {
   $accessRequirements += [ordered]@{ label = 'managed game-data link'; path = $documentLayout.LinkPath; rights = 'Modify'; inheritance = 'none' }
 }
-else {
+# A custom save path links only the Save child. Its plain document parent must
+# also be writable for options.xml, Blueprint and other game-owned documents.
+if ($null -eq $documentLayout.LinkPath -or -not (Test-DysonPathEquals $documentLayout.LinkPath $documentLayout.ManagedGameDocument)) {
   $accessRequirements += [ordered]@{ label = 'managed game document directory'; path = $documentLayout.ManagedGameDocument; rights = 'Modify'; inheritance = 'children' }
 }
 $accessPlan = Split-GameUserAccessRequirements $accessRequirements
