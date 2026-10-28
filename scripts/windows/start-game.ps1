@@ -212,7 +212,7 @@ if (-not $bindingMatches) {
   }
 }
 
-function Get-DysonInitialWorldArguments([string]$Root, [string]$Saves, [AllowNull()][string]$SelectedSave) {
+function Get-DysonInitialWorldArguments([string]$Root, [string]$Saves, [AllowNull()][string]$SelectedSave, [string]$Documents) {
   $pending = Join-Path $Root '.dyson-first-world.json'
   $consumed = Join-Path $Root '.dyson-first-world-consumed.json'
   $load = if ([string]::IsNullOrEmpty($SelectedSave)) { @('-load-latest') } else { @('-load', $SelectedSave) }
@@ -229,6 +229,30 @@ function Get-DysonInitialWorldArguments([string]$Root, [string]$Saves, [AllowNul
   $hasSave = @($files | Where-Object { $_.Extension -ieq '.dsv' }).Count -gt 0
   $hasSidecar = @($files | Where-Object { $_.Extension -iin @('.server', '.moddsv') }).Count -gt 0
   if (-not $hasSave -and $hasSidecar) { throw 'Save companions exist without a .dsv; refusing to create a new world.' }
+  if ([string]::IsNullOrEmpty($SelectedSave) -and -not $hasSave) {
+    # GameOption.LoadGlobal marks an absent options.xml as newlyCreated, which
+    # leaves VFPreload waiting for a language click even in Nebula headless mode.
+    # The current game uses options format 6 and applies defaults before importing
+    # the optional fields. Keep those defaults, including the system language.
+    $optionsPath = Join-Path $Documents 'options.xml'
+    $optionsItem = Get-Item -LiteralPath $optionsPath -Force -ErrorAction SilentlyContinue
+    if ($null -ne $optionsItem) {
+      if ($optionsItem.PSIsContainer -or ($optionsItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'First-world options.xml must be a plain file.'
+      }
+    }
+    else {
+      $bytes = [Text.UTF8Encoding]::new($false).GetBytes('<Options><CurrentVersion><VersionNumber>6</VersionNumber></CurrentVersion></Options>')
+      $temporaryOptions = Join-Path $Documents ('.dyson-options-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+      try {
+        $stream = [IO.File]::Open($temporaryOptions, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+        finally { $stream.Dispose() }
+        [IO.File]::Move($temporaryOptions, $optionsPath)
+      }
+      finally { if (Test-Path -LiteralPath $temporaryOptions) { Remove-Item -LiteralPath $temporaryOptions -Force } }
+    }
+  }
   # Consume this explicit first-install authorization once. A later loss of saves must
   # never silently create another world during automatic recovery.
   [IO.File]::Move($pending, $consumed)
@@ -238,7 +262,7 @@ function Get-DysonInitialWorldArguments([string]$Root, [string]$Saves, [AllowNul
 
 New-Item -ItemType Directory -Path (Split-Path -Parent $logPath) -Force | Out-Null
 $arguments = @('-batchmode', '-nographics', '-nebula-server', '-ups', [string]$targetUps, '-logFile', $logPath)
-$arguments += @(Get-DysonInitialWorldArguments $gameRootPath $saveDirectoryPath $saveName)
+$arguments += @(Get-DysonInitialWorldArguments $gameRootPath $saveDirectoryPath $saveName $managedGameDocumentPath)
 $quotedArguments = foreach ($argument in $arguments) {
   if ([string]$argument -match '"') { throw "Unsupported double quote in process argument: $argument" }
   '"{0}"' -f [string]$argument
