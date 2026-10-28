@@ -331,7 +331,7 @@ function assertAllowedReleasePath(name) {
     || name === 'dist/bridge/DysonControlBridge.dll'
     || name === 'dist/bridge/bridge-manifest.json'
     || (name.startsWith('scripts/windows/') && extname(name).toLowerCase() === '.ps1')
-    || (name.startsWith('docs/') && extname(name).toLowerCase() === '.md')
+    || (name.startsWith('docs/') && ['.md', '.png', '.jpg'].includes(extname(name).toLowerCase()))
   if (!allowed) fail(`Release allowlist rejected ${name}.`)
   if (/(^|\/)(?:node_modules|\.data|state|coverage|backups?|userdata|validation|fixtures?|tests?|temp|tmp)(?:\/|$)/i.test(name)
       || /(?:^|\/)control\.config\.json$/i.test(name)
