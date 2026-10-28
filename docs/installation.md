@@ -165,7 +165,7 @@ Invoke-RestMethod 'http://127.0.0.1:13020/healthz'
 Invoke-RestMethod 'http://127.0.0.1:13020/api/session'
 ```
 
-先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后仍需单独验证 HTTPS 入口、登录、Windows 游戏任务、Bridge 保存、存档恢复、重启恢复以及真实外部客户端加入。
+先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后检查自己的管理员登录、Windows 游戏任务、Bridge 保存和存档恢复；需要远程管理或外网联机时，按[连接自己的服务器](networking.md)配置并检查相应入口。游戏重启恢复的限制见 [README](../README.md#已知限制)。
 
 ## 卸载计划任务
 

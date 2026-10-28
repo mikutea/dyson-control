@@ -44,6 +44,6 @@ Windows 交互登录使用 Microsoft `node-pty` 的 ConPTY 支持，依赖固定
 
 失败的下载文件和 `dataDirectory/first-install/<id>/installation.json` 会保留。如果配置失败且确认没有启动任务或游戏进程，会把本次新安装目录移回暂存目录；不能确认任务清理成功时保留原目录并记录 `needs-review`。不会自动重试、覆盖已有游戏、迁移存档或启动服务器。
 
-安装成功仅证明文件和启动配置就绪。首次实际启动、Bridge 联通、存档完整性及外部玩家加入仍需分别验收。防火墙、端口转发、外网地址和图形版 Steam 登录不会在安装时自动修改。
+安装完成后，在自己的主机上实际启动，确认 Bridge 联通、保存和匹配客户端加入。需要外网联机时，再按[连接自己的服务器](networking.md)配置自己的地址。防火墙、端口转发、外网地址和图形版 Steam 登录不会在安装时自动修改。
 
 参考：[Valve SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)、[Valve 账号授权说明](https://partner.steamgames.com/doc/sdk/uploading)、[Nebula 无界面服务器说明](https://github.com/NebulaModTeam/nebula/wiki/Setup-Headless-Server)。

@@ -2,9 +2,9 @@
 
 # Dyson Control
 
-**在浏览器里管理你的戴森球计划联机服务器。**
+**在自己的 Windows 主机上搭建戴森球计划联机服务器，用浏览器管理。**
 
-启动与保存、存档备份、Steam 授权、模组更新和玩家管理，集中在一个中文面板里。
+启动与保存、存档备份、Steam 授权、模组更新和玩家管理，集中在一个中文面板里。每个部署实例使用自己的游戏目录、Steam 账号、存档和连接地址。
 
 [![CI](https://github.com/mikutea/dyson-control/actions/workflows/ci.yml/badge.svg?branch=codex%2Fsteam-onboarding)](https://github.com/mikutea/dyson-control/actions/workflows/ci.yml)
 [![Windows](https://img.shields.io/badge/server-Windows-0078D4)](#运行要求)
@@ -82,7 +82,9 @@ npm start
 
 ### 连接地址
 
-管理面板默认监听 `127.0.0.1:13020`，远程管理使用你配置的 HTTPS 入口。玩家则通过 **Nebula 游戏地址与端口**加入，常用端口为 `8469`。面板网页能打开与游戏能加入，需要分别确认。
+项目可独立部署，管理与游戏地址均由部署者自行配置。管理面板默认监听 `127.0.0.1:13020`，远程管理使用你配置的 HTTPS 入口。玩家通过你自己的 **Nebula 游戏地址与端口**加入，常用端口为 `8469`。
+
+配置中的 `game.example.com:8469` 是占位示例，请改成你的主机地址。局域网联机、公网端口转发及管理入口的配置见[连接自己的服务器](docs/networking.md)。
 
 ## 文档
 
@@ -91,6 +93,7 @@ npm start
 | 安装、升级、卸载 | [Windows 安装指南](docs/installation.md) |
 | Steam 登录、下载授权、空目录首装 | [安装与授权](docs/server-setup.md) |
 | 接入现有游戏与存档 | [游戏与 Bridge 配置](docs/game-configuration.md) |
+| 局域网、公网联机与远程管理 | [连接自己的服务器](docs/networking.md) |
 | 游戏和面板更新 | [Steam 游戏更新](docs/steam-updates.md) · [面板自身更新](docs/control-updates.md) |
 | 模组与客户端需求 | [模组适用端](docs/mod-requirements.md) · [版本锁定](docs/version-locks.md) |
 | 监控、自动备份、恢复和玩家历史 | [后台运行说明](docs/monitoring.md) |
@@ -104,7 +107,7 @@ npm start
 - **模组与性能**：不同模组组合、玩家数和工厂规模会影响兼容性与 UPS；当前一小时单客户端轻载结果不能用于承诺多人或大型工厂性能。
 - **接口范围**：当前 Nebula 没有提供的名单和角色权限功能不作模拟实现；具体支持范围见 [Bridge 说明](docs/bridge.md)。
 
-2026-10-28 的验证已覆盖真实 Windows 首装、空存档首启、保存与重载、两种存档恢复、异常自动恢复，以及真实客户端踢出与重连。另完成单客户端 60 分钟持续推进和定时备份；正式公网地址的真实客户端入服仍待完成。
+2026-10-28 的验证已覆盖真实 Windows 首装、空存档首启、保存与重载、两种存档恢复、异常自动恢复，以及真实客户端踢出与重连。另完成单客户端 60 分钟持续推进和定时备份。具体联机地址与网络连通性由各部署者在自己的环境中配置和检查。
 
 长时间压测、恒定 60 UPS、完整玩法模组组合和报告截图可继续完善；首版按已验证功能和这里列明的限制交付。
 
