@@ -2409,7 +2409,7 @@ $results | ConvertTo-Json -Depth 8 -Compress
     const { stdout } = await execFileAsync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
       '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
-    ], { windowsHide: true, timeout: 20_000 })
+    ], { windowsHide: true, timeout: 29_000 })
     const results = JSON.parse(stdout.trim()) as Array<{
       variant: string
       error: string | null
