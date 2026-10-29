@@ -84,6 +84,12 @@ async function waitForTerminal(manager: ControlUpdateManager, id: string): Promi
   throw new Error('operation did not settle')
 }
 
+async function waitForReady(manager: ControlUpdateManager, id: string): Promise<ControlUpdateOperation> {
+  const operation = await waitForTerminal(manager, id)
+  expect(operation.state, operation.message).toBe('ready')
+  return operation
+}
+
 async function installedLayout(root: string, version: string, taskName = 'Dyson-Control-Fixture'): Promise<{ installRoot: string; versionRoot: string }> {
   const installRoot = path.join(root, 'installed')
   const versionRoot = path.join(installRoot, 'versions', version)
@@ -137,13 +143,37 @@ describe('control update discovery and preparation', () => {
     await manager.close()
   })
 
+  it.each([['ENOSPC', '磁盘空间不足'], ['EPERM', '目录权限与文件占用']])(
+    'explains %s during preparation without exposing private filesystem details', async (code, message) => {
+      const root = await fixtureRoot()
+      const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+      await manager.initialize()
+      const writeFile = fs.writeFile.bind(fs)
+      const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith('-windows-panel-only.zip')) {
+          throw Object.assign(new Error('private deployment filesystem detail'), { code })
+        }
+        return writeFile(...args)
+      })
+      try {
+        const started = await manager.prepare({ requestId: `io-failure-${code}`, expectedVersion: '0.2.0' })
+        const operation = await waitForTerminal(manager, started.operation.id)
+        expect(operation).toMatchObject({ state: 'failed', message: expect.stringContaining(message) })
+        expect(operation.message).not.toContain('private deployment filesystem detail')
+      } finally {
+        spy.mockRestore()
+        await manager.close()
+      }
+    },
+  )
+
   it('expires an unapplied ready candidate after 24 hours and removes staged files', async () => {
     const root = await fixtureRoot()
     let now = Date.parse('2026-10-17T00:00:00.000Z')
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0'), clock: () => now })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'expire-ready', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     now += 24 * 60 * 60 * 1000 + 1
     await expect(manager.read(started.operation.id)).resolves.toMatchObject({ state: 'failed', message: expect.stringContaining('24 小时') })
     await expect(fs.stat(path.join(root, 'data', 'control-updates', 'operations', started.operation.id, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -189,7 +219,7 @@ describe('control update application evidence', () => {
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-demo', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-demo' }))
       .rejects.toMatchObject({ code: 'UPDATE_EXECUTION_UNAVAILABLE' } satisfies Partial<ControlUpdateError>)
     await manager.close()
@@ -207,7 +237,7 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-real', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     const applied = await manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })
     expect(applied.operation.state).toBe('scheduled')
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })).resolves.toMatchObject({ operation: { id: started.operation.id, state: 'scheduled' } })
@@ -242,7 +272,7 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-rollback', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await manager.apply({ operationId: started.operation.id, requestId: 'apply-rollback' })
     const handoff = JSON.parse(await fs.readFile(handoffPath, 'utf8')) as { statusPath: string; installRoot: string }
     await fs.writeFile(handoff.statusPath, JSON.stringify({

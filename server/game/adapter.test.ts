@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -92,6 +92,15 @@ function sign(secret: string, parts: string[]): string {
   return createHmac('sha256', secret).update(parts.join('\n')).digest('hex')
 }
 
+async function publishFixtureReceipt(file: string, payload: string): Promise<void> {
+  // Match BridgeFileStore: the adapter must only observe a complete signed file.
+  const temporary = `${file}.partial-${randomUUID()}`
+  try {
+    await fs.writeFile(temporary, payload, { flag: 'wx' })
+    await fs.rename(temporary, file)
+  } finally { await fs.rm(temporary, { force: true }) }
+}
+
 async function prepareBridge(fixture: ControlConfig, processId: number, startedAt = Date.now() - 1_000): Promise<string> {
   const secret = '0123456789abcdef0123456789abcdef0123456789abcdef'
   await fs.mkdir(path.join(fixture.game.bridgeDirectory, 'requests'), { recursive: true })
@@ -129,7 +138,7 @@ async function bridgeSaveWorker(fixture: ControlConfig, secret: string, saveName
       '10', '11', String(dsv.size), ticks(dsv), String(server.size), ticks(server),
       moddsv ? String(moddsv.size) : '-1', ticks(moddsv), 'true', 'true', moddsv ? 'true' : 'false', 'NONE'
     ]
-    await fs.writeFile(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
+    await publishFixtureReceipt(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
       'protocol=DYSON_CONTROL_RECEIPT_V3', `requestId=${requestId}`, 'action=save', 'state=succeeded',
       `startedAtUnixMs=${started}`, `finishedAtUnixMs=${finished}`, `saveName=${saveName}`, 'saveTimeBefore=10', 'saveTimeAfter=11',
       `dsvBytes=${dsv.size}`, `dsvWriteTimeUtcTicks=${ticks(dsv)}`, `serverBytes=${server.size}`, `serverWriteTimeUtcTicks=${ticks(server)}`,
@@ -157,7 +166,7 @@ async function bridgeStopWorker(fixture: ControlConfig, secret: string, onQuit: 
     const started = Date.now()
     const finished = started + 1
     const parts = ['DYSON_CONTROL_ACTION_V1', requestId, 'stop', 'succeeded', String(started), String(finished), 'NONE']
-    await fs.writeFile(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
+    await publishFixtureReceipt(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
       'protocol=DYSON_CONTROL_ACTION_V1', `requestId=${requestId}`, 'action=stop', 'state=succeeded',
       `startedAtUnixMs=${started}`, `finishedAtUnixMs=${finished}`, 'errorCode=NONE', `hmac=${sign(secret, parts)}`, ''
     ].join('\n'))
@@ -2345,10 +2354,9 @@ describe('Windows adapter fixture behavior', () => {
     const harness = path.join(fixture.dataDirectory, 'inspect-harness.ps1')
     await fs.writeFile(harness, `
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$InspectScript, [Parameter(Mandatory = $true)][string]$ArgumentsPath, [switch]$AddUnexpected, [switch]$DuplicateProcess, [switch]$UseSmbAlias)
+param([Parameter(Mandatory = $true)][string]$InspectScript, [Parameter(Mandatory = $true)][string]$ArgumentsPath)
 $inputObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $startArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + [string]$inputObject.managedStartScript + '" -GameRoot "' + [string]$inputObject.gameRoot + '" -SaveDirectory "' + [string]$inputObject.saveDirectory + '" -SettingsPath "' + [string]$inputObject.startupSettingsPath + '" -LogFile "' + [string]$inputObject.logFile + '" -ProcessPriority AboveNormal'
-if ($AddUnexpected) { $startArguments += ' -Unexpected value' }
 $startAction = [pscustomobject]@{ Execute = (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'); Arguments = $startArguments; WorkingDirectory = [string]$inputObject.gameRoot }
 function Get-CimInstance {
   [CmdletBinding()]param([string]$ClassName, [string]$Filter)
@@ -2383,21 +2391,37 @@ function Get-ScheduledTask {
   if ($TaskName -ceq [string]$inputObject.startTaskName) { return [pscustomobject]@{ TaskName = [string]$inputObject.startTaskName; Actions = @($startAction) } }
   return $null
 }
-& $InspectScript -ArgumentsPath $ArgumentsPath
+$results = foreach ($variant in @('managed', 'unexpected', 'ambiguous')) {
+  $DuplicateProcess = $variant -ceq 'ambiguous'
+  $UseSmbAlias = $DuplicateProcess
+  $startAction.Arguments = $startArguments
+  if ($variant -ceq 'unexpected') { $startAction.Arguments += ' -Unexpected value' }
+  try {
+    $result = & $InspectScript -ArgumentsPath $ArgumentsPath
+    [ordered]@{ variant = $variant; data = ($result | ConvertFrom-Json); error = $null }
+  } catch {
+    [ordered]@{ variant = $variant; data = $null; error = $_.Exception.Message }
+  }
+}
+$results | ConvertTo-Json -Depth 8 -Compress
 `)
-    const invoke = async (unexpected: boolean) => {
-      const { stdout } = await execFileAsync('powershell.exe', [
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
-        '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
-        ...(unexpected ? ['-AddUnexpected'] : [])
-      ], { windowsHide: true })
-      return JSON.parse(stdout.trim()) as {
+    // Exercise all contracts in one host rather than paying three PowerShell startups.
+    const { stdout } = await execFileAsync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
+      '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
+    ], { windowsHide: true, timeout: 20_000 })
+    const results = JSON.parse(stdout.trim()) as Array<{
+      variant: string
+      error: string | null
+      data: {
         tasks: { startManaged: boolean }
         versions: { game: null; nebula: null; bepinex: null }
         network: { sampledAtUnixMs: number; adapters: Array<{ id: string; receivedBytes: string; sentBytes: string }> }
-      }
-    }
-    const managed = await invoke(false)
+      } | null
+    }>
+    expect(results.map(result => result.variant)).toEqual(['managed', 'unexpected', 'ambiguous'])
+    expect(results[0].error).toBeNull()
+    const managed = results[0].data!
     expect(managed.tasks.startManaged).toBe(true)
     expect(managed.versions).toEqual({ game: null, nebula: null, bepinex: null })
     expect(managed.network.sampledAtUnixMs).toBeGreaterThan(0)
@@ -2405,13 +2429,10 @@ function Get-ScheduledTask {
       id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
       receivedBytes: '9007199254740993', sentBytes: '9007199254740995'
     }])
-    expect((await invoke(true)).tasks.startManaged).toBe(false)
-    await expect(execFileAsync('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
-      '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath, '-DuplicateProcess', '-UseSmbAlias'
-    ], { windowsHide: true })).rejects.toMatchObject({
-      stderr: expect.stringContaining('managed instance is ambiguous')
-    })
+    expect(results[1].error).toBeNull()
+    expect(results[1].data!.tasks.startManaged).toBe(false)
+    expect(results[2].data).toBeNull()
+    expect(results[2].error).toContain('managed instance is ambiguous')
   })
 
   it.runIf(process.platform === 'win32')('binds DSP Configs/path.txt to the configured managed save directory before launch', async () => {

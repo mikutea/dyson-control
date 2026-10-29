@@ -800,5 +800,10 @@ function isObject(value: unknown): value is Record<string, unknown> { return typ
 function safeError(error: unknown): string { return error instanceof Error ? error.message.slice(0, 500) : 'Unknown update helper error.' }
 function preparationMessage(error: unknown): string {
   if (error instanceof ControlUpdateError) return error.message
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  if (code === 'ENOSPC') return '准备面板更新时磁盘空间不足，请释放空间后重试。更新尚未应用。'
+  if (code === 'EACCES' || code === 'EPERM' || code === 'EBUSY') {
+    return `无法写入或替换更新文件（${code}），请检查目录权限与文件占用后重试。更新尚未应用。`
+  }
   return '面板更新包准备失败。'
 }
