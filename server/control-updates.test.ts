@@ -148,6 +148,7 @@ describe('control update discovery and preparation', () => {
       const root = await fixtureRoot()
       const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
       await manager.initialize()
+      const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
       const writeFile = fs.writeFile.bind(fs)
       const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
         if (String(args[0]).endsWith('-windows-panel-only.zip')) {
@@ -160,8 +161,12 @@ describe('control update discovery and preparation', () => {
         const operation = await waitForTerminal(manager, started.operation.id)
         expect(operation).toMatchObject({ state: 'failed', message: expect.stringContaining(message) })
         expect(operation.message).not.toContain('private deployment filesystem detail')
+        expect(diagnostic).toHaveBeenCalledWith('Control update preparation failed.', expect.objectContaining({ code }))
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(root)
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('private deployment filesystem detail')
       } finally {
         spy.mockRestore()
+        diagnostic.mockRestore()
         await manager.close()
       }
     },

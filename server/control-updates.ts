@@ -373,6 +373,12 @@ export class ControlUpdateManager {
       await this.#write(record)
     } catch (error) {
       const interrupted = signal.aborted || this.#closed
+      if (!interrupted && !(error instanceof ControlUpdateError)) {
+        const io = error as NodeJS.ErrnoException | null
+        console.error('Control update preparation failed.', {
+          code: io?.code, syscall: io?.syscall, file: typeof io?.path === 'string' ? path.basename(io.path) : null, step: record.step,
+        })
+      }
       await this.#cleanupCandidate(record)
       await this.#finish(record, 'failed', 'complete', interrupted ? '更新准备已中断。' : preparationMessage(error))
     }
