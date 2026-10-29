@@ -72,7 +72,7 @@ npm start
 | 使用场景 | 从这里开始 |
 | --- | --- |
 | 已有游戏和存档 | [安装面板](docs/installation.md#首次安装)，再按[游戏与 Bridge 接入](docs/game-configuration.md)绑定现有目录 |
-| 从空目录准备新服 | 安装完整面板包后，打开[安装与 Steam 授权](docs/server-setup.md)，完成授权与“一键安装服务器” |
+| 从空目录准备新服 | [交互生成私有配置](docs/installation.md#准备私有配置)并安装完整面板包，再打开[安装与 Steam 授权](docs/server-setup.md)完成首装 |
 | 升级已有面板 | 按[升级与自动回退](docs/installation.md#升级与自动回退)更新程序；游戏与存档继续使用原目录 |
 | 从源码准备发布包 | 按[生成发布包](docs/installation.md#生成发布包)构建完整包或仅面板包 |
 
