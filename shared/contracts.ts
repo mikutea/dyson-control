@@ -1,5 +1,5 @@
 export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
-export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server'
+export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
 
@@ -177,5 +177,5 @@ export interface ControlConfig {
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.
-// Input: load-save {saveId}; restore {backupId}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
+// Input: load-save {saveId}; verify-backup {backupId}; restore {backupId}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
 // backup {saveId?}; install-update {component,version?}; create-client-package {}.

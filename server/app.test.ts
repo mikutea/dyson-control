@@ -24,6 +24,26 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('authenticates and deduplicates read-only backup verification with strict input', async () => {
+    const f = await createFixture()
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const payload = { requestId: 'verify-backup-1', action: 'verify-backup', input: { backupId: 'fixture-backup' } }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', payload })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      for (const input of [{}, { backupId: '' }, { backupId: 'fixture-backup', path: '../other' }]) {
+        expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { ...payload, input } })).statusCode).toBe(400)
+      }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie, origin: 'https://untrusted.example.test' }, payload })).statusCode).toBe(403)
+      const first = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(first.statusCode).toBe(202)
+      const repeat = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(repeat.json().data.id).toBe(first.json().data.id)
+      expect((await waitForJobs(app, cookie, 1))[0]?.state).toBe('succeeded')
+      expect(f.adapter.calls).toEqual([{ action: 'verify-backup', input: { backupId: 'fixture-backup' } }])
+    } finally { await app.close() }
+  })
+
   it('authenticates, validates and deduplicates loading a save through the durable queue', async () => {
     const f = await createFixture()
     const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })

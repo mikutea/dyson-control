@@ -10,6 +10,7 @@ import { createR2ModmanPackage } from './profile.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { runBackupVerification } from './backup-verification.js'
 import { VersionLockStore } from './version-locks.js'
 
 const now = () => new Date().toISOString()
@@ -159,6 +160,7 @@ export class DemoGameAdapter implements GameAdapter {
       case 'restart':
         await this.run('stop', {}, report, signal); return this.run('start', {}, report, signal)
       case 'backup': return this.#backup(input.saveId, input.automatic === true ? 'automatic-scheduled' : 'manual', report)
+      case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'restore': return this.#restore(input.backupId, report)
       case 'import-backup': return this.#importBackup(input, report, signal)
       case 'toggle-mod': return this.#toggleMod(input, report)
@@ -266,6 +268,11 @@ export class DemoGameAdapter implements GameAdapter {
       })),
     }
     const backup: Backup = { id, saveName: save.name, createdAt: manifest.createdAt, bytes: files.reduce((total, file) => total + file.data.length, 0), members: [...save.members], reason }
+    const backupRoot = path.join(this.#config.game.backupDirectory, id)
+    await fs.mkdir(this.#config.game.backupDirectory, { recursive: true })
+    await fs.mkdir(backupRoot)
+    for (const file of files) await fs.writeFile(path.join(backupRoot, file.name), file.data, { flag: 'wx' })
+    await fs.writeFile(path.join(backupRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' })
     const existing = this.#backups.findIndex((item) => item.id === backup.id)
     if (existing >= 0) this.#backups[existing] = backup
     else this.#backups.push(backup)

@@ -60,6 +60,18 @@ async function fixture() {
 }
 
 describe('background runtime monitoring', () => {
+  it('does not pause game recovery after a read-only backup verification failure', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.setFailAction('verify-backup')
+    f.queue.enqueue({ requestId: 'verify-failed', action: 'verify-backup', input: { backupId: 'fixture' } })
+    await f.idle()
+    expect(f.monitor.status().recovery).toMatchObject({ wantedRunning: true, blockedReason: null })
+    expect(f.current.state).toBe('running')
+    expect(f.monitor.status().alerts.some(alert => alert.code === 'last-operation-failed' && alert.active)).toBe(true)
+  })
+
   it('pauses recovery after a failed save switch and resumes after a successful explicit load', async () => {
     const f = await fixture()
     await f.monitor.sample()

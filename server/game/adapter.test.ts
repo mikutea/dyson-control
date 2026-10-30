@@ -18,6 +18,34 @@ const temporaryDirectories: string[] = []
 const execFileAsync = promisify(execFile)
 afterEach(async () => { await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true }))) })
 
+describe('backup verification actions', () => {
+  it('verifies a real Windows-format backup without inspecting, saving or stopping the game', async () => {
+    const fixture = await config('windows')
+    for (const extension of ['.dsv', '.server', '.moddsv']) await fs.writeFile(path.join(fixture.game.saveDirectory, 'World' + extension), 'synthetic-' + extension)
+    const first = new WindowsGameAdapter(fixture, { inspect: async () => ({ process: null, versions: { game: null, nebula: null, bepinex: null }, tasks: { start: false, startManaged: false, configuredTargetUps: null } }) })
+    const backup = await first.run('backup', {}, () => {}, new AbortController().signal)
+    const inspect = vi.fn(async () => { throw new Error('Game status unavailable') })
+    const runScript = vi.fn(async () => { throw new Error('No script allowed') })
+    const adapter = new WindowsGameAdapter(fixture, { inspect, runScript })
+    const result = await adapter.run('verify-backup', { backupId: backup.backupId }, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ backupId: backup.backupId, saveName: 'World', members: ['World.dsv', 'World.server', 'World.moddsv'] })
+    expect(inspect).not.toHaveBeenCalled(); expect(runScript).not.toHaveBeenCalled()
+    expect(await fs.readFile(path.join(fixture.game.saveDirectory, 'World.dsv'), 'utf8')).toBe('synthetic-.dsv')
+  })
+
+  it('uses actual demo backup files and detects their subsequent corruption', async () => {
+    const fixture = await config('demo')
+    const adapter = createGameAdapter(fixture)
+    const backup = await adapter.run('backup', {}, () => {}, new AbortController().signal)
+    const input = { backupId: backup.backupId }
+    const result = await adapter.run('verify-backup', input, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ backupId: backup.backupId, saveName: 'DemoGalaxy', members: ['DemoGalaxy.dsv', 'DemoGalaxy.server', 'DemoGalaxy.moddsv'] })
+    await fs.appendFile(path.join(fixture.game.backupDirectory, String(backup.backupId), 'DemoGalaxy.server'), 'corruption')
+    await expect(adapter.run('verify-backup', input, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED' })
+    expect((await adapter.overview()).state).toBe('running')
+  })
+})
+
 describe('loading an existing save', () => {
   async function fixture(runningInitially = false, managed = true, failStart = false, wrongSelection = false) {
     const settings = await config('windows')

@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,6 +7,7 @@ import type {
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { hashBackupMember as sha256, readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import {
   assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeTelemetry,
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
@@ -34,11 +34,6 @@ interface InspectResult {
   versions: { game: string | null; nebula: string | null; bepinex: string | null }
   tasks: { start: boolean; startManaged: boolean; configuredTargetUps: number | null }
   network?: HostNetworkCounterSample | null
-}
-
-interface BackupManifest {
-  schema: 1; id: string; saveName: string; createdAt: string; reason: string
-  members: Array<{ fileName: string; bytes: number; sha256: string }>
 }
 
 interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
@@ -83,16 +78,6 @@ function dependencyPackageIdentity(reference: string): string | null {
 }
 function modId(name: string): string { return createHash('sha256').update(name.toLowerCase()).digest('hex').slice(0, 20) }
 function now(): string { return new Date().toISOString() }
-
-async function sha256(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const digest = createHash('sha256')
-    const stream = createReadStream(filePath)
-    stream.on('data', (chunk) => digest.update(chunk))
-    stream.on('error', reject)
-    stream.on('end', () => resolve(digest.digest('hex')))
-  })
-}
 
 function validateSettings(value: unknown): Omit<GameSettings, 'readOnlyFields'> {
   if (!value || typeof value !== 'object') invalidInput('settings is required.')
@@ -567,6 +552,7 @@ export class WindowsGameAdapter implements GameAdapter {
     switch (action) {
       case 'start': return this.#start(report, signal)
       case 'load-save': return this.#loadSave(input, report, signal)
+      case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'save': return this.#save(report, signal)
       case 'stop': return this.#stop(report, signal, true)
       case 'restart': {
@@ -925,45 +911,18 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #readBackupManifest(id: string): Promise<BackupManifest> {
-    safeId(id, 'backupId')
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, id))
-    const rootStat = await fs.lstat(root).catch(() => null)
-    if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', 'The requested backup does not exist.')
-    let manifest: BackupManifest
-    try { manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as BackupManifest } catch (error) { throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.', { cause: error }) }
-    if (manifest.schema !== 1 || manifest.id !== id || !validSaveName(manifest.saveName) ||
-        typeof manifest.createdAt !== 'string' || !Number.isFinite(Date.parse(manifest.createdAt)) ||
-        typeof manifest.reason !== 'string' || manifest.reason.length < 1 || manifest.reason.length > 100 ||
-        !Array.isArray(manifest.members) || manifest.members.length < 2 || manifest.members.length > 3 ||
-        new Set(manifest.members.map((member) => member.fileName)).size !== manifest.members.length ||
-        !manifest.members.some((member) => member.fileName === `${manifest.saveName}.dsv`) || !manifest.members.some((member) => member.fileName === `${manifest.saveName}.server`)) {
-      throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-    }
-    for (const member of manifest.members) {
-      if (!saveExtensions.some((extension) => member.fileName === `${manifest.saveName}${extension}`) || !Number.isSafeInteger(member.bytes) || member.bytes < 0 || !/^[0-9a-f]{64}$/.test(member.sha256)) {
-        throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-      }
-    }
-    return manifest
+    return readBackupManifest(this.#config.game.backupDirectory, id)
   }
 
-  async #verifyBackup(manifest: BackupManifest): Promise<string> {
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, manifest.id))
-    for (const member of manifest.members) {
-      const memberPath = ensureInside(root, path.join(root, member.fileName))
-      const stat = await fs.lstat(memberPath).catch(() => null)
-      if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== member.bytes || await sha256(memberPath) !== member.sha256) {
-        throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `Backup member failed verification: ${member.fileName}`)
-      }
-    }
-    return root
+  async #verifyBackup(manifest: BackupManifest, signal?: AbortSignal): Promise<string> {
+    return verifyBackupFiles(this.#config.game.backupDirectory, manifest, signal)
   }
 
   async #restore(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.backupId !== 'string') invalidInput('backupId is required.')
     const manifest = await this.#readBackupManifest(input.backupId)
     report('正在校验待恢复的存档备份')
-    const backupRoot = await this.#verifyBackup(manifest)
+    const backupRoot = await this.#verifyBackup(manifest, signal)
     const inspection = await this.#inspect(true)
     const wasRunning = Boolean(inspection.process)
     if (!inspection.tasks.startManaged) {

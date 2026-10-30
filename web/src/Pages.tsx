@@ -154,7 +154,13 @@ function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }
       </Panel>
       <Panel title="备份" icon={<Archive />}>
         <ResourceBody resource={backups} emptyTitle="还没有备份" emptyDescription="创建备份后可随时在这里恢复">
-          {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}><span className="file-icon"><ShieldCheck /></span><div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {backup.reason}</small></div><a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a><Button variant="quiet" icon={<RotateCcw />} onClick={() => runAction('restore', { backupId: backup.id }, { title: `恢复 ${backup.saveName}？`, description: '当前存档将被替换。系统会先为当前存档创建一份可恢复的备份。', label: '恢复备份', danger: true })}>恢复</Button></div>)}</div>}
+          {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}>
+            <span className="file-icon"><ShieldCheck /></span>
+            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {backup.reason === 'automatic-before-load-save' ? '切换存档前' : backup.reason}</small></div>
+            <a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a>
+            <Button variant="quiet" icon={<ShieldCheck />} aria-label={`校验备份 ${backup.saveName}`} disabled={operationActive || Boolean(backups.error)} onClick={() => runAction('verify-backup', { backupId: backup.id })}>校验</Button>
+            <Button variant="quiet" icon={<RotateCcw />} onClick={() => runAction('restore', { backupId: backup.id }, { title: `恢复 ${backup.saveName}？`, description: '当前存档将被替换。系统会先为当前存档创建一份可恢复的备份。', label: '恢复备份', danger: true })}>恢复</Button>
+          </div>)}</div>}
         </ResourceBody>
       </Panel>
     </div><BackupImport onJob={onJob} /></>
