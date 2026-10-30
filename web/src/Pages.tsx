@@ -142,14 +142,14 @@ function ModsPage({ refreshToken, runAction }: PagesProps) {
     </Panel></>}</>
 }
 
-function SavesPage({ refreshToken, runAction, onJob }: PagesProps) {
+function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }: PagesProps) {
   const saves = useResource<Save[]>('/saves', refreshToken)
   const backups = useResource<Backup[]>('/backups', refreshToken)
   return <><PageHeader title="存档" description="管理当前存档与可恢复的备份" actions={<Button variant="primary" icon={<Archive />} onClick={() => runAction('backup')}>立即备份</Button>} />
     <div className="split-grid">
       <Panel title="游戏存档" icon={<Database />}>
         <ResourceBody resource={saves} emptyTitle="没有找到存档" emptyDescription="游戏创建存档后会显示在这里">
-          {(items) => <div className="file-list">{items.map((save) => <div key={save.id}><span className="file-icon"><FileArchive /></span><div><strong>{save.name}</strong><p>{formatBytes(save.bytes)} · {save.members.length} 个文件</p><small>修改于 {formatFullDate(save.modifiedAt)}</small></div>{save.current && <span className="current-label">当前使用</span>}<Button variant="quiet" icon={<Archive />} onClick={() => runAction('backup', { saveId: save.id })}>备份</Button></div>)}</div>}
+          {(items) => <div className="file-list">{items.map((save) => <div key={save.id}><span className="file-icon"><FileArchive /></span><div><strong>{save.name}</strong><p>{formatBytes(save.bytes)} · {save.members.length} 个文件</p><small>修改于 {formatFullDate(save.modifiedAt)}</small></div>{save.current && <span className="current-label">当前使用</span>}<Button variant="quiet" icon={<Archive />} onClick={() => runAction('backup', { saveId: save.id })}>备份</Button><Button variant="quiet" icon={<Play />} disabled={operationActive || Boolean(saves.error) || !overview?.capabilities.restore || !overview.capabilities.lifecycle || (save.current && overview.state === 'running')} onClick={() => runAction('load-save', { saveId: save.id }, { title: `加载存档 ${save.name}？`, description: '服务器将从此存档启动。运行中的世界会先保存、备份并停止，在线玩家会断开；所选存档也会保留保护副本。', label: '加载存档', danger: true })}>加载</Button></div>)}</div>}
         </ResourceBody>
       </Panel>
       <Panel title="备份" icon={<Archive />}>

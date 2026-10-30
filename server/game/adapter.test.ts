@@ -18,6 +18,131 @@ const temporaryDirectories: string[] = []
 const execFileAsync = promisify(execFile)
 afterEach(async () => { await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true }))) })
 
+describe('loading an existing save', () => {
+  async function fixture(runningInitially = false, managed = true, failStart = false, wrongSelection = false) {
+    const settings = await config('windows')
+    for (const name of ['Current', '另一世界']) {
+      for (const extension of ['.dsv', '.server', '.moddsv']) await fs.writeFile(path.join(settings.game.saveDirectory, `${name}${extension}`), `${name}${extension}`)
+    }
+    let running = runningInitially
+    let processId = 4242
+    let selectedSave = 'Current'
+    const selections: unknown[] = []
+    const options = {
+      inspect: async () => ({
+        process: running ? { pid: processId, startedAt: new Date(Date.now() - 1000).toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: managed, configuredTargetUps: null },
+      }),
+      runScript: async <T>() => {
+        selections.push(JSON.parse(await fs.readFile(path.join(settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')))
+        if (failStart) throw new Error('Fixture startup rejected')
+        if (!wrongSelection) selectedSave = (selections.at(-1) as { saveName: string }).saveName
+        running = true; processId++
+        await prepareBridge(settings, processId)
+        return {} as T
+      },
+      pollIntervalMs: 10,
+    }
+    const adapter = new WindowsGameAdapter(settings, options)
+    const target = (await adapter.saves()).find(save => save.name === '另一世界')!
+    return { settings, adapter, target, selections, options, running: () => running,
+      bridge: () => prepareBridge(settings, processId), stop: () => { running = false } }
+  }
+
+  it('protects all three members and persists the exact Unicode save selection before starting', async () => {
+    const f = await fixture()
+    const before = await Promise.all(f.target.members.map(member => fs.readFile(path.join(f.settings.game.saveDirectory, member))))
+    const result = await f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ saveName: '另一世界', wasRunning: false, state: 'running', bridgeReady: true })
+    expect(f.selections).toEqual([{ schema: 1, targetUps: 60, saveName: '另一世界' }])
+    const backups = await f.adapter.backups()
+    expect(backups).toHaveLength(1)
+    expect(backups[0]).toMatchObject({ saveName: '另一世界', members: f.target.members, reason: 'automatic-before-load-save' })
+    expect(result.automaticBackups).toEqual([backups[0]!.id])
+    expect(await Promise.all(f.target.members.map(member => fs.readFile(path.join(f.settings.game.saveDirectory, member))))).toEqual(before)
+    const reopened = new WindowsGameAdapter(f.settings, { ...f.options, inspect: async () => ({ process: null, versions: { game: null, nebula: null, bepinex: null }, tasks: { start: true, startManaged: true, configuredTargetUps: null } }) })
+    expect((await reopened.overview()).currentSave).toBe('另一世界')
+  })
+
+  it('confirms the running save, protects both worlds, stops gracefully and starts the selection', async () => {
+    const f = await fixture(true)
+    const secret = await f.bridge()
+    const workers = Promise.all([bridgeSaveWorker(f.settings, secret, 'Current'), bridgeStopWorker(f.settings, secret, f.stop)])
+    const reports: string[] = []
+    const result = await f.adapter.run('load-save', { saveId: f.target.id }, message => reports.push(message), new AbortController().signal)
+    await workers
+    expect(result).toMatchObject({ saveName: '另一世界', wasRunning: true, state: 'running' })
+    expect(f.running()).toBe(true)
+    expect((await f.adapter.backups()).map(backup => backup.saveName).sort()).toEqual(['Current', '另一世界'])
+    expect(reports.indexOf('正在完整备份存档 Current')).toBeLessThan(reports.indexOf('正在停止服务器'))
+    expect(reports.indexOf('正在完整备份存档 另一世界')).toBeLessThan(reports.indexOf('正在停止服务器'))
+    expect(reports.indexOf('服务器已停止')).toBeLessThan(reports.indexOf('已将启动存档设为 另一世界'))
+    expect(f.selections).toHaveLength(1)
+  })
+
+  it('rejects an unmanaged task before interrupting the running game', async () => {
+    const f = await fixture(true, false)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'LOAD_SAVE_START_UNSUPPORTED' })
+    expect(f.running()).toBe(true)
+    expect(await f.adapter.backups()).toEqual([])
+    expect(f.selections).toEqual([])
+  })
+
+  it.each(['missing', 'companion-directory'])('rejects %s before saving or stopping players', async kind => {
+    const f = await fixture(true)
+    if (kind === 'missing') await fs.rm(path.join(f.settings.game.saveDirectory, '另一世界.server'))
+    else {
+      await fs.rm(path.join(f.settings.game.saveDirectory, '另一世界.moddsv'))
+      await fs.mkdir(path.join(f.settings.game.saveDirectory, '另一世界.moddsv'))
+    }
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: kind === 'missing' ? 'SAVE_NOT_FOUND' : 'SAVE_MEMBER_INVALID' })
+    expect(f.running()).toBe(true)
+    expect(await f.adapter.backups()).toEqual([])
+    expect(f.selections).toEqual([])
+  })
+
+  it('does not stop the game or change selection when protection backup fails', async () => {
+    const f = await fixture(true)
+    const secret = await f.bridge()
+    const worker = bridgeSaveWorker(f.settings, secret, 'Current')
+    const copy = vi.spyOn(fs, 'copyFile').mockRejectedValueOnce(Object.assign(new Error('Fixture disk full'), { code: 'ENOSPC' }))
+    try {
+      await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'ENOSPC' })
+      await worker
+    } finally { copy.mockRestore() }
+    expect(f.running()).toBe(true)
+    expect(f.selections).toEqual([])
+    expect(JSON.parse(await fs.readFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')).saveName).toBeNull()
+  })
+
+  it('retains the selected save and restorable protection after startup fails', async () => {
+    const f = await fixture(false, true, true)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'LOAD_SAVE_START_FAILED', message: expect.stringContaining('启动存档已设为 另一世界') })
+    expect(f.running()).toBe(false)
+    expect(f.selections).toHaveLength(1)
+    expect((await f.adapter.backups())[0]?.members).toEqual(f.target.members)
+    expect(JSON.parse(await fs.readFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')).saveName).toBe('另一世界')
+  })
+
+  it('rejects noncanonical and traversal identifiers without invoking a task', async () => {
+    const f = await fixture()
+    for (const saveId of ['../Current', Buffer.from('../Current').toString('base64url'), null, '']) {
+      await expect(f.adapter.run('load-save', { saveId }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(f.selections).toEqual([])
+  })
+
+  it('does not report success for a ready process launched with another save', async () => {
+    const f = await fixture(false, true, false, true)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      code: 'LOAD_SAVE_START_FAILED', cause: expect.objectContaining({ code: 'LOAD_SAVE_SELECTION_UNCONFIRMED' }),
+    })
+    expect(f.selections).toHaveLength(1)
+    expect(await f.adapter.backups()).toHaveLength(1)
+  })
+})
+
 async function config(mode: 'demo' | 'windows'): Promise<ControlConfig> {
   // Windows runners may expose TEMP through an 8.3 alias. Match the real path
   // PowerShell uses, including when the fixture simulates a separate SMB path.

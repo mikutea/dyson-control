@@ -566,6 +566,7 @@ export class WindowsGameAdapter implements GameAdapter {
     signal.throwIfAborted()
     switch (action) {
       case 'start': return this.#start(report, signal)
+      case 'load-save': return this.#loadSave(input, report, signal)
       case 'save': return this.#save(report, signal)
       case 'stop': return this.#stop(report, signal, true)
       case 'restart': {
@@ -669,6 +670,64 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     report('游戏已确认玩家离线清理完成')
     return { playerId, kicked: true }
+  }
+
+  async #loadSave(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (typeof input.saveId !== 'string') invalidInput('saveId is required.')
+    const name = saveNameFromId(input.saveId)
+    const inspection = await this.#inspect(true)
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('LOAD_SAVE_START_UNSUPPORTED', '加载指定存档需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      if (inspection.process) throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '请先停止游戏并完成中断的存档恢复。')
+      await this.#recoverInterruptedSaveRestore(report)
+    }
+    await this.#existingSaveMemberCount(name)
+    const selected = (await this.saves()).find(save => save.name === name)
+    if (!selected) throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档不存在或缺少完整的 .dsv / .server 文件，请刷新列表。')
+    const wasRunning = Boolean(inspection.process)
+    const protectedBackups: string[] = []
+    if (wasRunning) {
+      await this.#save(report, signal)
+      const receipt = this.#lastSaveReceipt!
+      protectedBackups.push((await this.#createBackup(receipt.saveName, 'automatic-before-load-save', report, receipt)).id)
+    }
+    if (!wasRunning || this.#lastSaveReceipt!.saveName !== name) {
+      protectedBackups.push((await this.#createBackup(name, 'automatic-before-load-save', report)).id)
+    }
+    for (const id of protectedBackups) report(`切换前保护备份：${id}`)
+    signal.throwIfAborted()
+    if (wasRunning) {
+      if ((await this.#inspect(true)).process?.pid !== inspection.process!.pid) {
+        throw new GameAdapterError('LOAD_SAVE_PROCESS_CHANGED', '游戏进程在切换前发生变化，未修改启动存档。')
+      }
+      await this.#stop(report, signal, false)
+    }
+    // Recheck after stopping: a disappeared save must never turn into load-latest.
+    if ((await this.#inspect(true)).process) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '游戏仍在运行，未修改启动存档。')
+    await this.#existingSaveMemberCount(name)
+    if (!(await this.saves()).some(save => save.name === name)) {
+      throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档在切换前已变化；服务器未切换，请检查存档。')
+    }
+    signal.throwIfAborted()
+    const nextStartup = { ...this.#startupSettings, saveName: name }
+    await this.#replaceJsonFile(this.#startupSettingsPath, nextStartup)
+    this.#startupSettings = nextStartup
+    this.#currentSave = null
+    report(`已将启动存档设为 ${name}`)
+    try {
+      const start = await this.#start(report, signal)
+      if (start.alreadyRunning === true) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '启动前出现了其他游戏进程。')
+      const started = (await this.#inspect(true)).process
+      if (!started || started.pid !== start.pid || started.selectedSave !== name) {
+        throw new GameAdapterError('LOAD_SAVE_SELECTION_UNCONFIRMED', '新进程没有使用所选存档的启动参数。')
+      }
+    } catch (error) {
+      throw new GameAdapterError('LOAD_SAVE_START_FAILED', `启动存档已设为 ${name}，但未确认加载完成。切换前备份已保留，请检查服务器状态后重试启动或恢复备份。`, { cause: error })
+    }
+    this.#currentSave = { name, savedAt: (await this.saves()).find(save => save.name === name)?.modifiedAt ?? selected.modifiedAt }
+    return { saveName: name, automaticBackups: protectedBackups, wasRunning, state: 'running', bridgeReady: true }
   }
 
   async #start(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {

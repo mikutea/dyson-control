@@ -260,10 +260,10 @@ export class RuntimeMonitor {
     const now = this.#clock()
     if (job.state === 'queued' && !automatic) {
       if (job.action === 'stop') this.#state.wantedRunning = false
-      if (job.action === 'start' || job.action === 'restart') this.#state.wantedRunning = true
+      if (job.action === 'start' || job.action === 'restart' || job.action === 'load-save') this.#state.wantedRunning = true
     }
     if (job.state === 'succeeded') {
-      if (job.action === 'start' || job.action === 'restart') {
+      if (job.action === 'start' || job.action === 'restart' || job.action === 'load-save') {
         this.#state.wantedRunning = true
         if (!automatic) {
           this.#state.blockedReason = null; this.#state.recoveryAttempts = []; this.#state.nextRecoveryAt = null
@@ -279,7 +279,7 @@ export class RuntimeMonitor {
     if (job.state === 'failed' || job.state === 'interrupted') {
       this.#alert('last-operation-failed', true, 'warning', `最近失败操作：${job.action}。请查看活动记录。`, now)
       if (job.action === 'backup') this.#alert('backup-failed', true, 'error', '备份未完成，请查看活动记录并检查可恢复副本。', now)
-      if (!automatic && ['start', 'restart', 'restore', 'install-server', 'install-update', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings'].includes(job.action)) {
+      if (!automatic && ['start', 'restart', 'load-save', 'restore', 'install-server', 'install-update', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings'].includes(job.action)) {
         this.#state.blockedReason = '上次游戏变更未成功，自动恢复已暂停；检查结果后手动启动可恢复自动恢复。'
         this.#alert('recovery-blocked', true, 'error', this.#state.blockedReason, now)
       }

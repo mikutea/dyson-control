@@ -7,6 +7,7 @@ export const actionLabels: Record<Action, string> = {
   save: '保存游戏',
   stop: '停止服务器',
   restart: '重新启动',
+  'load-save': '加载存档',
   backup: '创建备份',
   restore: '恢复备份',
   'import-backup': '导入备份',
@@ -94,6 +95,7 @@ export function formatJobResult(job: Job): string | null {
     case 'prepare-steamcmd': return 'SteamCMD 已就绪，可继续授权'
     case 'install-server': return '服务器安装完成，等待手动首次启动'
     case 'start': return '服务器已启动'
+    case 'load-save': return text('saveName') ? `已从存档 ${text('saveName')} 启动服务器` : '已加载所选存档'
     case 'stop': return '服务器已安全停止'
     case 'restart': return '服务器已重新启动'
     case 'kick-player': return '玩家已离线，游戏已完成连接清理'

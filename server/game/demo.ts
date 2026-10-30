@@ -133,6 +133,23 @@ export class DemoGameAdapter implements GameAdapter {
         report('正在启动服务器')
         this.#state = 'running'; this.#startedAt = Date.now(); this.#log('info', 'Server started by administrator.')
         return { state: 'running' }
+      case 'load-save': {
+        const selected = this.#saves.find(save => save.id === input.saveId)
+        if (!selected) throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档不存在，请刷新列表。')
+        const wasRunning = this.#state === 'running'
+        const automaticBackups: string[] = []
+        if (wasRunning) {
+          await this.#save(report)
+          const current = this.#saves.find(save => save.current)
+          if (current) automaticBackups.push(String((await this.#backup(current.id, 'automatic-before-load-save', report)).backupId))
+        }
+        if (!wasRunning || !selected.current) automaticBackups.push(String((await this.#backup(selected.id, 'automatic-before-load-save', report)).backupId))
+        for (const save of this.#saves) save.current = save === selected
+        this.#state = 'running'; this.#startedAt = Date.now(); this.#players = []
+        report(`已从存档 ${selected.name} 启动服务器`)
+        this.#log('info', `Loaded save ${selected.name}.`)
+        return { saveName: selected.name, automaticBackups, wasRunning, state: 'running', bridgeReady: true }
+      }
       case 'save': return this.#save(report)
       case 'stop':
         if (this.#state === 'stopped') return { alreadyStopped: true }

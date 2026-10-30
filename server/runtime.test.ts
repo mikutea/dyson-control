@@ -28,7 +28,7 @@ async function fixture() {
     run: async (action: Action, input: Record<string, unknown>) => {
       calls.push({ action, input })
       if (action === failAction) throw new Error('Fixture action failed')
-      if (action === 'start' || action === 'restart') { current.state = 'running'; current.pid = 1234 }
+      if (action === 'start' || action === 'restart' || action === 'load-save') { current.state = 'running'; current.pid = 1234 }
       if (action === 'stop') { current.state = 'stopped'; current.pid = null }
       return { fixture: true }
     },
@@ -60,6 +60,23 @@ async function fixture() {
 }
 
 describe('background runtime monitoring', () => {
+  it('pauses recovery after a failed save switch and resumes after a successful explicit load', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.setFailAction('load-save')
+    f.queue.enqueue({ requestId: 'load-failed', action: 'load-save', input: { saveId: 'fixture' } })
+    await f.idle()
+    f.current.state = 'stopped'; f.current.pid = null
+    await f.monitor.sample(); f.advance(120_000); await f.monitor.sample(); await f.idle()
+    expect(f.calls.map(call => call.action)).toEqual(['load-save'])
+    expect(f.monitor.status().recovery.blockedReason).not.toBeNull()
+    f.setFailAction(null)
+    f.queue.enqueue({ requestId: 'load-retry', action: 'load-save', input: { saveId: 'fixture' } })
+    await f.idle()
+    expect(f.monitor.status().recovery).toMatchObject({ wantedRunning: true, blockedReason: null })
+  })
+
   it('preserves the initial settings, restores a previous version and reopens bounded history', async () => {
     const f = await fixture()
     const initial = f.monitor.settings()
