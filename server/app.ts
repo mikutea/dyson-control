@@ -26,7 +26,7 @@ const emptyObjectSchema = z.object({}).strict()
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
-const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server'])
+const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world'])
 const settingsSchema = z.object({
   serverName: z.string().trim().min(1).max(80).regex(/^[^\r\n\0]+$/u),
   maxPlayers: z.number().int().min(1).max(256).nullable(),
@@ -40,6 +40,7 @@ const settingsSchema = z.object({
 const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'prepare-steamcmd': emptyObjectSchema,
   'install-server': z.object({ gameUser: z.string().trim().min(1).max(80).regex(/^[^\\/\r\n\0]+$/u) }).strict(),
+  'prepare-first-world': emptyObjectSchema,
   start: emptyObjectSchema,
   save: emptyObjectSchema,
   stop: emptyObjectSchema,

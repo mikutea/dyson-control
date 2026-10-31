@@ -31,6 +31,9 @@ try{
   Assert ($options -ceq '<Options><CurrentVersion><VersionNumber>6</VersionNumber></CurrentVersion></Options>') 'Fresh headless startup did not seed default options with the supported format'
   Assert (Test-Path -LiteralPath (Join-Path $s.Root '.dyson-first-world-consumed.json')) 'First-world authorization was not consumed'
   Assert ((@(Get-DysonInitialWorldArguments $s.Root $s.Saves $null $s.Documents) -join ' ') -ceq '-load-latest') 'A later empty directory could create another world'
+  [IO.File]::Move((Join-Path $s.Root '.dyson-first-world-consumed.json'),(Join-Path $s.Root '.dyson-first-world.json'))
+  Assert ((@(Get-DysonInitialWorldArguments $s.Root $s.Saves $null $s.Documents) -join ' ') -ceq '-newgame-default') 'Explicitly restored permission did not allow one new-world attempt'
+  Assert ((@(Get-DysonInitialWorldArguments $s.Root $s.Saves $null $s.Documents) -join ' ') -ceq '-load-latest') 'Restored permission was reusable without another explicit preparation'
   $s=Scenario 'existing-save'
   [IO.File]::WriteAllText((Join-Path $s.Saves 'World.dsv'),'preserve')
   Assert ((@(Get-DysonInitialWorldArguments $s.Root $s.Saves $null $s.Documents) -join ' ') -ceq '-load-latest') 'Existing saves were ignored'

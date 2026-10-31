@@ -1,0 +1,16 @@
+.activity-log-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 1rem; padding: 1rem; }
+.activity-log-status { display: grid; gap: .3rem; margin: 0; font-size: .76rem; }
+.activity-log-status strong { color: var(--text); font-weight: 600; }
+.activity-log-status span { color: var(--quiet); font-size: .68rem; }
+.activity-log-actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+.activity-log-filters { padding: 0 1rem .75rem; }
+.activity-log-scope { margin: 0; padding: 0 1rem 1rem; color: var(--quiet); font-size: .7rem; line-height: 1.65; border-bottom: 1px solid var(--line); }
+.activity-log-warning { margin: .8rem 1rem; }
+.activity-log-list p { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+@media (max-width: 640px) {
+  .activity-log-actions { width: 100%; }
+  .activity-log-actions .button { flex: 1; }
+  .activity-log-actions .button:last-child { flex-basis: 100%; }
+  .activity-log-filters small { width: 100%; padding-bottom: 0; }
+}

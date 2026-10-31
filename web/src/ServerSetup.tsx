@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Check, Download, KeyRound, Rocket, ShieldCheck } from 'lucide-react'
+import { Check, Download, KeyRound, Rocket, RotateCcw, ShieldCheck } from 'lucide-react'
 import type { ServerSetupStatus, SteamAuthStatus } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { get, post, remove } from './api'
@@ -80,6 +80,16 @@ export function ServerSetup({ refreshToken, runAction, operationActive }: { refr
     <ol className="setup-progress" aria-label="安装步骤">
       {[['SteamCMD', status.steamReady], ['Steam 授权', ready], ['安装服务器', status.existingGame && status.taskExists]].map(([label, done], index) => <li key={String(label)} className={done ? 'complete' : ''}><span>{done ? <Check aria-hidden /> : index + 1}</span><strong>{label}</strong></li>)}
     </ol>
+    {(status.firstWorld.state !== 'unavailable' || status.firstWorld.message) && <Panel title={status.firstWorld.state === 'retryable' ? '重新准备首次建图' : status.firstWorld.state === 'ready' ? '首次建图已准备' : '首次建图状态'} icon={status.firstWorld.state === 'ready' ? <Check /> : <RotateCcw />} className="setup-card setup-first-world">
+      <div className="setup-card-body">
+        <p role="status">{status.firstWorld.message}</p>
+        {status.firstWorld.state === 'retryable' && <>
+          <p>请先处理首次启动失败的原因。重新准备后，下一次从概览手动启动将按游戏默认设置创建新世界。</p>
+          <Button variant="primary" disabled={!status.supported || operationActive} onClick={() => runAction('prepare-first-world', {}, { title: '重新准备首次建图', description: '请先处理首次启动失败的原因。本次操作恢复首次建图许可；下一次从概览手动启动时，将按游戏默认设置创建新世界。', label: '确认重新准备' })}>重新准备首次建图</Button>
+        </>}
+        {status.firstWorld.state === 'ready' && <a className="button button-primary" href="#/overview">前往概览手动启动</a>}
+      </div>
+    </Panel>}
     <div className="setup-grid">
       <Panel title="SteamCMD" icon={<Download />} className="setup-card">
         <div className="setup-card-body"><p>用于查询和下载戴森球计划的官方游戏文件。</p><div className="setup-check"><StatusDot state={status.steamReady ? 'good' : 'warning'} /><strong>{status.steamReady ? '已准备好' : '等待准备'}</strong></div><code className="setup-path">{status.steamExecutable}</code>

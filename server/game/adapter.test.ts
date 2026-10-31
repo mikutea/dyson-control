@@ -18,6 +18,75 @@ const temporaryDirectories: string[] = []
 const execFileAsync = promisify(execFile)
 afterEach(async () => { await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true }))) })
 
+describe('preparing first-world authorization', () => {
+  async function fixture(state: 'stopped' | 'running' | 'unknown' | 'unmanaged' = 'stopped') {
+    const settings = await config('windows')
+    await fs.mkdir(settings.game.root)
+    const installationId = 'first-install-11111111-1111-1111-1111-111111111111'
+    const original = JSON.stringify({ schema: 1, mode: 'default', installationId }, null, 2) + '\r\n'
+    const consumed = path.join(settings.game.root, '.dyson-first-world-consumed.json')
+    const pending = path.join(settings.game.root, '.dyson-first-world.json')
+    await fs.writeFile(consumed, original)
+    const inspect = vi.fn(async () => {
+      if (state === 'unknown') throw new Error('Fixture inspection unavailable')
+      return {
+        process: state === 'running' ? { pid: 4242, startedAt: new Date().toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave: null } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: state !== 'unmanaged', configuredTargetUps: null },
+      }
+    })
+    const runScript = vi.fn(async () => { throw new Error('Preparing a world must not invoke a script') })
+    const adapter = new WindowsGameAdapter(settings, { inspect, runScript })
+    return { settings, adapter, original, installationId, consumed, pending, inspect, runScript }
+  }
+
+  it('restores the original permission without launching a task or changing startup settings', async () => {
+    const f = await fixture()
+    await f.adapter.settings()
+    const startup = path.join(f.settings.dataDirectory, 'game-startup', 'settings.json')
+    const before = await fs.readFile(startup)
+    const reports: string[] = []
+    expect(await f.adapter.run('prepare-first-world', {}, message => reports.push(message), new AbortController().signal)).toEqual({ prepared: true, installationId: f.installationId, started: false })
+    expect(await fs.readFile(f.pending, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.consumed)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await fs.readFile(startup)).toEqual(before)
+    expect(f.runScript).not.toHaveBeenCalled()
+    expect(reports.at(-1)).toContain('游戏保持停止')
+  })
+
+  it.each([
+    ['running', 'FIRST_WORLD_GAME_RUNNING'], ['unknown', 'FIRST_WORLD_STATE_UNKNOWN'], ['unmanaged', 'FIRST_WORLD_TASK_REQUIRED'],
+  ] as const)('does not restore permission when the game is %s', async (state, code) => {
+    const f = await fixture(state)
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code })
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('reads the actual startup selection before restoring permission', async () => {
+    const f = await fixture()
+    await f.adapter.settings()
+    await fs.writeFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), JSON.stringify({ schema: 1, targetUps: 60, saveName: 'Selected World' }))
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'FIRST_WORLD_SAVE_SELECTED' })
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('leaves an unfinished restore transaction and its consumed permission untouched', async () => {
+    const f = await fixture()
+    const active = path.join(f.settings.dataDirectory, 'save-restore', 'active')
+    await fs.mkdir(active, { recursive: true })
+    await fs.writeFile(path.join(active, 'evidence.txt'), 'preserve-restore')
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'FIRST_WORLD_RESTORE_PENDING' })
+    expect(await fs.readFile(path.join(active, 'evidence.txt'), 'utf8')).toBe('preserve-restore')
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+})
+
 describe('backup verification actions', () => {
   it('verifies a real Windows-format backup without inspecting, saving or stopping the game', async () => {
     const fixture = await config('windows')
@@ -2638,18 +2707,16 @@ $results | ConvertTo-Json -Depth 8 -Compress
     })
   })
 
-  it.runIf(process.platform === 'win32')('requires Steam ownership in the same Windows session before changing the game binding', async () => {
+  it.runIf(process.platform === 'win32').each(['absent', 'different-session'] as const)('requires Steam ownership in the same Windows session before changing the game binding (%s)', async steamMode => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
     await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
     await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
     const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
-    for (const steamMode of ['absent', 'different-session'] as const) {
-      await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, steamMode)).rejects.toMatchObject({
-        stderr: expect.stringContaining('No running Steam client is owned by the current GameUser in interactive session')
-      })
-    }
+    await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, steamMode)).rejects.toMatchObject({
+      stderr: expect.stringContaining('No running Steam client is owned by the current GameUser in interactive session')
+    })
     await expect(fs.lstat(path.join(fixture.game.root, 'Configs'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 

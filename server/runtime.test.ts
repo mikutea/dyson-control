@@ -2,7 +2,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
-import type { Action, GameAdapter, Overview } from '../shared/contracts.js'
+import type { Action, GameAdapter, Job, Overview } from '../shared/contracts.js'
 import { JobQueue, JobStore } from './jobs.js'
 import { RuntimeMonitor } from './runtime.js'
 
@@ -36,8 +36,8 @@ async function fixture() {
   const jobs = new JobStore(path.join(root, 'jobs.sqlite'))
   const queue = new JobQueue(jobs, adapter)
   const monitors: RuntimeMonitor[] = []
-  const open = () => {
-    const value = new RuntimeMonitor(path.join(root, 'runtime.sqlite'), adapter, queue, jobs, { clock: () => time, recoveryGraceMs: 0 })
+  const open = (recoveredJobs: Job[] = []) => {
+    const value = new RuntimeMonitor(path.join(root, 'runtime.sqlite'), adapter, queue, jobs, { clock: () => time, recoveryGraceMs: 0, recoveredJobs })
     monitors.push(value); return value
   }
   const monitor = open()
@@ -281,6 +281,60 @@ describe('background runtime monitoring', () => {
     await f.idle()
     expect(reopened.status().recovery.wantedRunning).toBe(true)
     expect(reopened.status().recovery.blockedReason).toBeNull()
+  })
+
+  it.each([false, true])('keeps the game stopped after first-world preparation across monitor restart (failed: %s)', async failed => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.current.state = 'stopped'; f.current.pid = null
+    if (failed) f.setFailAction('prepare-first-world')
+    f.queue.enqueue({ requestId: 'prepare-world', action: 'prepare-first-world', input: {} })
+    await f.idle()
+    await f.monitor.close()
+    const reopened = f.open()
+    await reopened.sample(); f.advance(120_000); await reopened.sample(); await f.idle()
+    expect(f.calls.map(call => call.action)).toEqual(['prepare-first-world'])
+    if (failed) expect(reopened.status().recovery.blockedReason).not.toBeNull()
+    else expect(reopened.status().recovery.wantedRunning).toBe(false)
+    f.setFailAction(null)
+    f.queue.enqueue({ requestId: 'start-prepared-world', action: 'start', input: {} })
+    await f.idle()
+    expect(reopened.status().recovery).toMatchObject({ wantedRunning: true, blockedReason: null })
+  })
+
+  it('does not clear a prior recovery block merely by preparing first-world permission', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.current.state = 'stopped'; f.current.pid = null; f.setFailAction('start')
+    f.queue.enqueue({ requestId: 'failed-first-start', action: 'start', input: {} })
+    await f.idle()
+    const blocked = f.monitor.status().recovery.blockedReason
+    expect(blocked).not.toBeNull()
+    f.setFailAction(null)
+    f.queue.enqueue({ requestId: 'prepare-after-failure', action: 'prepare-first-world', input: {} })
+    await f.idle()
+    expect(f.monitor.status().recovery).toMatchObject({ wantedRunning: false, blockedReason: blocked })
+    await f.monitor.sample(); f.advance(120_000); await f.monitor.sample(); await f.idle()
+    expect(f.calls.map(call => call.action)).toEqual(['start', 'prepare-first-world'])
+  })
+
+  it('blocks automatic startup when service restart recovers an interrupted first-world preparation', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    f.current.state = 'stopped'; f.current.pid = null
+    await f.monitor.close()
+    const { job } = f.jobs.create({ requestId: 'interrupted-prepare', action: 'prepare-first-world', input: {} })
+    f.jobs.start(job.id)
+    const reopened = f.open(f.jobs.recoverInterruptedJobs())
+    expect(reopened.status().recovery.blockedReason).not.toBeNull()
+    await reopened.sample(); f.advance(120_000); await reopened.sample(); await f.idle()
+    expect(f.calls).toEqual([])
+    f.queue.enqueue({ requestId: 'explicit-start-after-interruption', action: 'start', input: {} })
+    await f.idle()
+    expect(reopened.status().recovery).toMatchObject({ wantedRunning: true, blockedReason: null })
   })
 
   it('blocks recovery after a failed file mutation until a successful manual start', async () => {

@@ -12,7 +12,9 @@
 .setup-progress svg { width:17px; height:17px; }
 .setup-grid { display:grid; grid-template-columns:minmax(0,.85fr) minmax(0,1.15fr); gap:20px; }
 .setup-card { min-width:0; }
+.setup-first-world { margin-bottom:22px; border-color:var(--line-strong); }
 .setup-card-body { padding:22px; }
+.setup-first-world .setup-card-body > p:last-child { margin-bottom:0; }
 .setup-card-body > p, .setup-card-body form p { color:var(--muted); font-size:13px; line-height:1.8; margin-top:0; }
 .setup-check { display:flex; align-items:center; gap:9px; margin:18px 0 12px; font-size:14px; }
 .setup-path { display:block; overflow-wrap:anywhere; white-space:normal; line-height:1.65; font-size:12px; border:1px solid var(--line); border-radius:8px; background:var(--surface-soft); color:var(--muted); padding:11px 13px; margin:12px 0 20px; }

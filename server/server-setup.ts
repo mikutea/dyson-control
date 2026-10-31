@@ -5,6 +5,7 @@ import path from 'node:path'
 import { z } from 'zod'
 import type { ControlConfig, ReportStep, ServerSetupStatus } from '../shared/contracts.js'
 import { GameAdapterError } from './game/errors.js'
+import { readFirstWorldStatus } from './game/first-world.js'
 import { extractZipBuffer, GameUpdateManager } from './game/updates.js'
 import { parseAppManifest, runSteamCommand, type SteamCommandRunner } from './game/steam-update.js'
 import { resolveWindowsScript, runPowerShell } from './game/system.js'
@@ -94,7 +95,7 @@ export class ServerSetupManager {
     const response: ServerSetupStatus = {
       supported, gameRoot: this.#config.game.root, steamExecutable: executable, accountName: this.#config.game.steam?.accountName ?? '',
       steamReady: false, existingGame: false, targetEmpty: false, bridgeAvailable: false, taskExists: false,
-      gameUsers: [], blockers: [], auth: this.auth.status(owner),
+      gameUsers: [], blockers: [], auth: this.auth.status(owner), firstWorld: { state: 'unavailable', message: '' },
     }
     if (!supported) { response.blockers.push('首次安装与 Steam 授权需要 Windows 服务器。'); return response }
     const steam = await stat(executable)
@@ -103,12 +104,39 @@ export class ServerSetupManager {
       response.existingGame = !!await stat(path.join(this.#config.game.root, 'DSPGAME.exe'))
       response.targetEmpty = await emptyDirectory(this.#config.game.root)
     } catch { response.blockers.push('游戏目录暂不可访问；可以单独完成 Steam 授权。') }
+    let hostVerified = true
     const host = await this.#host().catch(() => {
+      hostVerified = false
       response.blockers.push('未能读取 Windows 用户与启动任务，请检查面板运行权限。')
       return { taskExists: false, running: false, gameUsers: [] } satisfies HostStatus
     })
     response.taskExists = host.taskExists
     response.gameUsers = host.gameUsers
+    response.firstWorld = await readFirstWorldStatus(this.#config)
+    if (response.firstWorld.state !== 'unavailable') {
+      if (!hostVerified) response.firstWorld = { state: 'unavailable', message: '未能确认游戏进程与启动任务，请刷新检查后再准备首次建图。' }
+      else if (host.running) response.firstWorld = { state: 'unavailable', message: '服务器正在运行，请在停止后检查首次建图状态。' }
+      else if (!host.taskExists) response.firstWorld = { state: 'unavailable', message: '游戏启动任务不存在，请先修复启动配置。' }
+      else {
+        try {
+          if (await stat(path.join(this.#config.dataDirectory, 'save-restore', 'active'))) {
+            response.firstWorld = { state: 'unavailable', message: '存在尚未完成的存档恢复，请先检查并完成恢复。' }
+          } else {
+            const startupPath = path.join(this.#config.dataDirectory, 'game-startup', 'settings.json')
+            if (await stat(startupPath)) {
+              const startup = JSON.parse(await fs.readFile(startupPath, 'utf8')) as { saveName?: unknown }
+              if (typeof startup.saveName === 'string' && startup.saveName.length > 0) {
+                response.firstWorld = { state: 'unavailable', message: '已选择启动存档，请继续加载或恢复该存档。' }
+              } else if (startup.saveName !== null) {
+                response.firstWorld = { state: 'unavailable', message: '启动存档设置无效，请检查启动配置。' }
+              }
+            }
+          }
+        } catch {
+          response.firstWorld = { state: 'unavailable', message: '无法读取启动存档设置或恢复状态，请检查文件权限与存储状态。' }
+        }
+      }
+    }
     if (!response.targetEmpty) response.blockers.push('目标目录已有内容，首次安装不会覆盖现有文件。')
     if (host.taskExists) response.blockers.push('已存在游戏启动任务；请继续使用现有服务器管理功能。')
     if (host.running) response.blockers.push('目标服务器正在运行。')

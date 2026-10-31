@@ -13,6 +13,7 @@ import {
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
 } from './bridge.js'
 import { GameAdapterError, invalidInput, unsupported } from './errors.js'
+import { prepareFirstWorld } from './first-world.js'
 import { readGameLogs } from './logs.js'
 import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
@@ -551,6 +552,7 @@ export class WindowsGameAdapter implements GameAdapter {
     signal.throwIfAborted()
     switch (action) {
       case 'start': return this.#start(report, signal)
+      case 'prepare-first-world': return this.#prepareFirstWorld(report, signal)
       case 'load-save': return this.#loadSave(input, report, signal)
       case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'save': return this.#save(report, signal)
@@ -714,6 +716,29 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     this.#currentSave = { name, savedAt: (await this.saves()).find(save => save.name === name)?.modifiedAt ?? selected.modifiedAt }
     return { saveName: name, automaticBackups: protectedBackups, wasRunning, state: 'running', bridgeReady: true }
+  }
+
+  async #prepareFirstWorld(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    let inspection: InspectResult
+    try { inspection = await this.#inspect(true) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STATE_UNKNOWN', '未能确认服务器已经停止，请检查服务器状态后重试。', { cause: error }) }
+    if (inspection.process) throw new GameAdapterError('FIRST_WORLD_GAME_RUNNING', '请先停止服务器，再准备首次世界许可。')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('FIRST_WORLD_TASK_REQUIRED', '准备首次世界许可需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    let startup: StartupSettings
+    try { startup = validateStartupSettings(JSON.parse(await fs.readFile(this.#startupSettingsPath, 'utf8'))) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STARTUP_INVALID', '无法读取有效的启动存档设置，未准备首次世界许可。', { cause: error }) }
+    if (startup.saveName !== null) {
+      throw new GameAdapterError('FIRST_WORLD_SAVE_SELECTED', '已选择启动存档，请继续加载或恢复该存档；未准备新世界。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      throw new GameAdapterError('FIRST_WORLD_RESTORE_PENDING', '存在尚未完成的存档恢复，请先检查并完成恢复；未准备新世界。')
+    }
+    report('正在恢复原始首装许可')
+    const result = await prepareFirstWorld(this.#config, signal)
+    report('首次世界许可已准备好。游戏保持停止，请前往概览手动启动。')
+    return result
   }
 
   async #start(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {

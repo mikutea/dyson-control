@@ -1,5 +1,5 @@
 export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
-export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server'
+export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
 
@@ -130,11 +130,12 @@ export interface SteamAuthStatus {
   id: string | null; state: SteamAuthState; promptId: number; message: string
   expiresAt: string | null; verifiedAt: string | null; latestBuild: string | null
 }
+export interface FirstWorldStatus { state: 'unavailable' | 'ready' | 'retryable'; message: string }
 export interface ServerSetupStatus {
   supported: boolean; gameRoot: string; steamExecutable: string; steamReady: boolean; accountName: string
   existingGame: boolean; targetEmpty: boolean; bridgeAvailable: boolean; taskExists: boolean
   gameUsers: Array<{ name: string; activeSteam: boolean }>
-  blockers: string[]; auth: SteamAuthStatus
+  blockers: string[]; auth: SteamAuthStatus; firstWorld: FirstWorldStatus
 }
 
 export interface GameAdapter {

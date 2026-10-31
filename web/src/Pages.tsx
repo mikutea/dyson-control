@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
-  Activity, Archive, Box, CheckCircle2, CircleGauge, Clock3, CloudDownload, Cpu, Database,
+  Activity, Archive, Box, CircleGauge, Clock3, CloudDownload, Cpu, Database,
   Download, FileArchive, Gamepad2, HardDrive, MemoryStick, PackageCheck, Play, Power,
   RefreshCw, RotateCcw, Save as SaveIcon, Server as ServerIcon, Settings2, ShieldCheck,
   Square, TimerReset, UserRound, Users, Wifi,
@@ -11,7 +11,7 @@ import type {
 } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, MetricBar, PageHeader, Panel, StatusDot } from './components'
-import { actionLabels, formatBytes, formatDate, formatDuration, formatFullDate, formatJobResult, jobStateLabels, percent, serverStateLabels } from './format'
+import { formatBytes, formatDate, formatDuration, formatFullDate, percent, serverStateLabels } from './format'
 import { useResource } from './hooks'
 import { BackupImport } from './BackupImport'
 import { ModCatalog } from './ModCatalog'
@@ -26,6 +26,7 @@ import { ModSideControl } from './ModSideControl'
 import { ControlUpdates } from './ControlUpdates'
 import { ComponentVersionCard } from './ComponentVersionCard'
 import { ServerSetup } from './ServerSetup'
+import { ActivityPage } from './ActivityPage'
 
 interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void; operationActive: boolean }
 
@@ -244,17 +245,6 @@ function SettingsPage({ refreshToken, runAction }: PagesProps) {
     <SettingsHistory refreshToken={refreshToken} dirty={dirty} runAction={runAction} />
     <RuntimeSettingsPanel refreshToken={refreshToken} />
   </>
-}
-
-function ActivityPage({ refreshToken }: PagesProps) {
-  const jobs = useResource<Job[]>('/jobs', refreshToken)
-  const logs = useResource<LogEntry[]>('/logs', refreshToken)
-  const [tab, setTab] = useState<'operations' | 'logs'>('operations')
-  return <><PageHeader title="活动" description="查看管理操作和服务器消息" actions={<div className="segmented"><button className={tab === 'operations' ? 'selected' : ''} onClick={() => setTab('operations')}>管理操作</button><button className={tab === 'logs' ? 'selected' : ''} onClick={() => setTab('logs')}>服务器消息</button></div>} />
-    <Panel className="table-panel">
-      {tab === 'operations' ? <ResourceBody resource={jobs} emptyTitle="还没有管理操作" emptyDescription="启动、保存或备份后会记录在这里">{(items) => <div className="job-history">{items.map((job) => <article key={job.id}><div className="job-history-head"><span className={`operation-icon operation-${job.state}`}>{job.state === 'succeeded' ? <CheckCircle2 /> : job.state === 'failed' || job.state === 'interrupted' ? <Square /> : <RefreshCw />}</span><div><h2>{actionLabels[job.action]}</h2><p>{formatJobResult(job) || job.message || jobStateLabels[job.state]}</p></div><span className={`job-state state-${job.state}`}>{jobStateLabels[job.state]}</span><time>{formatFullDate(job.createdAt)}</time></div>{job.steps.length > 0 && <details><summary>查看 {job.steps.length} 个步骤</summary><ol>{job.steps.map((step, index) => <li key={`${step.time}-${index}`}><time>{formatDate(step.time)}</time><span>{step.message}</span></li>)}</ol></details>}</article>)}</div>}</ResourceBody>
-        : <ResourceBody resource={logs} emptyTitle="暂无服务器消息" emptyDescription="服务器的新消息会显示在这里">{(items) => <div className="log-list">{items.map((entry) => <div key={entry.id}><time>{entry.time ? formatFullDate(entry.time) : '时间未记录'}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div>}</ResourceBody>}
-    </Panel></>
 }
 
 function ResourceBody<T>({ resource, emptyTitle, emptyDescription, children }: { resource: ReturnType<typeof useResource<T>>; emptyTitle: string; emptyDescription: string; children: (data: T & { length: number }) => ReactNode }) {

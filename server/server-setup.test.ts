@@ -170,7 +170,94 @@ it('does not require Steam login to inspect setup status', async () => {
   const f = await fixture(); const status = await f.manager.status('owner')
   expect(status).toMatchObject({ steamReady: true, targetEmpty: true, bridgeAvailable: true, existingGame: false })
   expect(status.auth.state).toBe('idle')
+  expect(status.firstWorld).toEqual({ state: 'unavailable', message: '' })
   expect(f.run).not.toHaveBeenCalled(); expect(f.fetcher).not.toHaveBeenCalled()
+})
+
+it.each([
+  { marker: '.dyson-first-world.json', state: 'ready' },
+  { marker: '.dyson-first-world-consumed.json', state: 'retryable' },
+])('reports a $state first-world permission without changing the marker or starting the game', async ({ marker, state }) => {
+  const f = await fixture({ freshStorage: true })
+  f.host.taskExists = true
+  await fs.mkdir(f.config.game.saveDirectory)
+  const content = JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }) + '\n'
+  await write(path.join(f.config.game.root, marker), content)
+  const status = await f.manager.status('owner')
+  expect(status.firstWorld.state).toBe(state)
+  expect(status.firstWorld.message).not.toBe('')
+  expect(await fs.readFile(path.join(f.config.game.root, marker), 'utf8')).toBe(content)
+  expect(f.run).not.toHaveBeenCalled()
+  expect(f.runScript.mock.calls.map(call => call[0])).toEqual(['inspect-server-setup.ps1'])
+})
+
+it.each([
+  { running: true, taskExists: true, message: '服务器正在运行' },
+  { running: false, taskExists: false, message: '游戏启动任务不存在' },
+])('blocks first-world preparation in setup status when running=$running and taskExists=$taskExists', async ({ running, taskExists, message }) => {
+  const f = await fixture({ freshStorage: true })
+  Object.assign(f.host, { running, taskExists })
+  await fs.mkdir(f.config.game.saveDirectory)
+  await write(path.join(f.config.game.root, '.dyson-first-world-consumed.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }))
+  expect((await f.manager.status('owner')).firstWorld).toEqual({ state: 'unavailable', message: expect.stringContaining(message) })
+  await expect(fs.access(path.join(f.config.game.root, '.dyson-first-world.json'))).rejects.toHaveProperty('code', 'ENOENT')
+})
+
+it('does not offer first-world preparation when host inspection fails', async () => {
+  const f = await fixture({ freshStorage: true })
+  await fs.mkdir(f.config.game.saveDirectory)
+  await write(path.join(f.config.game.root, '.dyson-first-world-consumed.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }))
+  f.runScript.mockRejectedValueOnce(new Error('fixture inspection failure'))
+  expect((await f.manager.status('owner')).firstWorld).toEqual({ state: 'unavailable', message: expect.stringContaining('未能确认游戏进程与启动任务') })
+})
+
+it('reports first-world preparation as unavailable once a save exists', async () => {
+  const f = await fixture()
+  f.host.taskExists = true
+  await write(path.join(f.config.game.root, '.dyson-first-world-consumed.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }))
+  expect((await f.manager.status('owner')).firstWorld).toEqual({ state: 'unavailable', message: expect.stringContaining('存档目录已有') })
+  expect(await fs.readFile(path.join(f.config.game.saveDirectory, 'existing.dsv'), 'utf8')).toBe('UNRELATED SAVE')
+})
+
+it.each([null, 'Selected World'])('respects an existing startup save selection: %s', async saveName => {
+  const f = await fixture({ freshStorage: true })
+  f.host.taskExists = true
+  await fs.mkdir(f.config.game.saveDirectory)
+  await write(path.join(f.config.game.root, '.dyson-first-world-consumed.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }))
+  const startupPath = path.join(f.config.dataDirectory, 'game-startup', 'settings.json')
+  const content = JSON.stringify({ schema: 1, targetUps: 60, saveName })
+  await write(startupPath, content)
+  const status = await f.manager.status('owner')
+  expect(status.firstWorld.state).toBe(saveName === null ? 'retryable' : 'unavailable')
+  if (saveName !== null) expect(status.firstWorld.message).toContain('已选择启动存档')
+  expect(await fs.readFile(startupPath, 'utf8')).toBe(content)
+  expect(f.runScript.mock.calls.map(call => call[0])).toEqual(['inspect-server-setup.ps1'])
+})
+
+it('does not offer first-world preparation while a save restoration is unfinished', async () => {
+  const f = await fixture({ freshStorage: true })
+  f.host.taskExists = true
+  await fs.mkdir(f.config.game.saveDirectory)
+  const markerPath = path.join(f.config.game.root, '.dyson-first-world-consumed.json')
+  const marker = JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' })
+  await write(markerPath, marker)
+  const transactionPath = path.join(f.config.dataDirectory, 'save-restore', 'active', 'transaction.json')
+  await write(transactionPath, 'UNFINISHED RESTORE FIXTURE')
+  expect((await f.manager.status('owner')).firstWorld).toEqual({ state: 'unavailable', message: expect.stringContaining('尚未完成的存档恢复') })
+  expect(await fs.readFile(markerPath, 'utf8')).toBe(marker)
+  expect(await fs.readFile(transactionPath, 'utf8')).toBe('UNFINISHED RESTORE FIXTURE')
+  expect(f.runScript.mock.calls.map(call => call[0])).toEqual(['inspect-server-setup.ps1'])
+})
+
+it('does not offer first-world preparation when existing startup settings cannot be read', async () => {
+  const f = await fixture({ freshStorage: true })
+  f.host.taskExists = true
+  await fs.mkdir(f.config.game.saveDirectory)
+  await write(path.join(f.config.game.root, '.dyson-first-world-consumed.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: 'first-install-11111111-1111-1111-1111-111111111111' }))
+  const startupPath = path.join(f.config.dataDirectory, 'game-startup', 'settings.json')
+  await write(startupPath, '{invalid fixture')
+  expect((await f.manager.status('owner')).firstWorld).toEqual({ state: 'unavailable', message: expect.stringContaining('无法读取启动存档设置或恢复状态') })
+  expect(await fs.readFile(startupPath, 'utf8')).toBe('{invalid fixture')
 })
 
 it.each([
