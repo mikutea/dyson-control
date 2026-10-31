@@ -1,11 +1,16 @@
 import type { Action, Job, JobState, ServerState } from '../../shared/contracts'
 
 export const actionLabels: Record<Action, string> = {
+  'prepare-steamcmd': '准备 SteamCMD',
+  'install-server': '首次安装服务器',
+  'prepare-first-world': '重新准备首次建图',
   start: '启动服务器',
   save: '保存游戏',
   stop: '停止服务器',
   restart: '重新启动',
+  'load-save': '加载存档',
   backup: '创建备份',
+  'verify-backup': '校验备份',
   restore: '恢复备份',
   'import-backup': '导入备份',
   'install-update': '安装更新',
@@ -89,12 +94,17 @@ export function formatJobResult(job: Job): string | null {
   if (job.state !== 'succeeded' || !job.result) return null
   const text = (key: string) => typeof job.result?.[key] === 'string' ? String(job.result[key]) : null
   switch (job.action) {
+    case 'prepare-steamcmd': return 'SteamCMD 已就绪，可继续授权'
+    case 'install-server': return '服务器安装完成，等待手动首次启动'
+    case 'prepare-first-world': return '首次建图已准备，请前往概览手动启动'
     case 'start': return '服务器已启动'
+    case 'load-save': return text('saveName') ? `已从存档 ${text('saveName')} 启动服务器` : '已加载所选存档'
     case 'stop': return '服务器已安全停止'
     case 'restart': return '服务器已重新启动'
     case 'kick-player': return '玩家已离线，游戏已完成连接清理'
     case 'save': return text('saveName') ? `存档 ${text('saveName')} 已保存` : '游戏已保存'
     case 'backup': return text('saveName') ? `${text('saveName')} 已完整备份` : '备份已创建'
+    case 'verify-backup': return text('saveName') ? `${text('saveName')} 备份完整性校验通过` : '备份完整性校验通过'
     case 'restore': return text('saveName') ? `${text('saveName')} 已恢复` : '备份已恢复'
     case 'import-backup': return text('saveName') ? `${text('saveName')} 已导入，可在存档页面恢复` : '备份已导入，可在存档页面恢复'
     case 'install-update': return text('version') ? `已更新至 ${text('version')}` : '更新已安装'

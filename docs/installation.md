@@ -75,34 +75,39 @@ Get-ChildItem 'C:\Temp\dyson-control-release\scripts\windows\*.ps1' | Unblock-Fi
 
 ## 准备私有配置
 
-先将发布 ZIP 解压到临时目录。创建独立配置和数据目录：
+先将发布 ZIP 解压到临时目录。准备新服务器时，可以直接生成配置，无需手工编辑 JSON 或粘贴密码散列。在 PowerShell 中运行：
 
 ```powershell
 $release = 'C:\Temp\dyson-control-release'
 $privateRoot = 'C:\ProgramData\Dyson Control'
 New-Item -ItemType Directory -Path $privateRoot -Force | Out-Null
-Copy-Item "$release\control.config.example.json" "$privateRoot\control.config.json"
-```
-
-编辑 `control.config.json`：
-
-- `host` 保持 `127.0.0.1`；
-- `dataDirectory` 使用版本目录之外的绝对路径，例如 `C:/ProgramData/Dyson Control/data`；
-- 将游戏、存档、备份、日志、Bridge 和游戏计划任务路径改为本机的绝对路径；
-- 示例域名只能替换为部署者自己的游戏连接地址；
-- `adminPasswordHash` 必须换成真实密码的 scrypt 散列。
-
-发布包不含依赖，因此可先在解压目录安装生产依赖并生成散列：
-
-```powershell
 Push-Location $release
 npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-node .\dist\server\admin.js hash-password
+node .\dist\server\admin.js init-windows "$privateRoot\control.config.json" `
+  --server-root 'D:\Dyson' `
+  --address 'game.example.com:8469' `
+  --name 'Dyson Server'
 node .\dist\server\admin.js validate-config "$privateRoot\control.config.json"
 Pop-Location
 ```
 
-密码输入不会回显。不要把密码、散列后的私有配置、Bridge 密钥或真实服务器路径提交到仓库或重新打进 ZIP。配置确认后可用本地化无关的 SID 限制读取权限：
+将 `D:\Dyson` 换成自己的持久化存储目录，示例域名换成自己的游戏地址。按提示输入并确认至少 12 字符的管理员密码，输入不会回显，配置中只保存 scrypt 散列。不要在命令参数中传密码。
+
+生成的配置默认保持回环监听；可用 `--port 13021` 更改面板端口。省略 `--address` 时，游戏地址默认为本机 `127.0.0.1:8469`，适合先完成本机配置，之后再修改为实际分享地址。
+
+| 内容 | 上述示例的路径 |
+| --- | --- |
+| 私有配置 | `C:\ProgramData\Dyson Control\control.config.json` |
+| 面板数据 | `C:\ProgramData\Dyson Control\data` |
+| 游戏文件 | `D:\Dyson\game` |
+| 存档与备份 | `D:\Dyson\userdata\Save`、`D:\Dyson\backups` |
+| Bridge 通信与密钥 | `D:\Dyson\bridge`、`D:\Dyson\private\bridge-secret` |
+
+初始化只创建这一份配置；已有同名文件会被保留，命令不会下载或启动游戏，也不注册 Windows 任务。游戏与数据目录会由后续安装流程按需准备。
+
+接入已有游戏或使用其他目录布局时，仍可复制 `control.config.example.json` 后自行调整：各目录应使用版本目录之外的绝对路径，`host` 保持回环监听。使用 `node .\dist\server\admin.js hash-password` 生成管理员散列，随后通过 `validate-config` 检查配置。
+
+不要把密码、散列后的私有配置、Bridge 密钥或真实服务器路径提交到仓库或重新打进 ZIP。配置确认后可用本地化无关的 SID 限制读取权限：
 
 ```powershell
 icacls "$privateRoot\control.config.json" /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
@@ -132,7 +137,7 @@ npm 的嵌套依赖可能使文件路径超过 260 字符。安装与升级统�
 
 若 Node.js 或 npm 不在 PATH 中，可显式传入 `-NodePath` 和 `-NpmPath`。`-TaskName` 只接受字母、数字、空格、点、下划线和连字符，安装状态会记录精确名称供升级和卸载核对。
 
-服务首次安装后，再按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`。完整包可直接把版本目录中的 `dist\bridge` 作为候选；面板包需要另行构建并提供候选目录。先运行 `-PrepareOnly` 审查计划和待部署文件；真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。脚本默认不启动游戏，也不迁移存档。
+服务首次安装后，完整包用户可打开[安装与授权](server-setup.md)，在空游戏目录中一键安装服务器。现有游戏接入仍按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`：先运行 `-PrepareOnly` 审查计划，真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。面板包可修复 Steam 授权，但首次安装服务器需要完整包。两个接入流程都不自动启动游戏或迁移存档。
 
 ## 升级与自动回退
 
@@ -165,7 +170,7 @@ Invoke-RestMethod 'http://127.0.0.1:13020/healthz'
 Invoke-RestMethod 'http://127.0.0.1:13020/api/session'
 ```
 
-先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后仍需单独验证 HTTPS 入口、登录、Windows 游戏任务、Bridge 保存、存档恢复、重启恢复以及真实外部客户端加入。
+先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后检查自己的管理员登录、Windows 游戏任务、Bridge 保存和存档恢复；需要远程管理或外网联机时，按[连接自己的服务器](networking.md)配置并检查相应入口。游戏重启恢复的限制见 [README](../README.md#已知限制)。
 
 ## 卸载计划任务
 

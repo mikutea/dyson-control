@@ -19,12 +19,14 @@ import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
 import { playerIdPattern } from './game/bridge.js'
 import { ControlUpdateError, ControlUpdateManager } from './control-updates.js'
+import { SteamAuthManager } from './steam-auth.js'
+import { ServerSetupManager } from './server-setup.js'
 
 const emptyObjectSchema = z.object({}).strict()
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
-const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player'])
+const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world'])
 const settingsSchema = z.object({
   serverName: z.string().trim().min(1).max(80).regex(/^[^\r\n\0]+$/u),
   maxPlayers: z.number().int().min(1).max(256).nullable(),
@@ -36,11 +38,16 @@ const settingsSchema = z.object({
 }).strict().transform(({ readOnlyFields: _readOnlyFields, ...settings }) => settings)
 
 const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
+  'prepare-steamcmd': emptyObjectSchema,
+  'install-server': z.object({ gameUser: z.string().trim().min(1).max(80).regex(/^[^\\/\r\n\0]+$/u) }).strict(),
+  'prepare-first-world': emptyObjectSchema,
   start: emptyObjectSchema,
   save: emptyObjectSchema,
   stop: emptyObjectSchema,
   restart: emptyObjectSchema,
+  'load-save': z.object({ saveId: idSchema }).strict(),
   backup: z.object({ saveId: idSchema.optional() }).strict(),
+  'verify-backup': z.object({ backupId: idSchema }).strict(),
   restore: z.object({ backupId: idSchema }).strict(),
   'import-backup': z.object({ uploadId: z.string().uuid() }).strict(),
   'install-update': z.object({ component: z.enum(['game', 'nebula', 'bepinex']), version: z.string().trim().min(1).max(100).optional() }).strict(),
@@ -71,6 +78,8 @@ export interface BuildAppOptions {
   maxOutstandingJobs?: number
   jobTimeoutMs?: number
   runtimeOptions?: { clock?: () => number; intervalMs?: number }
+  steamAuth?: SteamAuthManager
+  serverSetup?: Pick<ServerSetupManager, 'status' | 'prepareSteam' | 'install'>
   controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'history' | 'close'>
 }
 
@@ -83,6 +92,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     requestTimeout: REQUEST_TIMEOUT_MS,
     trustProxy: (address, hop) => hop === 0 && isLoopbackAddress(address),
   })
+  const steamAuth = options.steamAuth ?? new SteamAuthManager(options.config)
+  await steamAuth.initialize()
+  const setup = options.serverSetup ?? new ServerSetupManager(options.config, steamAuth)
   const adapter = options.adapter ?? await createGameAdapter(options.config)
   const store = new JobStore(options.databasePath ?? resolve(options.config.dataDirectory, 'control.sqlite'))
   const recoveredJobs = store.recoverInterruptedJobs()
@@ -91,6 +103,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const queue = new JobQueue(store, adapter, {
     maxOutstandingJobs: options.maxOutstandingJobs,
     jobTimeoutMs: options.jobTimeoutMs,
+    execute: (action, input, report, signal) => action === 'prepare-steamcmd' ? setup.prepareSteam(report, signal)
+      : action === 'install-server' ? setup.install(String(input.gameUser), report, signal)
+      : adapter.run(action, input, report, signal),
   })
   const maintenance = new MaintenanceGate(
     options.config.dataDirectory,
@@ -103,7 +118,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const controlUpdates = options.controlUpdates ?? new ControlUpdateManager({ config: options.config, currentVersion: healthIdentity.version })
   await controlUpdates.initialize()
   let events: EventHub
-  const sessions = new SessionStore({ maxSessions: options.maxSessions, onInvalidate: (token) => events.closeSession(token) })
+  const sessions = new SessionStore({ maxSessions: options.maxSessions, onInvalidate: (token) => { events.closeSession(token); steamAuth.invalidate(token) } })
   events = new EventHub(adapter, (token) => sessions.has(token), { maxClients: options.maxSseClients })
   const loginGuard = options.loginGuard ?? new LoginGuard()
   const activeUploads = new Map<string, AbortController>()
@@ -212,6 +227,30 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const overview = await adapter.overview()
     events.publishOverview(overview)
     return data(overview)
+  })
+  app.get('/api/setup', async request => { assertNoQuery(request); return data(await setup.status(request.cookies[SESSION_COOKIE]!)) })
+  app.get('/api/steam-auth', async request => { assertNoQuery(request); return data(steamAuth.status(request.cookies[SESSION_COOKIE]!)) })
+  app.post('/api/steam-auth', { bodyLimit: 1024 }, async request => {
+    assertNoQuery(request)
+    assertSteamTransport(request)
+    if (options.config.mode !== 'windows') throw new ApiError(501, 'windows_required', 'Steam 授权需要 Windows 服务器。')
+    if (!queue.isIdle) throw new ApiError(409, 'job_in_progress', '请等待当前服务器任务结束后再授权。')
+    const body = z.object({ accountName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/) }).strict().parse(request.body)
+    return data(await steamAuth.start(request.cookies[SESSION_COOKIE]!, body.accountName))
+  })
+  app.post('/api/steam-auth/:id/input', { bodyLimit: 2048 }, async request => {
+    assertNoQuery(request)
+    assertSteamTransport(request)
+    try {
+      const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+      const body = z.object({ promptId: z.number().int().nonnegative(), value: z.string().min(1).max(256) }).strict().parse(request.body)
+      return data(steamAuth.input(request.cookies[SESSION_COOKIE]!, id, body.promptId, body.value))
+    } finally { request.body = undefined }
+  })
+  app.delete('/api/steam-auth/:id', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+    return data(await steamAuth.cancel(request.cookies[SESSION_COOKIE]!, id))
   })
   app.get('/api/players', async (request) => { assertNoQuery(request); return data(await adapter.players()) })
   app.get('/api/player-history', async request => {
@@ -436,6 +475,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
 
   app.addHook('preClose', async () => {
+    await steamAuth.close()
     runtime.stop()
     playerHistory.stop()
     for (const controller of activeUploads.values()) controller.abort(new Error('控制服务正在关闭。'))
@@ -496,6 +536,10 @@ function isLoopbackAddress(address: string): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
+function assertSteamTransport(request: FastifyRequest): void {
+  if (!isSecure(request) && !isLoopbackAddress(request.ip)) throw new ApiError(403, 'https_required', '输入 Steam 凭据需要 HTTPS 或服务器本机访问。')
+}
+
 function isSecure(request: FastifyRequest): boolean {
   return request.protocol === 'https'
 }
@@ -508,6 +552,7 @@ function cookieOptions(request: FastifyRequest) {
 }
 
 function gameErrorStatus(code: string): number {
+  if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
   if (code === 'SETTINGS_HISTORY_NOT_FOUND') return 404

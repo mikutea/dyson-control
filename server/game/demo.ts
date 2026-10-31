@@ -10,6 +10,7 @@ import { createR2ModmanPackage } from './profile.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { runBackupVerification } from './backup-verification.js'
 import { VersionLockStore } from './version-locks.js'
 
 const now = () => new Date().toISOString()
@@ -133,6 +134,23 @@ export class DemoGameAdapter implements GameAdapter {
         report('正在启动服务器')
         this.#state = 'running'; this.#startedAt = Date.now(); this.#log('info', 'Server started by administrator.')
         return { state: 'running' }
+      case 'load-save': {
+        const selected = this.#saves.find(save => save.id === input.saveId)
+        if (!selected) throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档不存在，请刷新列表。')
+        const wasRunning = this.#state === 'running'
+        const automaticBackups: string[] = []
+        if (wasRunning) {
+          await this.#save(report)
+          const current = this.#saves.find(save => save.current)
+          if (current) automaticBackups.push(String((await this.#backup(current.id, 'automatic-before-load-save', report)).backupId))
+        }
+        if (!wasRunning || !selected.current) automaticBackups.push(String((await this.#backup(selected.id, 'automatic-before-load-save', report)).backupId))
+        for (const save of this.#saves) save.current = save === selected
+        this.#state = 'running'; this.#startedAt = Date.now(); this.#players = []
+        report(`已从存档 ${selected.name} 启动服务器`)
+        this.#log('info', `Loaded save ${selected.name}.`)
+        return { saveName: selected.name, automaticBackups, wasRunning, state: 'running', bridgeReady: true }
+      }
       case 'save': return this.#save(report)
       case 'stop':
         if (this.#state === 'stopped') return { alreadyStopped: true }
@@ -142,6 +160,7 @@ export class DemoGameAdapter implements GameAdapter {
       case 'restart':
         await this.run('stop', {}, report, signal); return this.run('start', {}, report, signal)
       case 'backup': return this.#backup(input.saveId, input.automatic === true ? 'automatic-scheduled' : 'manual', report)
+      case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'restore': return this.#restore(input.backupId, report)
       case 'import-backup': return this.#importBackup(input, report, signal)
       case 'toggle-mod': return this.#toggleMod(input, report)
@@ -194,6 +213,9 @@ export class DemoGameAdapter implements GameAdapter {
       case 'write-mod-config': return this.#changeModConfig(input, report, false)
       case 'rollback-mod-config': return this.#changeModConfig(input, report, true)
       case 'create-client-package': return this.#createClientPackage(report)
+      case 'prepare-first-world': throw new GameAdapterError('WINDOWS_REQUIRED', '重新准备首次建图需要实际 Windows 服务器。')
+      case 'prepare-steamcmd':
+      case 'install-server': throw new GameAdapterError('WINDOWS_REQUIRED', '首次安装需要 Windows 服务器。')
     }
   }
 
@@ -247,6 +269,11 @@ export class DemoGameAdapter implements GameAdapter {
       })),
     }
     const backup: Backup = { id, saveName: save.name, createdAt: manifest.createdAt, bytes: files.reduce((total, file) => total + file.data.length, 0), members: [...save.members], reason }
+    const backupRoot = path.join(this.#config.game.backupDirectory, id)
+    await fs.mkdir(this.#config.game.backupDirectory, { recursive: true })
+    await fs.mkdir(backupRoot)
+    for (const file of files) await fs.writeFile(path.join(backupRoot, file.name), file.data, { flag: 'wx' })
+    await fs.writeFile(path.join(backupRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' })
     const existing = this.#backups.findIndex((item) => item.id === backup.id)
     if (existing >= 0) this.#backups[existing] = backup
     else this.#backups.push(backup)

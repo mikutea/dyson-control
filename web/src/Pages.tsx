@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
-  Activity, Archive, Box, CheckCircle2, CircleGauge, Clock3, CloudDownload, Cpu, Database,
+  Activity, Archive, Box, CircleGauge, Clock3, CloudDownload, Cpu, Database,
   Download, FileArchive, Gamepad2, HardDrive, MemoryStick, PackageCheck, Play, Power,
   RefreshCw, RotateCcw, Save as SaveIcon, Server as ServerIcon, Settings2, ShieldCheck,
   Square, TimerReset, UserRound, Users, Wifi,
@@ -11,7 +11,7 @@ import type {
 } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, MetricBar, PageHeader, Panel, StatusDot } from './components'
-import { actionLabels, formatBytes, formatDate, formatDuration, formatFullDate, formatJobResult, jobStateLabels, percent, serverStateLabels } from './format'
+import { formatBytes, formatDate, formatDuration, formatFullDate, percent, serverStateLabels } from './format'
 import { useResource } from './hooks'
 import { BackupImport } from './BackupImport'
 import { ModCatalog } from './ModCatalog'
@@ -25,8 +25,10 @@ import { VersionLockButton } from './VersionLockButton'
 import { ModSideControl } from './ModSideControl'
 import { ControlUpdates } from './ControlUpdates'
 import { ComponentVersionCard } from './ComponentVersionCard'
+import { ServerSetup } from './ServerSetup'
+import { ActivityPage } from './ActivityPage'
 
-interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void }
+interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void; operationActive: boolean }
 
 export function Pages(props: PagesProps) {
   switch (props.page) {
@@ -39,6 +41,7 @@ export function Pages(props: PagesProps) {
     case 'server': return <ServerPage {...props} />
     case 'settings': return <SettingsPage {...props} />
     case 'activity': return <ActivityPage {...props} />
+    case 'setup': return <ServerSetup refreshToken={props.refreshToken} runAction={props.runAction} operationActive={props.operationActive} />
   }
 }
 
@@ -116,7 +119,7 @@ function PlayersPage({ refreshToken, overview, runAction }: PagesProps) {
 function VersionsPage({ refreshToken, runAction }: PagesProps) {
   const versions = useResource<ComponentVersion[]>('/versions', refreshToken)
   const locks = useResource<VersionLock[]>('/version-locks', refreshToken)
-  return <><PageHeader title="版本" description="查看游戏、联机组件和管理面板的版本" />
+  return <><PageHeader title="版本" description="查看游戏、联机组件和管理面板的版本" actions={<a className="button button-secondary" href="#/setup">Steam 授权</a>} />
     <ControlUpdates refreshToken={refreshToken} />
     <Panel className="table-panel">
       <ResourceBody resource={versions} emptyTitle="没有版本信息" emptyDescription="检查服务器配置后再试一次">
@@ -140,19 +143,25 @@ function ModsPage({ refreshToken, runAction }: PagesProps) {
     </Panel></>}</>
 }
 
-function SavesPage({ refreshToken, runAction, onJob }: PagesProps) {
+function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }: PagesProps) {
   const saves = useResource<Save[]>('/saves', refreshToken)
   const backups = useResource<Backup[]>('/backups', refreshToken)
   return <><PageHeader title="存档" description="管理当前存档与可恢复的备份" actions={<Button variant="primary" icon={<Archive />} onClick={() => runAction('backup')}>立即备份</Button>} />
     <div className="split-grid">
       <Panel title="游戏存档" icon={<Database />}>
         <ResourceBody resource={saves} emptyTitle="没有找到存档" emptyDescription="游戏创建存档后会显示在这里">
-          {(items) => <div className="file-list">{items.map((save) => <div key={save.id}><span className="file-icon"><FileArchive /></span><div><strong>{save.name}</strong><p>{formatBytes(save.bytes)} · {save.members.length} 个文件</p><small>修改于 {formatFullDate(save.modifiedAt)}</small></div>{save.current && <span className="current-label">当前使用</span>}<Button variant="quiet" icon={<Archive />} onClick={() => runAction('backup', { saveId: save.id })}>备份</Button></div>)}</div>}
+          {(items) => <div className="file-list">{items.map((save) => <div key={save.id}><span className="file-icon"><FileArchive /></span><div><strong>{save.name}</strong><p>{formatBytes(save.bytes)} · {save.members.length} 个文件</p><small>修改于 {formatFullDate(save.modifiedAt)}</small></div>{save.current && <span className="current-label">当前使用</span>}<Button variant="quiet" icon={<Archive />} onClick={() => runAction('backup', { saveId: save.id })}>备份</Button><Button variant="quiet" icon={<Play />} disabled={operationActive || Boolean(saves.error) || !overview?.capabilities.restore || !overview.capabilities.lifecycle || (save.current && overview.state === 'running')} onClick={() => runAction('load-save', { saveId: save.id }, { title: `加载存档 ${save.name}？`, description: '服务器将从此存档启动。运行中的世界会先保存、备份并停止，在线玩家会断开；所选存档也会保留保护副本。', label: '加载存档', danger: true })}>加载</Button></div>)}</div>}
         </ResourceBody>
       </Panel>
       <Panel title="备份" icon={<Archive />}>
         <ResourceBody resource={backups} emptyTitle="还没有备份" emptyDescription="创建备份后可随时在这里恢复">
-          {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}><span className="file-icon"><ShieldCheck /></span><div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {backup.reason}</small></div><a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a><Button variant="quiet" icon={<RotateCcw />} onClick={() => runAction('restore', { backupId: backup.id }, { title: `恢复 ${backup.saveName}？`, description: '当前存档将被替换。系统会先为当前存档创建一份可恢复的备份。', label: '恢复备份', danger: true })}>恢复</Button></div>)}</div>}
+          {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}>
+            <span className="file-icon"><ShieldCheck /></span>
+            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {backup.reason === 'automatic-before-load-save' ? '切换存档前' : backup.reason}</small></div>
+            <a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a>
+            <Button variant="quiet" icon={<ShieldCheck />} aria-label={`校验备份 ${backup.saveName}`} disabled={operationActive || Boolean(backups.error)} onClick={() => runAction('verify-backup', { backupId: backup.id })}>校验</Button>
+            <Button variant="quiet" icon={<RotateCcw />} onClick={() => runAction('restore', { backupId: backup.id }, { title: `恢复 ${backup.saveName}？`, description: '当前存档将被替换。系统会先为当前存档创建一份可恢复的备份。', label: '恢复备份', danger: true })}>恢复</Button>
+          </div>)}</div>}
         </ResourceBody>
       </Panel>
     </div><BackupImport onJob={onJob} /></>
@@ -236,17 +245,6 @@ function SettingsPage({ refreshToken, runAction }: PagesProps) {
     <SettingsHistory refreshToken={refreshToken} dirty={dirty} runAction={runAction} />
     <RuntimeSettingsPanel refreshToken={refreshToken} />
   </>
-}
-
-function ActivityPage({ refreshToken }: PagesProps) {
-  const jobs = useResource<Job[]>('/jobs', refreshToken)
-  const logs = useResource<LogEntry[]>('/logs', refreshToken)
-  const [tab, setTab] = useState<'operations' | 'logs'>('operations')
-  return <><PageHeader title="活动" description="查看管理操作和服务器消息" actions={<div className="segmented"><button className={tab === 'operations' ? 'selected' : ''} onClick={() => setTab('operations')}>管理操作</button><button className={tab === 'logs' ? 'selected' : ''} onClick={() => setTab('logs')}>服务器消息</button></div>} />
-    <Panel className="table-panel">
-      {tab === 'operations' ? <ResourceBody resource={jobs} emptyTitle="还没有管理操作" emptyDescription="启动、保存或备份后会记录在这里">{(items) => <div className="job-history">{items.map((job) => <article key={job.id}><div className="job-history-head"><span className={`operation-icon operation-${job.state}`}>{job.state === 'succeeded' ? <CheckCircle2 /> : job.state === 'failed' || job.state === 'interrupted' ? <Square /> : <RefreshCw />}</span><div><h2>{actionLabels[job.action]}</h2><p>{formatJobResult(job) || job.message || jobStateLabels[job.state]}</p></div><span className={`job-state state-${job.state}`}>{jobStateLabels[job.state]}</span><time>{formatFullDate(job.createdAt)}</time></div>{job.steps.length > 0 && <details><summary>查看 {job.steps.length} 个步骤</summary><ol>{job.steps.map((step, index) => <li key={`${step.time}-${index}`}><time>{formatDate(step.time)}</time><span>{step.message}</span></li>)}</ol></details>}</article>)}</div>}</ResourceBody>
-        : <ResourceBody resource={logs} emptyTitle="暂无服务器消息" emptyDescription="服务器的新消息会显示在这里">{(items) => <div className="log-list">{items.map((entry) => <div key={entry.id}><time>{entry.time ? formatFullDate(entry.time) : '时间未记录'}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div>}</ResourceBody>}
-    </Panel></>
 }
 
 function ResourceBody<T>({ resource, emptyTitle, emptyDescription, children }: { resource: ReturnType<typeof useResource<T>>; emptyTitle: string; emptyDescription: string; children: (data: T & { length: number }) => ReactNode }) {

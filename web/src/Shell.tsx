@@ -18,6 +18,7 @@ export const navItems: NavItem[] = [
   { page: 'clients', label: '客户端', icon: CloudCog },
   { page: 'server', label: '服务器', icon: Server },
   { page: 'settings', label: '设置', icon: Settings },
+  { page: 'setup', label: '安装与授权', icon: CloudCog },
   { page: 'activity', label: '活动', icon: Activity },
 ]
 
@@ -92,7 +93,9 @@ function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; o
   const working = job.state === 'queued' || job.state === 'running'
   const latestStep = job.steps.at(-1)?.message
   const tone = job.state === 'succeeded' ? 'good' : job.state === 'failed' || job.state === 'interrupted' ? 'bad' : 'warning'
-  const summary = useMemo(() => formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])
+  const summary = useMemo(() => job.state === 'failed' || job.state === 'interrupted'
+    ? job.message || jobStateLabels[job.state]
+    : formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])
 
   if (!open) return (
     <button className="job-chip" onClick={() => onOpen(true)}>

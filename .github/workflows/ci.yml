@@ -43,6 +43,10 @@ jobs:
       - name: Build
         run: npm run build
 
+      - name: Exercise native Steam authorization console
+        shell: powershell
+        run: .\scripts\tests\steam-terminal.fixture.ps1
+
       - name: Parse Windows scripts
         shell: powershell
         run: |
@@ -109,6 +113,14 @@ jobs:
         shell: powershell
         run: .\scripts\tests\configure-game.fixture.ps1
 
+      - name: Exercise first-world startup guards
+        shell: powershell
+        run: .\scripts\tests\first-world.fixture.ps1
+
+      - name: Exercise first-install task collision handling
+        shell: powershell
+        run: .\scripts\tests\first-install-task.fixture.ps1
+
       - name: Exercise long-path installation cleanup guards
         shell: powershell
         run: .\scripts\tests\install-directory.fixture.ps1 -NodePath (Get-Command node.exe).Source
@@ -146,6 +158,7 @@ jobs:
             'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1',
             'scripts/windows/uninstall-control.ps1', 'docs/installation.md',
             'scripts/windows/configure-game.ps1', 'docs/game-configuration.md',
+            'docs/images/overview.jpg', 'docs/images/saves.jpg',
             'scripts/windows/remove-install-directory.ps1',
             'release-manifest.json'
           )
@@ -158,7 +171,7 @@ jobs:
               -or $file.StartsWith('dist/shared/') `
               -or $file.StartsWith('dist/web/') `
               -or ($file.StartsWith('scripts/windows/') -and $file.EndsWith('.ps1')) `
-              -or ($file.StartsWith('docs/') -and $file.EndsWith('.md'))
+              -or ($file.StartsWith('docs/') -and [IO.Path]::GetExtension($file).ToLowerInvariant() -in @('.md', '.png', '.jpg'))
             if (-not $allowed) { throw "Unexpected release file: $file" }
             if ($file -match '(^|/)(node_modules|\.data|state|coverage|backups?|userdata|validation|fixtures?|tests?|temp|tmp)(/|$)' `
                 -or $file -match '(^|/)control\.config\.json$' `

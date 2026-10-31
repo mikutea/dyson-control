@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -8,11 +7,13 @@ import type {
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { hashBackupMember as sha256, readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import {
   assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeTelemetry,
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
 } from './bridge.js'
 import { GameAdapterError, invalidInput, unsupported } from './errors.js'
+import { prepareFirstWorld } from './first-world.js'
 import { readGameLogs } from './logs.js'
 import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
@@ -25,6 +26,8 @@ import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, 
 import { GameUpdateManager } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
 import { SteamGameUpdateBackend } from './steam-update.js'
+import { steamExecutable } from '../steam-auth.js'
+import { acquireSteamProcess } from './steam-process.js'
 
 interface InspectResult {
   sampledAtUnixMs?: number
@@ -32,11 +35,6 @@ interface InspectResult {
   versions: { game: string | null; nebula: string | null; bepinex: string | null }
   tasks: { start: boolean; startManaged: boolean; configuredTargetUps: number | null }
   network?: HostNetworkCounterSample | null
-}
-
-interface BackupManifest {
-  schema: 1; id: string; saveName: string; createdAt: string; reason: string
-  members: Array<{ fileName: string; bytes: number; sha256: string }>
 }
 
 interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
@@ -81,16 +79,6 @@ function dependencyPackageIdentity(reference: string): string | null {
 }
 function modId(name: string): string { return createHash('sha256').update(name.toLowerCase()).digest('hex').slice(0, 20) }
 function now(): string { return new Date().toISOString() }
-
-async function sha256(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const digest = createHash('sha256')
-    const stream = createReadStream(filePath)
-    stream.on('data', (chunk) => digest.update(chunk))
-    stream.on('error', reject)
-    stream.on('end', () => resolve(digest.digest('hex')))
-  })
-}
 
 function validateSettings(value: unknown): Omit<GameSettings, 'readOnlyFields'> {
   if (!value || typeof value !== 'object') invalidInput('settings is required.')
@@ -200,9 +188,9 @@ export class WindowsGameAdapter implements GameAdapter {
     })
     this.#versionLocks = new VersionLockStore(path.join(config.dataDirectory, 'version-locks.json'))
     this.#updateOverrideConfigured = options.updates !== undefined
-    this.#steamUpdates = config.game.steam ? new SteamGameUpdateBackend({
-      steamCmdPath: config.game.steam.executable,
-      accountName: config.game.steam.accountName,
+    this.#steamUpdates = new SteamGameUpdateBackend({
+      steamCmdPath: steamExecutable(config),
+      accountName: () => config.game.steam?.accountName ?? '',
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'steam-updates', 'work'),
       backupDirectory: path.join(config.dataDirectory, 'steam-updates', 'backups'),
@@ -211,7 +199,7 @@ export class WindowsGameAdapter implements GameAdapter {
         if ((await this.#inspect(true)).process) throw new GameAdapterError('GAME_RUNNING', 'Stop the game before replacing Steam files.')
       },
       versionLocks: this.#versionLocks,
-    }) : null
+    })
     this.#updates = options.updates ?? new GameUpdateManager({
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'updates', 'work'),
@@ -564,6 +552,9 @@ export class WindowsGameAdapter implements GameAdapter {
     signal.throwIfAborted()
     switch (action) {
       case 'start': return this.#start(report, signal)
+      case 'prepare-first-world': return this.#prepareFirstWorld(report, signal)
+      case 'load-save': return this.#loadSave(input, report, signal)
+      case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'save': return this.#save(report, signal)
       case 'stop': return this.#stop(report, signal, true)
       case 'restart': {
@@ -667,6 +658,87 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     report('游戏已确认玩家离线清理完成')
     return { playerId, kicked: true }
+  }
+
+  async #loadSave(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (typeof input.saveId !== 'string') invalidInput('saveId is required.')
+    const name = saveNameFromId(input.saveId)
+    const inspection = await this.#inspect(true)
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('LOAD_SAVE_START_UNSUPPORTED', '加载指定存档需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      if (inspection.process) throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '请先停止游戏并完成中断的存档恢复。')
+      await this.#recoverInterruptedSaveRestore(report)
+    }
+    await this.#existingSaveMemberCount(name)
+    const selected = (await this.saves()).find(save => save.name === name)
+    if (!selected) throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档不存在或缺少完整的 .dsv / .server 文件，请刷新列表。')
+    const wasRunning = Boolean(inspection.process)
+    const protectedBackups: string[] = []
+    if (wasRunning) {
+      await this.#save(report, signal)
+      const receipt = this.#lastSaveReceipt!
+      protectedBackups.push((await this.#createBackup(receipt.saveName, 'automatic-before-load-save', report, receipt)).id)
+    }
+    if (!wasRunning || this.#lastSaveReceipt!.saveName !== name) {
+      protectedBackups.push((await this.#createBackup(name, 'automatic-before-load-save', report)).id)
+    }
+    for (const id of protectedBackups) report(`切换前保护备份：${id}`)
+    signal.throwIfAborted()
+    if (wasRunning) {
+      if ((await this.#inspect(true)).process?.pid !== inspection.process!.pid) {
+        throw new GameAdapterError('LOAD_SAVE_PROCESS_CHANGED', '游戏进程在切换前发生变化，未修改启动存档。')
+      }
+      await this.#stop(report, signal, false)
+    }
+    // Recheck after stopping: a disappeared save must never turn into load-latest.
+    if ((await this.#inspect(true)).process) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '游戏仍在运行，未修改启动存档。')
+    await this.#existingSaveMemberCount(name)
+    if (!(await this.saves()).some(save => save.name === name)) {
+      throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档在切换前已变化；服务器未切换，请检查存档。')
+    }
+    signal.throwIfAborted()
+    const nextStartup = { ...this.#startupSettings, saveName: name }
+    await this.#replaceJsonFile(this.#startupSettingsPath, nextStartup)
+    this.#startupSettings = nextStartup
+    this.#currentSave = null
+    report(`已将启动存档设为 ${name}`)
+    try {
+      const start = await this.#start(report, signal)
+      if (start.alreadyRunning === true) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '启动前出现了其他游戏进程。')
+      const started = (await this.#inspect(true)).process
+      if (!started || started.pid !== start.pid || started.selectedSave !== name) {
+        throw new GameAdapterError('LOAD_SAVE_SELECTION_UNCONFIRMED', '新进程没有使用所选存档的启动参数。')
+      }
+    } catch (error) {
+      throw new GameAdapterError('LOAD_SAVE_START_FAILED', `启动存档已设为 ${name}，但未确认加载完成。切换前备份已保留，请检查服务器状态后重试启动或恢复备份。`, { cause: error })
+    }
+    this.#currentSave = { name, savedAt: (await this.saves()).find(save => save.name === name)?.modifiedAt ?? selected.modifiedAt }
+    return { saveName: name, automaticBackups: protectedBackups, wasRunning, state: 'running', bridgeReady: true }
+  }
+
+  async #prepareFirstWorld(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    let inspection: InspectResult
+    try { inspection = await this.#inspect(true) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STATE_UNKNOWN', '未能确认服务器已经停止，请检查服务器状态后重试。', { cause: error }) }
+    if (inspection.process) throw new GameAdapterError('FIRST_WORLD_GAME_RUNNING', '请先停止服务器，再准备首次世界许可。')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('FIRST_WORLD_TASK_REQUIRED', '准备首次世界许可需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    let startup: StartupSettings
+    try { startup = validateStartupSettings(JSON.parse(await fs.readFile(this.#startupSettingsPath, 'utf8'))) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STARTUP_INVALID', '无法读取有效的启动存档设置，未准备首次世界许可。', { cause: error }) }
+    if (startup.saveName !== null) {
+      throw new GameAdapterError('FIRST_WORLD_SAVE_SELECTED', '已选择启动存档，请继续加载或恢复该存档；未准备新世界。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      throw new GameAdapterError('FIRST_WORLD_RESTORE_PENDING', '存在尚未完成的存档恢复，请先检查并完成恢复；未准备新世界。')
+    }
+    report('正在恢复原始首装许可')
+    const result = await prepareFirstWorld(this.#config, signal)
+    report('首次世界许可已准备好。游戏保持停止，请前往概览手动启动。')
+    return result
   }
 
   async #start(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -864,45 +936,18 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #readBackupManifest(id: string): Promise<BackupManifest> {
-    safeId(id, 'backupId')
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, id))
-    const rootStat = await fs.lstat(root).catch(() => null)
-    if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', 'The requested backup does not exist.')
-    let manifest: BackupManifest
-    try { manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as BackupManifest } catch (error) { throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.', { cause: error }) }
-    if (manifest.schema !== 1 || manifest.id !== id || !validSaveName(manifest.saveName) ||
-        typeof manifest.createdAt !== 'string' || !Number.isFinite(Date.parse(manifest.createdAt)) ||
-        typeof manifest.reason !== 'string' || manifest.reason.length < 1 || manifest.reason.length > 100 ||
-        !Array.isArray(manifest.members) || manifest.members.length < 2 || manifest.members.length > 3 ||
-        new Set(manifest.members.map((member) => member.fileName)).size !== manifest.members.length ||
-        !manifest.members.some((member) => member.fileName === `${manifest.saveName}.dsv`) || !manifest.members.some((member) => member.fileName === `${manifest.saveName}.server`)) {
-      throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-    }
-    for (const member of manifest.members) {
-      if (!saveExtensions.some((extension) => member.fileName === `${manifest.saveName}${extension}`) || !Number.isSafeInteger(member.bytes) || member.bytes < 0 || !/^[0-9a-f]{64}$/.test(member.sha256)) {
-        throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-      }
-    }
-    return manifest
+    return readBackupManifest(this.#config.game.backupDirectory, id)
   }
 
-  async #verifyBackup(manifest: BackupManifest): Promise<string> {
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, manifest.id))
-    for (const member of manifest.members) {
-      const memberPath = ensureInside(root, path.join(root, member.fileName))
-      const stat = await fs.lstat(memberPath).catch(() => null)
-      if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== member.bytes || await sha256(memberPath) !== member.sha256) {
-        throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `Backup member failed verification: ${member.fileName}`)
-      }
-    }
-    return root
+  async #verifyBackup(manifest: BackupManifest, signal?: AbortSignal): Promise<string> {
+    return verifyBackupFiles(this.#config.game.backupDirectory, manifest, signal)
   }
 
   async #restore(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.backupId !== 'string') invalidInput('backupId is required.')
     const manifest = await this.#readBackupManifest(input.backupId)
     report('正在校验待恢复的存档备份')
-    const backupRoot = await this.#verifyBackup(manifest)
+    const backupRoot = await this.#verifyBackup(manifest, signal)
     const inspection = await this.#inspect(true)
     const wasRunning = Boolean(inspection.process)
     if (!inspection.tasks.startManaged) {
@@ -1247,9 +1292,11 @@ export class WindowsGameAdapter implements GameAdapter {
     const component = input.component
     const version = typeof input.version === 'string' ? input.version.trim() : undefined
     if (component === 'game') {
-      if (!this.#steamUpdates && !this.#updateOverrideConfigured) {
+      if (!this.#config.game.steam && !this.#updateOverrideConfigured) {
         throw new GameAdapterError('UPDATE_BACKEND_REQUIRED', 'Game updates require an explicitly configured and authorized Steam update backend.')
       }
+      // Fail before saving/stopping players when login or a version query already owns SteamCMD.
+      const release = acquireSteamProcess(steamExecutable(this.#config)); release()
       if (version) await this.#versionLocks.assertPlan([{ package: GAME_VERSION_LOCK_ID, version }])
     } else {
       const plan = await this.#updates.resolvePackagePlan(componentPackageIds[component], version, signal)

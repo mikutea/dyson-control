@@ -33,6 +33,7 @@ const DEFAULT_JOB_TIMEOUT_MS = 2 * 60 * 60 * 1000
 export interface JobQueueOptions {
   maxOutstandingJobs?: number
   jobTimeoutMs?: number
+  execute?: GameAdapter['run']
 }
 
 export class JobStore {
@@ -177,6 +178,7 @@ export class JobQueue extends EventEmitter {
   #shuttingDown = false
   readonly #maxOutstandingJobs: number
   readonly #jobTimeoutMs: number
+  readonly #execute: GameAdapter['run']
 
   constructor(
     private readonly store: JobStore,
@@ -186,6 +188,7 @@ export class JobQueue extends EventEmitter {
     super()
     this.#maxOutstandingJobs = positiveInteger(options.maxOutstandingJobs ?? DEFAULT_MAX_OUTSTANDING_JOBS, 'maxOutstandingJobs')
     this.#jobTimeoutMs = positiveInteger(options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS, 'jobTimeoutMs')
+    this.#execute = options.execute ?? adapter.run.bind(adapter)
   }
 
   enqueue(request: NewJob): Job {
@@ -263,7 +266,7 @@ export class JobQueue extends EventEmitter {
     let job = this.store.start(id)
     this.emit('job', job)
     try {
-      const result = await this.adapter.run(
+      const result = await this.#execute(
         job.action,
         this.store.input(id),
         (message) => {

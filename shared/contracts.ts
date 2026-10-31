@@ -1,5 +1,5 @@
-export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity'
-export type Action = 'start' | 'save' | 'stop' | 'restart' | 'backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player'
+export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
+export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
 
@@ -125,6 +125,19 @@ export interface ApiErrorBody { error: { code: string; message: string } }
 export interface Session { authenticated: boolean; username: 'administrator'; source: 'demo' | 'windows' }
 export type ReportStep = (message: string) => void
 
+export type SteamAuthState = 'idle' | 'starting' | 'password' | 'guard' | 'approval' | 'verifying' | 'authorized' | 'failed' | 'cancelled'
+export interface SteamAuthStatus {
+  id: string | null; state: SteamAuthState; promptId: number; message: string
+  expiresAt: string | null; verifiedAt: string | null; latestBuild: string | null
+}
+export interface FirstWorldStatus { state: 'unavailable' | 'ready' | 'retryable'; message: string }
+export interface ServerSetupStatus {
+  supported: boolean; gameRoot: string; steamExecutable: string; steamReady: boolean; accountName: string
+  existingGame: boolean; targetEmpty: boolean; bridgeAvailable: boolean; taskExists: boolean
+  gameUsers: Array<{ name: string; activeSteam: boolean }>
+  blockers: string[]; auth: SteamAuthStatus; firstWorld: FirstWorldStatus
+}
+
 export interface GameAdapter {
   source: 'demo' | 'windows'
   overview(): Promise<Overview>
@@ -165,5 +178,5 @@ export interface ControlConfig {
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.
-// Input: restore {backupId}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
+// Input: load-save {saveId}; verify-backup {backupId}; restore {backupId}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
 // backup {saveId?}; install-update {component,version?}; create-client-package {}.

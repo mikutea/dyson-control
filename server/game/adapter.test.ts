@@ -1,4 +1,4 @@
-import { createHash, createHmac } from 'node:crypto'
+import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
 import fs from 'node:fs/promises'
 import os from 'node:os'
@@ -17,6 +17,228 @@ import { buildStoredZip } from './zip.js'
 const temporaryDirectories: string[] = []
 const execFileAsync = promisify(execFile)
 afterEach(async () => { await Promise.all(temporaryDirectories.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true }))) })
+
+describe('preparing first-world authorization', () => {
+  async function fixture(state: 'stopped' | 'running' | 'unknown' | 'unmanaged' = 'stopped') {
+    const settings = await config('windows')
+    await fs.mkdir(settings.game.root)
+    const installationId = 'first-install-11111111-1111-1111-1111-111111111111'
+    const original = JSON.stringify({ schema: 1, mode: 'default', installationId }, null, 2) + '\r\n'
+    const consumed = path.join(settings.game.root, '.dyson-first-world-consumed.json')
+    const pending = path.join(settings.game.root, '.dyson-first-world.json')
+    await fs.writeFile(consumed, original)
+    const inspect = vi.fn(async () => {
+      if (state === 'unknown') throw new Error('Fixture inspection unavailable')
+      return {
+        process: state === 'running' ? { pid: 4242, startedAt: new Date().toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave: null } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: state !== 'unmanaged', configuredTargetUps: null },
+      }
+    })
+    const runScript = vi.fn(async () => { throw new Error('Preparing a world must not invoke a script') })
+    const adapter = new WindowsGameAdapter(settings, { inspect, runScript })
+    return { settings, adapter, original, installationId, consumed, pending, inspect, runScript }
+  }
+
+  it('restores the original permission without launching a task or changing startup settings', async () => {
+    const f = await fixture()
+    await f.adapter.settings()
+    const startup = path.join(f.settings.dataDirectory, 'game-startup', 'settings.json')
+    const before = await fs.readFile(startup)
+    const reports: string[] = []
+    expect(await f.adapter.run('prepare-first-world', {}, message => reports.push(message), new AbortController().signal)).toEqual({ prepared: true, installationId: f.installationId, started: false })
+    expect(await fs.readFile(f.pending, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.consumed)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await fs.readFile(startup)).toEqual(before)
+    expect(f.runScript).not.toHaveBeenCalled()
+    expect(reports.at(-1)).toContain('游戏保持停止')
+  })
+
+  it.each([
+    ['running', 'FIRST_WORLD_GAME_RUNNING'], ['unknown', 'FIRST_WORLD_STATE_UNKNOWN'], ['unmanaged', 'FIRST_WORLD_TASK_REQUIRED'],
+  ] as const)('does not restore permission when the game is %s', async (state, code) => {
+    const f = await fixture(state)
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code })
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('reads the actual startup selection before restoring permission', async () => {
+    const f = await fixture()
+    await f.adapter.settings()
+    await fs.writeFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), JSON.stringify({ schema: 1, targetUps: 60, saveName: 'Selected World' }))
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'FIRST_WORLD_SAVE_SELECTED' })
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('leaves an unfinished restore transaction and its consumed permission untouched', async () => {
+    const f = await fixture()
+    const active = path.join(f.settings.dataDirectory, 'save-restore', 'active')
+    await fs.mkdir(active, { recursive: true })
+    await fs.writeFile(path.join(active, 'evidence.txt'), 'preserve-restore')
+    await expect(f.adapter.run('prepare-first-world', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'FIRST_WORLD_RESTORE_PENDING' })
+    expect(await fs.readFile(path.join(active, 'evidence.txt'), 'utf8')).toBe('preserve-restore')
+    expect(await fs.readFile(f.consumed, 'utf8')).toBe(f.original)
+    await expect(fs.lstat(f.pending)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+})
+
+describe('backup verification actions', () => {
+  it('verifies a real Windows-format backup without inspecting, saving or stopping the game', async () => {
+    const fixture = await config('windows')
+    for (const extension of ['.dsv', '.server', '.moddsv']) await fs.writeFile(path.join(fixture.game.saveDirectory, 'World' + extension), 'synthetic-' + extension)
+    const first = new WindowsGameAdapter(fixture, { inspect: async () => ({ process: null, versions: { game: null, nebula: null, bepinex: null }, tasks: { start: false, startManaged: false, configuredTargetUps: null } }) })
+    const backup = await first.run('backup', {}, () => {}, new AbortController().signal)
+    const inspect = vi.fn(async () => { throw new Error('Game status unavailable') })
+    const runScript = vi.fn(async () => { throw new Error('No script allowed') })
+    const adapter = new WindowsGameAdapter(fixture, { inspect, runScript })
+    const result = await adapter.run('verify-backup', { backupId: backup.backupId }, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ backupId: backup.backupId, saveName: 'World', members: ['World.dsv', 'World.server', 'World.moddsv'] })
+    expect(inspect).not.toHaveBeenCalled(); expect(runScript).not.toHaveBeenCalled()
+    expect(await fs.readFile(path.join(fixture.game.saveDirectory, 'World.dsv'), 'utf8')).toBe('synthetic-.dsv')
+  })
+
+  it('uses actual demo backup files and detects their subsequent corruption', async () => {
+    const fixture = await config('demo')
+    const adapter = createGameAdapter(fixture)
+    const backup = await adapter.run('backup', {}, () => {}, new AbortController().signal)
+    const input = { backupId: backup.backupId }
+    const result = await adapter.run('verify-backup', input, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ backupId: backup.backupId, saveName: 'DemoGalaxy', members: ['DemoGalaxy.dsv', 'DemoGalaxy.server', 'DemoGalaxy.moddsv'] })
+    await fs.appendFile(path.join(fixture.game.backupDirectory, String(backup.backupId), 'DemoGalaxy.server'), 'corruption')
+    await expect(adapter.run('verify-backup', input, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED' })
+    expect((await adapter.overview()).state).toBe('running')
+  })
+})
+
+describe('loading an existing save', () => {
+  async function fixture(runningInitially = false, managed = true, failStart = false, wrongSelection = false) {
+    const settings = await config('windows')
+    for (const name of ['Current', '另一世界']) {
+      for (const extension of ['.dsv', '.server', '.moddsv']) await fs.writeFile(path.join(settings.game.saveDirectory, `${name}${extension}`), `${name}${extension}`)
+    }
+    let running = runningInitially
+    let processId = 4242
+    let selectedSave = 'Current'
+    const selections: unknown[] = []
+    const options = {
+      inspect: async () => ({
+        process: running ? { pid: processId, startedAt: new Date(Date.now() - 1000).toISOString(), workingSetBytes: 1024, totalProcessorSeconds: 1, targetUps: 60, selectedSave } : null,
+        versions: { game: null, nebula: null, bepinex: null },
+        tasks: { start: true, startManaged: managed, configuredTargetUps: null },
+      }),
+      runScript: async <T>() => {
+        selections.push(JSON.parse(await fs.readFile(path.join(settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')))
+        if (failStart) throw new Error('Fixture startup rejected')
+        if (!wrongSelection) selectedSave = (selections.at(-1) as { saveName: string }).saveName
+        running = true; processId++
+        await prepareBridge(settings, processId)
+        return {} as T
+      },
+      pollIntervalMs: 10,
+    }
+    const adapter = new WindowsGameAdapter(settings, options)
+    const target = (await adapter.saves()).find(save => save.name === '另一世界')!
+    return { settings, adapter, target, selections, options, running: () => running,
+      bridge: () => prepareBridge(settings, processId), stop: () => { running = false } }
+  }
+
+  it('protects all three members and persists the exact Unicode save selection before starting', async () => {
+    const f = await fixture()
+    const before = await Promise.all(f.target.members.map(member => fs.readFile(path.join(f.settings.game.saveDirectory, member))))
+    const result = await f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ saveName: '另一世界', wasRunning: false, state: 'running', bridgeReady: true })
+    expect(f.selections).toEqual([{ schema: 1, targetUps: 60, saveName: '另一世界' }])
+    const backups = await f.adapter.backups()
+    expect(backups).toHaveLength(1)
+    expect(backups[0]).toMatchObject({ saveName: '另一世界', members: f.target.members, reason: 'automatic-before-load-save' })
+    expect(result.automaticBackups).toEqual([backups[0]!.id])
+    expect(await Promise.all(f.target.members.map(member => fs.readFile(path.join(f.settings.game.saveDirectory, member))))).toEqual(before)
+    const reopened = new WindowsGameAdapter(f.settings, { ...f.options, inspect: async () => ({ process: null, versions: { game: null, nebula: null, bepinex: null }, tasks: { start: true, startManaged: true, configuredTargetUps: null } }) })
+    expect((await reopened.overview()).currentSave).toBe('另一世界')
+  })
+
+  it('confirms the running save, protects both worlds, stops gracefully and starts the selection', async () => {
+    const f = await fixture(true)
+    const secret = await f.bridge()
+    const workers = Promise.all([bridgeSaveWorker(f.settings, secret, 'Current'), bridgeStopWorker(f.settings, secret, f.stop)])
+    const reports: string[] = []
+    const result = await f.adapter.run('load-save', { saveId: f.target.id }, message => reports.push(message), new AbortController().signal)
+    await workers
+    expect(result).toMatchObject({ saveName: '另一世界', wasRunning: true, state: 'running' })
+    expect(f.running()).toBe(true)
+    expect((await f.adapter.backups()).map(backup => backup.saveName).sort()).toEqual(['Current', '另一世界'])
+    expect(reports.indexOf('正在完整备份存档 Current')).toBeLessThan(reports.indexOf('正在停止服务器'))
+    expect(reports.indexOf('正在完整备份存档 另一世界')).toBeLessThan(reports.indexOf('正在停止服务器'))
+    expect(reports.indexOf('服务器已停止')).toBeLessThan(reports.indexOf('已将启动存档设为 另一世界'))
+    expect(f.selections).toHaveLength(1)
+  })
+
+  it('rejects an unmanaged task before interrupting the running game', async () => {
+    const f = await fixture(true, false)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'LOAD_SAVE_START_UNSUPPORTED' })
+    expect(f.running()).toBe(true)
+    expect(await f.adapter.backups()).toEqual([])
+    expect(f.selections).toEqual([])
+  })
+
+  it.each(['missing', 'companion-directory'])('rejects %s before saving or stopping players', async kind => {
+    const f = await fixture(true)
+    if (kind === 'missing') await fs.rm(path.join(f.settings.game.saveDirectory, '另一世界.server'))
+    else {
+      await fs.rm(path.join(f.settings.game.saveDirectory, '另一世界.moddsv'))
+      await fs.mkdir(path.join(f.settings.game.saveDirectory, '另一世界.moddsv'))
+    }
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: kind === 'missing' ? 'SAVE_NOT_FOUND' : 'SAVE_MEMBER_INVALID' })
+    expect(f.running()).toBe(true)
+    expect(await f.adapter.backups()).toEqual([])
+    expect(f.selections).toEqual([])
+  })
+
+  it('does not stop the game or change selection when protection backup fails', async () => {
+    const f = await fixture(true)
+    const secret = await f.bridge()
+    const worker = bridgeSaveWorker(f.settings, secret, 'Current')
+    const copy = vi.spyOn(fs, 'copyFile').mockRejectedValueOnce(Object.assign(new Error('Fixture disk full'), { code: 'ENOSPC' }))
+    try {
+      await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'ENOSPC' })
+      await worker
+    } finally { copy.mockRestore() }
+    expect(f.running()).toBe(true)
+    expect(f.selections).toEqual([])
+    expect(JSON.parse(await fs.readFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')).saveName).toBeNull()
+  })
+
+  it('retains the selected save and restorable protection after startup fails', async () => {
+    const f = await fixture(false, true, true)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'LOAD_SAVE_START_FAILED', message: expect.stringContaining('启动存档已设为 另一世界') })
+    expect(f.running()).toBe(false)
+    expect(f.selections).toHaveLength(1)
+    expect((await f.adapter.backups())[0]?.members).toEqual(f.target.members)
+    expect(JSON.parse(await fs.readFile(path.join(f.settings.dataDirectory, 'game-startup', 'settings.json'), 'utf8')).saveName).toBe('另一世界')
+  })
+
+  it('rejects noncanonical and traversal identifiers without invoking a task', async () => {
+    const f = await fixture()
+    for (const saveId of ['../Current', Buffer.from('../Current').toString('base64url'), null, '']) {
+      await expect(f.adapter.run('load-save', { saveId }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    }
+    expect(f.selections).toEqual([])
+  })
+
+  it('does not report success for a ready process launched with another save', async () => {
+    const f = await fixture(false, true, false, true)
+    await expect(f.adapter.run('load-save', { saveId: f.target.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({
+      code: 'LOAD_SAVE_START_FAILED', cause: expect.objectContaining({ code: 'LOAD_SAVE_SELECTION_UNCONFIRMED' }),
+    })
+    expect(f.selections).toHaveLength(1)
+    expect(await f.adapter.backups()).toHaveLength(1)
+  })
+})
 
 async function config(mode: 'demo' | 'windows'): Promise<ControlConfig> {
   // Windows runners may expose TEMP through an 8.3 alias. Match the real path
@@ -92,6 +314,15 @@ function sign(secret: string, parts: string[]): string {
   return createHmac('sha256', secret).update(parts.join('\n')).digest('hex')
 }
 
+async function publishFixtureReceipt(file: string, payload: string): Promise<void> {
+  // Match BridgeFileStore: the adapter must only observe a complete signed file.
+  const temporary = `${file}.partial-${randomUUID()}`
+  try {
+    await fs.writeFile(temporary, payload, { flag: 'wx' })
+    await fs.rename(temporary, file)
+  } finally { await fs.rm(temporary, { force: true }) }
+}
+
 async function prepareBridge(fixture: ControlConfig, processId: number, startedAt = Date.now() - 1_000): Promise<string> {
   const secret = '0123456789abcdef0123456789abcdef0123456789abcdef'
   await fs.mkdir(path.join(fixture.game.bridgeDirectory, 'requests'), { recursive: true })
@@ -129,7 +360,7 @@ async function bridgeSaveWorker(fixture: ControlConfig, secret: string, saveName
       '10', '11', String(dsv.size), ticks(dsv), String(server.size), ticks(server),
       moddsv ? String(moddsv.size) : '-1', ticks(moddsv), 'true', 'true', moddsv ? 'true' : 'false', 'NONE'
     ]
-    await fs.writeFile(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
+    await publishFixtureReceipt(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
       'protocol=DYSON_CONTROL_RECEIPT_V3', `requestId=${requestId}`, 'action=save', 'state=succeeded',
       `startedAtUnixMs=${started}`, `finishedAtUnixMs=${finished}`, `saveName=${saveName}`, 'saveTimeBefore=10', 'saveTimeAfter=11',
       `dsvBytes=${dsv.size}`, `dsvWriteTimeUtcTicks=${ticks(dsv)}`, `serverBytes=${server.size}`, `serverWriteTimeUtcTicks=${ticks(server)}`,
@@ -157,7 +388,7 @@ async function bridgeStopWorker(fixture: ControlConfig, secret: string, onQuit: 
     const started = Date.now()
     const finished = started + 1
     const parts = ['DYSON_CONTROL_ACTION_V1', requestId, 'stop', 'succeeded', String(started), String(finished), 'NONE']
-    await fs.writeFile(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
+    await publishFixtureReceipt(path.join(fixture.game.bridgeDirectory, 'receipts', `${requestId}.receipt`), [
       'protocol=DYSON_CONTROL_ACTION_V1', `requestId=${requestId}`, 'action=stop', 'state=succeeded',
       `startedAtUnixMs=${started}`, `finishedAtUnixMs=${finished}`, 'errorCode=NONE', `hmac=${sign(secret, parts)}`, ''
     ].join('\n'))
@@ -2345,10 +2576,9 @@ describe('Windows adapter fixture behavior', () => {
     const harness = path.join(fixture.dataDirectory, 'inspect-harness.ps1')
     await fs.writeFile(harness, `
 [CmdletBinding()]
-param([Parameter(Mandatory = $true)][string]$InspectScript, [Parameter(Mandatory = $true)][string]$ArgumentsPath, [switch]$AddUnexpected, [switch]$DuplicateProcess, [switch]$UseSmbAlias)
+param([Parameter(Mandatory = $true)][string]$InspectScript, [Parameter(Mandatory = $true)][string]$ArgumentsPath)
 $inputObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $startArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + [string]$inputObject.managedStartScript + '" -GameRoot "' + [string]$inputObject.gameRoot + '" -SaveDirectory "' + [string]$inputObject.saveDirectory + '" -SettingsPath "' + [string]$inputObject.startupSettingsPath + '" -LogFile "' + [string]$inputObject.logFile + '" -ProcessPriority AboveNormal'
-if ($AddUnexpected) { $startArguments += ' -Unexpected value' }
 $startAction = [pscustomobject]@{ Execute = (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'); Arguments = $startArguments; WorkingDirectory = [string]$inputObject.gameRoot }
 function Get-CimInstance {
   [CmdletBinding()]param([string]$ClassName, [string]$Filter)
@@ -2383,21 +2613,37 @@ function Get-ScheduledTask {
   if ($TaskName -ceq [string]$inputObject.startTaskName) { return [pscustomobject]@{ TaskName = [string]$inputObject.startTaskName; Actions = @($startAction) } }
   return $null
 }
-& $InspectScript -ArgumentsPath $ArgumentsPath
+$results = foreach ($variant in @('managed', 'unexpected', 'ambiguous')) {
+  $DuplicateProcess = $variant -ceq 'ambiguous'
+  $UseSmbAlias = $DuplicateProcess
+  $startAction.Arguments = $startArguments
+  if ($variant -ceq 'unexpected') { $startAction.Arguments += ' -Unexpected value' }
+  try {
+    $result = & $InspectScript -ArgumentsPath $ArgumentsPath
+    [ordered]@{ variant = $variant; data = ($result | ConvertFrom-Json); error = $null }
+  } catch {
+    [ordered]@{ variant = $variant; data = $null; error = $_.Exception.Message }
+  }
+}
+$results | ConvertTo-Json -Depth 8 -Compress
 `)
-    const invoke = async (unexpected: boolean) => {
-      const { stdout } = await execFileAsync('powershell.exe', [
-        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
-        '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
-        ...(unexpected ? ['-AddUnexpected'] : [])
-      ], { windowsHide: true })
-      return JSON.parse(stdout.trim()) as {
+    // Exercise all contracts in one host rather than paying three PowerShell startups.
+    const { stdout } = await execFileAsync('powershell.exe', [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
+      '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
+    ], { windowsHide: true, timeout: 29_000 })
+    const results = JSON.parse(stdout.trim()) as Array<{
+      variant: string
+      error: string | null
+      data: {
         tasks: { startManaged: boolean }
         versions: { game: null; nebula: null; bepinex: null }
         network: { sampledAtUnixMs: number; adapters: Array<{ id: string; receivedBytes: string; sentBytes: string }> }
-      }
-    }
-    const managed = await invoke(false)
+      } | null
+    }>
+    expect(results.map(result => result.variant)).toEqual(['managed', 'unexpected', 'ambiguous'])
+    expect(results[0].error).toBeNull()
+    const managed = results[0].data!
     expect(managed.tasks.startManaged).toBe(true)
     expect(managed.versions).toEqual({ game: null, nebula: null, bepinex: null })
     expect(managed.network.sampledAtUnixMs).toBeGreaterThan(0)
@@ -2405,13 +2651,10 @@ function Get-ScheduledTask {
       id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
       receivedBytes: '9007199254740993', sentBytes: '9007199254740995'
     }])
-    expect((await invoke(true)).tasks.startManaged).toBe(false)
-    await expect(execFileAsync('powershell.exe', [
-      '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
-      '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath, '-DuplicateProcess', '-UseSmbAlias'
-    ], { windowsHide: true })).rejects.toMatchObject({
-      stderr: expect.stringContaining('managed instance is ambiguous')
-    })
+    expect(results[1].error).toBeNull()
+    expect(results[1].data!.tasks.startManaged).toBe(false)
+    expect(results[2].data).toBeNull()
+    expect(results[2].error).toContain('managed instance is ambiguous')
   })
 
   it.runIf(process.platform === 'win32')('binds DSP Configs/path.txt to the configured managed save directory before launch', async () => {
@@ -2464,18 +2707,16 @@ function Get-ScheduledTask {
     })
   })
 
-  it.runIf(process.platform === 'win32')('requires Steam ownership in the same Windows session before changing the game binding', async () => {
+  it.runIf(process.platform === 'win32').each(['absent', 'different-session'] as const)('requires Steam ownership in the same Windows session before changing the game binding (%s)', async steamMode => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })
     await fs.mkdir(path.join(fixture.dataDirectory, 'game-startup'), { recursive: true })
     await fs.copyFile(path.join(process.env.SystemRoot!, 'System32', 'where.exe'), path.join(fixture.game.root, 'DSPGAME.exe'))
     const settingsPath = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
     await fs.writeFile(settingsPath, JSON.stringify({ schema: 1, targetUps: 60, saveName: null }))
-    for (const steamMode of ['absent', 'different-session'] as const) {
-      await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, steamMode)).rejects.toMatchObject({
-        stderr: expect.stringContaining('No running Steam client is owned by the current GameUser in interactive session')
-      })
-    }
+    await expect(invokeStartGameFixture(fixture, settingsPath, fixture.game.saveDirectory, steamMode)).rejects.toMatchObject({
+      stderr: expect.stringContaining('No running Steam client is owned by the current GameUser in interactive session')
+    })
     await expect(fs.lstat(path.join(fixture.game.root, 'Configs'))).rejects.toMatchObject({ code: 'ENOENT' })
   })
 

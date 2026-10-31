@@ -16,7 +16,7 @@ export interface Confirmation {
 
 export type RunAction = (action: Action, input?: Record<string, unknown>, confirmation?: Confirmation) => void
 
-const pages = new Set<Page>(['overview', 'players', 'versions', 'mods', 'saves', 'clients', 'server', 'settings', 'activity'])
+const pages = new Set<Page>(['overview', 'players', 'versions', 'mods', 'saves', 'clients', 'server', 'settings', 'activity', 'setup'])
 
 function pageFromHash(): Page {
   const value = window.location.hash.replace(/^#\/?/, '') as Page
@@ -148,7 +148,8 @@ export default function App() {
     setJobOpen(true)
     setRefreshToken((value) => value + 1)
   }, [])
-  const pagesProps = useMemo(() => ({ page, refreshToken, overview, onOverview: setOverview, runAction, onJob: receiveJob }), [page, refreshToken, overview, runAction, receiveJob])
+  const operationActive = submitting || job?.state === 'queued' || job?.state === 'running'
+  const pagesProps = useMemo(() => ({ page, refreshToken, overview, onOverview: setOverview, runAction, onJob: receiveJob, operationActive }), [page, refreshToken, overview, runAction, receiveJob, operationActive])
 
   if (sessionLoading) return <><ControlUpdateReceipt /><div className="boot-screen"><span className="brand-mark"><i /><i /></span><span>Dyson Control</span></div></>
   if (sessionError) return <><ControlUpdateReceipt /><main className="login-page"><section className="login-panel"><ErrorBlock message={sessionError} retry={() => void loadSession()} /></section></main></>

@@ -27,6 +27,8 @@ SMB 全局映射使用现有共享身份与服务器权限。接入工具不会�
 
 ## 只准备并审查
 
+存档目录使用 `saves` 等自定义名称时，仅 `Save` 子目录链接到该位置。游戏账号还会获得独立文档目录 `dataDirectory\dyson-control-documents\Dyson Sphere Program` 的继承写入权限，用于创建 `options.xml`、蓝图等文件；应用前会实际验证这两个目录的写入能力。权限不会扩展到其上层控制数据目录。
+
 只准备模式不需要停游戏，也不更改游戏目录、目标 secret、计划任务或存档。输出目录必须尚不存在：
 
 ```powershell

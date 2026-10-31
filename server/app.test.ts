@@ -1,4 +1,7 @@
 import { randomUUID } from 'node:crypto'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
+import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -12,6 +15,7 @@ import { LoginGuard } from './auth.js'
 import { buildApp } from './app.js'
 import { MAINTENANCE_MARKER } from './health.js'
 import { ControlUpdateError } from './control-updates.js'
+import { SteamAuthManager } from './steam-auth.js'
 
 const tempDirectories: string[] = []
 
@@ -20,6 +24,148 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('authenticates and deduplicates first-world preparation through the game action queue', async () => {
+    const f = await createFixture()
+    const prepared = { prepared: true, installationId: 'first-install-11111111-1111-1111-1111-111111111111', started: false }
+    const run = f.adapter.run.bind(f.adapter)
+    f.adapter.run = async (...args) => { await run(...args); return prepared }
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const payload = { requestId: 'prepare-first-world-1', action: 'prepare-first-world', input: {} }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', payload })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'GET', url: '/api/setup' })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      for (const input of [{ installationId: prepared.installationId }, { start: true }, []]) {
+        expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { ...payload, input } })).statusCode).toBe(400)
+      }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie, origin: 'https://untrusted.example.test' }, payload })).statusCode).toBe(403)
+      expect(f.adapter.calls).toHaveLength(0)
+      const first = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      const repeat = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { requestId: payload.requestId, action: payload.action } })
+      expect(first.statusCode).toBe(202)
+      expect(repeat.json().data.id).toBe(first.json().data.id)
+      expect((await waitForJobs(app, cookie, 1))[0]).toMatchObject({ state: 'succeeded', result: prepared })
+      expect(f.adapter.calls).toEqual([{ action: 'prepare-first-world', input: {} }])
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { ...payload, action: 'start' } })).statusCode).toBe(409)
+      expect((await app.inject({ method: 'GET', url: '/api/setup', headers: { cookie } })).json().data.firstWorld).toEqual({ state: 'unavailable', message: '' })
+    } finally { await app.close() }
+  })
+
+  it('authenticates and deduplicates read-only backup verification with strict input', async () => {
+    const f = await createFixture()
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const payload = { requestId: 'verify-backup-1', action: 'verify-backup', input: { backupId: 'fixture-backup' } }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', payload })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      for (const input of [{}, { backupId: '' }, { backupId: 'fixture-backup', path: '../other' }]) {
+        expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { ...payload, input } })).statusCode).toBe(400)
+      }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie, origin: 'https://untrusted.example.test' }, payload })).statusCode).toBe(403)
+      const first = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(first.statusCode).toBe(202)
+      const repeat = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(repeat.json().data.id).toBe(first.json().data.id)
+      expect((await waitForJobs(app, cookie, 1))[0]?.state).toBe('succeeded')
+      expect(f.adapter.calls).toEqual([{ action: 'verify-backup', input: { backupId: 'fixture-backup' } }])
+    } finally { await app.close() }
+  })
+
+  it('authenticates, validates and deduplicates loading a save through the durable queue', async () => {
+    const f = await createFixture()
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const payload = { requestId: 'load-save-1', action: 'load-save', input: { saveId: 'fixture-save' } }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', payload })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      for (const input of [{}, { saveId: '' }, { saveId: 'fixture-save', path: '../other' }]) {
+        expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { ...payload, input } })).statusCode).toBe(400)
+      }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie, origin: 'https://untrusted.example.test' }, payload })).statusCode).toBe(403)
+      const first = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      const repeat = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(first.statusCode).toBe(202)
+      expect(repeat.json().data.id).toBe(first.json().data.id)
+      expect((await waitForJobs(app, cookie, 1))[0]?.state).toBe('succeeded')
+      expect(f.adapter.calls).toEqual([{ action: 'load-save', input: { saveId: 'fixture-save' } }])
+    } finally { await app.close() }
+  })
+
+  it('requires an admin, safe transport and the owning session for transient Steam credentials', async () => {
+    const fixture = await createFixture()
+    fixture.config.mode = 'windows'
+    fixture.config.game.steam = { executable: join(fixture.directory, 'steamcmd.exe'), accountName: 'fixture_account' }
+    await writeFile(fixture.config.game.steam.executable, 'FIXTURE ONLY')
+    const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), exitCode: null, signalCode: null,
+      kill() { queueMicrotask(() => child.emit('close', null)); return true },
+    })
+    let inputs = 0
+    child.stdin.on('data', () => { inputs++ })
+    const auth = new SteamAuthManager(fixture.config, { spawn: () => child as unknown as ChildProcessWithoutNullStreams })
+    const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, steamAuth: auth, maxSessions: 2, databasePath: ':memory:' })
+    await app.ready()
+    try {
+      for (const url of ['/api/setup', '/api/steam-auth']) expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'POST', url: '/api/steam-auth', payload: { accountName: 'fixture_account' } })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      const insecure = await app.inject({ method: 'POST', url: '/api/steam-auth', remoteAddress: '198.51.100.8', headers: { cookie, 'x-forwarded-proto': 'https' }, payload: { accountName: 'fixture_account' } })
+      expect(insecure.statusCode).toBe(403)
+      expect(insecure.json().error.code).toBe('https_required')
+      expect((await app.inject({ method: 'POST', url: '/api/steam-auth', headers: { cookie, origin: 'https://untrusted.example.test' }, payload: { accountName: 'fixture_account' } })).statusCode).toBe(403)
+      const started = await app.inject({ method: 'POST', url: '/api/steam-auth', headers: { cookie }, payload: { accountName: 'fixture_account' } })
+      expect(started.statusCode).toBe(200)
+      child.stdout.write('password:')
+      const state = (await app.inject({ method: 'GET', url: '/api/steam-auth', headers: { cookie } })).json().data
+      expect(state.state).toBe('password')
+      const otherCookie = await loginCookie(app)
+      const otherState = (await app.inject({ method: 'GET', url: '/api/steam-auth', headers: { cookie: otherCookie } })).json().data
+      expect(otherState.id).toBeNull()
+      const payload = { promptId: state.promptId, value: 'SYNTHETIC_PASSWORD_NO_REAL_ACCOUNT' }
+      expect((await app.inject({ method: 'POST', url: `/api/steam-auth/${state.id}/input`, headers: { cookie: otherCookie }, payload })).statusCode).toBe(404)
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { requestId: 'no-password-job', action: 'install-server', input: { gameUser: 'FixtureUser', password: payload.value } } })).statusCode).toBe(400)
+      const submitted = await app.inject({ method: 'POST', url: `/api/steam-auth/${state.id}/input`, headers: { cookie }, payload })
+      expect(submitted.statusCode).toBe(200)
+      expect(submitted.headers['cache-control']).toBe('no-store')
+      expect(submitted.body).not.toContain(payload.value)
+      expect(inputs).toBe(1)
+      expect((await app.inject({ method: 'POST', url: `/api/steam-auth/${state.id}/input`, headers: { cookie }, payload })).statusCode).toBe(409)
+      expect((await app.inject({ method: 'GET', url: '/api/jobs', headers: { cookie } })).json().data).toEqual([])
+      await app.inject({ method: 'DELETE', url: '/api/session', headers: { cookie } })
+      await new Promise(resolve => setImmediate(resolve))
+      expect(auth.busy).toBe(false)
+      expect(fixture.adapter.calls).toHaveLength(0)
+    } finally { await app.close() }
+  })
+
+  it('runs installation in the existing durable queue, deduplicating requests before other game actions', async () => {
+    const fixture = await createFixture()
+    const calls: string[] = []
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:', serverSetup: {
+      status: async () => { throw new Error('Not needed') },
+      prepareSteam: async report => { calls.push('prepare'); report('fixture preparation'); await gate; return { prepared: true } },
+      install: async () => { calls.push('install'); return { installed: true, gameStarted: false } },
+    } })
+    await app.ready()
+    try {
+      const cookie = await loginCookie(app)
+      const payload = { requestId: 'prepare-deduplicate', action: 'prepare-steamcmd', input: {} }
+      const one = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      const two = await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload })
+      expect(one.json().data.id).toBe(two.json().data.id)
+      await app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { requestId: 'install-next', action: 'install-server', input: { gameUser: 'FixtureUser' } } })
+      expect(calls).toEqual(['prepare'])
+      release()
+      for (let i = 0; i < 20 && calls.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 5))
+      expect(calls).toEqual(['prepare', 'install'])
+      expect(fixture.adapter.calls).toHaveLength(0)
+      const jobs = (await app.inject({ method: 'GET', url: '/api/jobs', headers: { cookie } })).json().data
+      expect(jobs).toHaveLength(2)
+      expect(jobs.every((job: Job) => job.state === 'succeeded')).toBe(true)
+    } finally { release(); await app.close() }
+  })
+
   it('serves only public web assets and protects API routes with encoded paths', async () => {
     const fixture = await createFixture()
     const webRoot = join(fixture.directory, 'web')

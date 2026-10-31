@@ -41,6 +41,8 @@ export class RuntimeMonitor {
   #stoppedSince: number | null = null
   #healthySince: number | null = null
   #lowUpsSince: number | null = null
+  #stalledSince: number | null = null
+  #stalledPid: number | null = null
 
   constructor(
     file: string,
@@ -188,6 +190,16 @@ export class RuntimeMonitor {
       else this.#lowUpsSince = null
       this.#alert('ups-low', this.#lowUpsSince !== null && now - this.#lowUpsSince >= minute, 'warning', `UPS 已连续一分钟低于 ${this.#settings.minimumUps}。`, now)
 
+      // The engine update loop can keep reporting UPS while no simulation ticks advance.
+      // Paused/unavailable telemetry and queued game operations do not establish a stall.
+      const stalled = sample.state === 'running' && overview.capabilities.save && this.queue.isIdle && this.queue.accepting &&
+        generation === this.#jobGeneration && sample.tps === 0 && sample.ups !== null && sample.ups > 0
+      if (!stalled || sample.pid !== this.#stalledPid) this.#stalledSince = stalled ? now : null
+      this.#stalledPid = stalled ? sample.pid : null
+      if (stalled) this.#stalledSince ??= now
+      this.#alert('simulation-stalled', this.#stalledSince !== null && now - this.#stalledSince >= minute, 'warning',
+        '游戏世界已连续一分钟没有推进（TPS 为 0）。请检查暂停状态、联机模组和游戏日志。', now)
+
       if (!this.queue.isIdle || !this.queue.accepting || generation !== this.#jobGeneration || this.#storageFailed) {
         this.#stoppedSince = null; this.#persist(); this.#storageFailed = false; return
       }
@@ -213,6 +225,7 @@ export class RuntimeMonitor {
       }
       this.#persist()
     } catch (error) {
+      this.#stalledSince = null; this.#stalledPid = null
       if (!this.#closed) this.#alert('monitor-unavailable', true, 'error', '暂时无法读取服务器运行状态。', now)
       // A failed sample never becomes a stopped game, an empty player list or a restart request.
       throw error
@@ -242,21 +255,22 @@ export class RuntimeMonitor {
   #recordJob(job: Job): void {
     if (this.#closed) return
     this.#jobGeneration++
+    this.#stalledSince = null; this.#stalledPid = null
     const automatic = this.jobs.input(job.id).automatic === true
     const now = this.#clock()
     if (job.state === 'queued' && !automatic) {
       if (job.action === 'stop') this.#state.wantedRunning = false
-      if (job.action === 'start' || job.action === 'restart') this.#state.wantedRunning = true
+      if (job.action === 'start' || job.action === 'restart' || job.action === 'load-save') this.#state.wantedRunning = true
     }
     if (job.state === 'succeeded') {
-      if (job.action === 'start' || job.action === 'restart') {
+      if (job.action === 'start' || job.action === 'restart' || job.action === 'load-save') {
         this.#state.wantedRunning = true
         if (!automatic) {
           this.#state.blockedReason = null; this.#state.recoveryAttempts = []; this.#state.nextRecoveryAt = null
           this.#alert('recovery-blocked', false, 'error', '', now)
         }
       }
-      if (job.action === 'stop') this.#state.wantedRunning = false
+      if (job.action === 'stop' || job.action === 'install-server' || job.action === 'prepare-first-world') this.#state.wantedRunning = false
       if (job.action === 'backup') {
         this.#state.lastBackupAt = now
         this.#alert('backup-failed', false, 'error', '', now)
@@ -265,7 +279,7 @@ export class RuntimeMonitor {
     if (job.state === 'failed' || job.state === 'interrupted') {
       this.#alert('last-operation-failed', true, 'warning', `最近失败操作：${job.action}。请查看活动记录。`, now)
       if (job.action === 'backup') this.#alert('backup-failed', true, 'error', '备份未完成，请查看活动记录并检查可恢复副本。', now)
-      if (!automatic && ['start', 'restart', 'restore', 'install-update', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings'].includes(job.action)) {
+      if (!automatic && ['start', 'restart', 'load-save', 'restore', 'install-server', 'prepare-first-world', 'install-update', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings'].includes(job.action)) {
         this.#state.blockedReason = '上次游戏变更未成功，自动恢复已暂停；检查结果后手动启动可恢复自动恢复。'
         this.#alert('recovery-blocked', true, 'error', this.#state.blockedReason, now)
       }
