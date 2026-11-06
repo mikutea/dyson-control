@@ -68,7 +68,7 @@ export class BackupRetention {
       const manifest = await readBackupManifest(this.directory, entry.name).catch(() => null)
       if (manifest) manifests.push(manifest)
     }
-    return manifests.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id))
+    return manifests.sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt) || b.id.localeCompare(a.id))
   }
 
   async #marked(manifest: BackupManifest): Promise<boolean | null> {

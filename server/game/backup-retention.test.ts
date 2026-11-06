@@ -59,6 +59,14 @@ async function groupSnapshot(dir: string) {
 }
 
 describe('automatic backup retention', () => {
+  it('shows and retains the newest instant across differently formatted time zone offsets', async () => {
+    await seedBackup('older-utc', '2026-11-06T12:00:00+08:00')
+    await seedBackup('newer-utc', '2026-11-06T06:00:00Z')
+    const keeper = new BackupRetention(config.game.backupDirectory, config.dataDirectory, path.join(config.dataDirectory, 'downloads'))
+    expect((await keeper.list()).map(backup => backup.id)).toEqual(['newer-utc', 'older-utc'])
+    expect(await keeper.prune(1, new Set())).toBe(1)
+    expect((await keeper.list()).map(backup => backup.id)).toEqual(['newer-utc'])
+  })
   it.each(['windows', 'demo'] as const)('preserves retained backups beyond the rolling count, across %s restarts, until a later rotation after release', async mode => {
     config.mode = mode
     let adapter = openAdapter()
