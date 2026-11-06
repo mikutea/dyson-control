@@ -26,7 +26,7 @@ const emptyObjectSchema = z.object({}).strict()
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
-const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world'])
+const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world', 'prepare-existing-server', 'adopt-existing-server'])
 const settingsSchema = z.object({
   serverName: z.string().trim().min(1).max(80).regex(/^[^\r\n\0]+$/u),
   maxPlayers: z.number().int().min(1).max(256).nullable(),
@@ -37,9 +37,12 @@ const settingsSchema = z.object({
   readOnlyFields: z.array(z.enum(['maxPlayers', 'targetUps', 'autosaveMinutes'])).max(3).optional(),
 }).strict().transform(({ readOnlyFields: _readOnlyFields, ...settings }) => settings)
 
+const localGameUserSchema = z.string().trim().min(1).max(80).regex(/^[^\\/\r\n\0]+$/u)
 const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'prepare-steamcmd': emptyObjectSchema,
-  'install-server': z.object({ gameUser: z.string().trim().min(1).max(80).regex(/^[^\\/\r\n\0]+$/u) }).strict(),
+  'install-server': z.object({ gameUser: localGameUserSchema }).strict(),
+  'prepare-existing-server': z.object({ gameUser: localGameUserSchema }).strict(),
+  'adopt-existing-server': z.object({ planId: z.string().uuid() }).strict(),
   'prepare-first-world': emptyObjectSchema,
   start: emptyObjectSchema,
   save: emptyObjectSchema,
@@ -79,7 +82,7 @@ export interface BuildAppOptions {
   jobTimeoutMs?: number
   runtimeOptions?: { clock?: () => number; intervalMs?: number }
   steamAuth?: SteamAuthManager
-  serverSetup?: Pick<ServerSetupManager, 'status' | 'prepareSteam' | 'install'>
+  serverSetup?: Pick<ServerSetupManager, 'status' | 'prepareSteam' | 'install' | 'prepareExisting' | 'adoptExisting'>
   controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'history' | 'close'>
 }
 
@@ -103,9 +106,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const queue = new JobQueue(store, adapter, {
     maxOutstandingJobs: options.maxOutstandingJobs,
     jobTimeoutMs: options.jobTimeoutMs,
-    execute: (action, input, report, signal) => action === 'prepare-steamcmd' ? setup.prepareSteam(report, signal)
-      : action === 'install-server' ? setup.install(String(input.gameUser), report, signal)
-      : adapter.run(action, input, report, signal),
+    execute: (action, input, report, signal) => {
+      switch (action) {
+        case 'prepare-steamcmd': return setup.prepareSteam(report, signal)
+        case 'install-server': return setup.install(String(input.gameUser), report, signal)
+        case 'prepare-existing-server': return setup.prepareExisting(String(input.gameUser), report, signal)
+        case 'adopt-existing-server': return setup.adoptExisting(String(input.planId), report, signal)
+        default: return adapter.run(action, input, report, signal)
+      }
+    },
   })
   const maintenance = new MaintenanceGate(
     options.config.dataDirectory,
@@ -356,6 +365,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return data(runtime.restoreSettings(historyId))
   })
 
+  app.get('/api/jobs/current', async request => {
+    assertNoQuery(request)
+    return data(store.current())
+  })
   app.get('/api/jobs/by-request/:requestId', async request => {
     assertNoQuery(request)
     const { requestId } = z.object({ requestId: requestIdSchema }).strict().parse(request.params)

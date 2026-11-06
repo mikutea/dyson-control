@@ -19,7 +19,7 @@
 
 *截图来自演示模式，展示实际页面与操作入口；其中的玩家、存档、版本和指标均为示例。*
 
-> **当前版本状态**：本分支为 `0.1.10` 候选版，包含新的安装与 Steam 授权流程。截至 2026-10-28，默认 `main` 仍为 `0.1.7`，仓库尚无公开 Release。可按下方从源码体验；最新改动见 [PR #4](https://github.com/mikutea/dyson-control/pull/4)。
+> **当前版本状态**　本分支提供 `0.1.10` 候选版。截至 2026-11-06，默认分支 `main` 的版本为 `0.1.7`，GitHub Releases 列表为空。可按下方说明从源码体验。[候选版 PR #4](https://github.com/mikutea/dyson-control/pull/4)
 
 ## 功能
 
@@ -71,7 +71,8 @@ npm start
 
 | 使用场景 | 从这里开始 |
 | --- | --- |
-| 已有游戏和存档 | [安装面板](docs/installation.md#首次安装)，再按[游戏与 Bridge 接入](docs/game-configuration.md)绑定现有目录 |
+| 已有游戏和存档 | 安装完整面板包，在“安装与授权”中预览接入已有停服实例的变更，再确认接入。[Windows 安装](docs/installation.md#首次安装) · [游戏与 Bridge 接入](docs/game-configuration.md) |
+| 已有存档 ZIP | 在“存档 → 导入备份”选择包含同一存档完整文件组的 ZIP，导入后预览恢复。[导入与恢复](docs/monitoring.md) |
 | 从空目录准备新服 | [交互生成私有配置](docs/installation.md#准备私有配置)并安装完整面板包，再打开[安装与 Steam 授权](docs/server-setup.md)完成首装 |
 | 升级已有面板 | 按[升级与自动回退](docs/installation.md#升级与自动回退)更新程序；游戏与存档继续使用原目录 |
 | 从源码准备发布包 | 按[生成发布包](docs/installation.md#生成发布包)构建完整包或仅面板包 |

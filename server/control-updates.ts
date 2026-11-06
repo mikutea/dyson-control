@@ -12,6 +12,7 @@ export type {
   ControlUpdateOperationState, ControlUpdatePrepareResult, ControlUpdateStep,
 } from '../shared/contracts.js'
 import { extractZipBuffer } from './game/updates.js'
+import { writeAtomicJson } from './atomic-json.js'
 
 const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
 const repositoryPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -268,7 +269,7 @@ export class ControlUpdateManager {
         sourcePath: record.sourcePath, sourceFingerprint: record.sourceFingerprint,
         upgradeScriptPath: capability.upgradePath, statusPath: helperStatusPath, createdAt: this.#now(),
       }
-      await atomicJson(operationFile, handoff)
+      await writeAtomicJson(operationFile, handoff)
       record.applyRequestId = input.requestId
       record.state = 'scheduled'
       record.step = 'handoff'
@@ -521,7 +522,7 @@ export class ControlUpdateManager {
   async #write(record: StoredOperation): Promise<void> {
     const previous = this.#writeTails.get(record.id) ?? Promise.resolve()
     const snapshot = structuredClone(record)
-    const write = previous.catch(() => undefined).then(() => atomicJson(path.join(record.operationRoot, 'operation.json'), snapshot))
+    const write = previous.catch(() => undefined).then(() => writeAtomicJson(path.join(record.operationRoot, 'operation.json'), snapshot))
     this.#writeTails.set(record.id, write)
     try { await write } finally { if (this.#writeTails.get(record.id) === write) this.#writeTails.delete(record.id) }
   }
@@ -748,22 +749,6 @@ async function scheduleWithPowerShell(helperPath: string, operationFile: string)
   })
 }
 
-async function atomicJson(filePath: string, value: unknown): Promise<void> {
-  const temporary = `${filePath}.partial-${randomUUID()}`
-  try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    // Windows can temporarily hold a sharing lock on the destination. Retry only the rename, never the update.
-    const delays = [25, 50, 100, 200, 400, 800]
-    for (let attempt = 0; ; attempt += 1) {
-      try { await fs.rename(temporary, filePath); break }
-      catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (attempt === delays.length || (code !== 'EPERM' && code !== 'EBUSY')) throw error
-        await new Promise(resolve => setTimeout(resolve, delays[attempt]))
-      }
-    }
-  } finally { await fs.rm(temporary, { force: true }).catch(() => undefined) }
-}
 
 async function assertPlainFile(filePath: string): Promise<void> {
   const stat = await fs.lstat(filePath)

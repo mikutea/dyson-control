@@ -6,6 +6,7 @@ import { get, post, remove } from './api'
 import { Button, ErrorBlock, LoadingBlock, PageHeader, Panel, StatusDot } from './components'
 import { formatFullDate } from './format'
 import { useResource } from './hooks'
+import { ExistingServerCard } from './ExistingServerCard'
 import './server-setup.css'
 
 const working = new Set(['starting', 'password', 'guard', 'approval', 'verifying'])
@@ -105,16 +106,21 @@ export function ServerSetup({ refreshToken, runAction, operationActive }: { refr
   const ready = currentAuth?.state === 'authorized'
   const prompt = currentAuth?.state === 'password' || currentAuth?.state === 'guard'
   const configured = status.existingGame && status.taskExists
-  const unconfirmed = !!status.lastInstallation && status.lastInstallation.state !== 'ready'
+  const adopt = status.supported && (status.existingServer.plan !== null || (status.existingGame && !status.taskExists))
+  const unconfirmed = (!!status.lastInstallation && status.lastInstallation.state !== 'ready')
+    || status.existingServer.plan?.state === 'applying' || status.existingServer.plan?.state === 'needs-review'
   const canInstall = status.supported && !resource.error && status.steamReady && ready && status.targetEmpty && !status.taskExists && status.blockers.length === 0 && !!gameUser && !operationActive && status.lastInstallation?.state !== 'running'
 
   return <>
-    <PageHeader title="安装与授权" description="准备首次开服，或单独修复现有 Steam 授权" actions={<Button onClick={() => void resource.reload()}>刷新检查</Button>} />
+    <PageHeader title="安装与授权" description="首次开服、接入已有游戏或修复 Steam 授权" actions={<Button onClick={() => void resource.reload()}>刷新检查</Button>} />
     {resource.error && <p className="setup-notice" role="alert">未能刷新安装状态，下面显示上次读取的结果。</p>}
-    <div className="setup-intro"><div><span className="setup-eyebrow">SERVER SETUP</span><h2>{status.existingGame || status.taskExists ? (unconfirmed ? '已检测到游戏文件或启动任务' : '现有服务器，随时修复授权') : '从空目录开始，准备你的服务器'}</h2><p>{status.existingGame || status.taskExists ? '完成 Steam 授权后即可继续查询游戏版本。' : '下载官方游戏、安装必要模组，并配置首次启动。'}</p></div><ShieldCheck aria-hidden /></div>
+    <div className="setup-intro"><div><h2>{adopt ? '接入已有游戏目录' : status.existingGame || status.taskExists ? (unconfirmed ? '已检测到游戏文件或启动任务' : '现有服务器') : '从空目录开始，准备你的服务器'}</h2><p>{adopt ? '选择游戏用户，预览将要配置的文件与启动任务。' : status.existingGame || status.taskExists ? '完成 Steam 授权后即可继续查询游戏版本。' : '下载官方游戏、安装必要模组，并配置首次启动。'}</p></div><ShieldCheck aria-hidden /></div>
     <ol className="setup-progress" aria-label="安装步骤">
-      {[['SteamCMD', status.steamReady], ['Steam 授权', ready], [status.lastInstallation ? '首次安装' : '游戏与启动任务', configured && (!status.lastInstallation || status.lastInstallation.state === 'ready')]].map(([label, done], index) => <li key={String(label)} className={done ? 'complete' : ''}><span>{done ? <Check aria-hidden /> : index + 1}</span><strong>{label}</strong></li>)}
+      {(adopt ? [['已有游戏', status.existingGame], ['接入预览', status.existingServer.plan?.state === 'prepared' || status.existingServer.plan?.state === 'adopted'], ['接入管理', configured && status.existingServer.plan?.state === 'adopted']]
+        : [['SteamCMD', status.steamReady], ['Steam 授权', ready], [status.lastInstallation ? '首次安装' : '游戏与启动任务', configured && (!status.lastInstallation || status.lastInstallation.state === 'ready')]]
+      ).map(([label, done], index) => <li key={String(label)} className={done ? 'complete' : ''}><span>{done ? <Check aria-hidden /> : index + 1}</span><strong>{label}</strong></li>)}
     </ol>
+    {adopt && <ExistingServerCard status={status} busy={operationActive} stale={Boolean(resource.error)} runAction={runAction} />}
     {status.lastInstallation && <InstallationReceipt attempt={status.lastInstallation} configured={configured} />}
     {(status.firstWorld.state !== 'unavailable' || status.firstWorld.message) && <Panel title={status.firstWorld.state === 'retryable' ? '重新准备首次建图' : status.firstWorld.state === 'ready' ? (unconfirmed ? '首次建图许可' : '首次建图已准备') : '首次建图状态'} icon={status.firstWorld.state === 'ready' && !unconfirmed ? <Check /> : <RotateCcw />} className="setup-card setup-first-world">
       <div className="setup-card-body">
@@ -150,7 +156,7 @@ export function ServerSetup({ refreshToken, runAction, operationActive }: { refr
         </div>
       </Panel>
     </div>
-    <Panel title="首次安装服务器" icon={<Rocket />} className="setup-card setup-install">
+    {!adopt && <Panel title="首次安装服务器" icon={<Rocket />} className="setup-card setup-install">
       <div className="setup-card-body"><div className="setup-install-heading"><div><h3>{status.existingGame || status.taskExists ? (unconfirmed ? '目标已有游戏文件或启动任务' : '已发现现有服务器') : '检查目标目录后，开始安装'}</h3><p>首次安装仅接受空目录。完成后可从概览手动启动服务器。</p></div><span className="setup-target-label">目标目录</span></div><code className="setup-path">{status.gameRoot}</code>
         <div className="setup-install-detail"><div><label className="setup-field" htmlFor="game-user">运行游戏的 Windows 用户<select id="game-user" value={gameUser} onChange={event => setGameUser(event.target.value)} disabled={!status.supported || status.existingGame || status.taskExists}><option value="">选择服务器上的用户</option>{status.gameUsers.map(user => <option key={user.name} value={user.name} disabled={!user.activeSteam}>{user.name}{user.activeSteam ? ' · Steam 已运行' : ' · 请先登录桌面 Steam'}</option>)}</select></label><p className="setup-help">该用户需要在服务器上保持 Windows 登录，并登录桌面 Steam。安装会配置游戏启动任务。</p></div><div className="setup-includes"><strong>安装内容</strong><span>戴森球计划 · Steam public</span><span>Nebula · BepInEx · 所需依赖</span><span>与安装包匹配的 Bridge 与启动配置</span></div></div>
         {status.supported && !status.lastInstallation && <p className="setup-help">尚无首次安装记录。</p>}
@@ -158,6 +164,6 @@ export function ServerSetup({ refreshToken, runAction, operationActive }: { refr
         {!status.existingGame && !status.taskExists && <p className="setup-help">首次启动时，有存档则加载最新存档；空存档目录会按游戏默认设置创建一个新世界。</p>}
         <div className="setup-actions"><Button variant="primary" disabled={!canInstall} onClick={() => runAction('install-server', { gameUser })}>一键安装服务器</Button>{(status.existingGame || status.taskExists) && <a className="button button-secondary" href="#/overview">前往服务器概览</a>}</div>
       </div>
-    </Panel>
+    </Panel>}
   </>
 }

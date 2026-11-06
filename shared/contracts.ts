@@ -1,5 +1,5 @@
 export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
-export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world'
+export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world' | 'prepare-existing-server' | 'adopt-existing-server'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
 
@@ -149,11 +149,19 @@ export interface FirstInstallationAttempt {
   stage: 'preparing-files' | 'downloading' | 'installing-mods' | 'checking-bridge' | 'configuring' | null
   createdAt: string | null; updatedAt: string | null; buildId: string | null
 }
+export interface ExistingServerPlan {
+  id: string; createdAt: string; gameUser: string
+  state: 'prepared' | 'applying' | 'adopted' | 'stale' | 'needs-review'
+  bridgeSha256: string; bridgeDll: 'create' | 'replace'; bridgeConfig: 'create' | 'replace'
+  secret: 'create' | 'retain'; startup: 'create' | 'retain'
+  accessChanges: number; existingAccessChecks: number
+}
 export interface ServerSetupStatus {
   supported: boolean; gameRoot: string; steamExecutable: string; steamReady: boolean; accountName: string
   existingGame: boolean; targetEmpty: boolean; bridgeAvailable: boolean; taskExists: boolean
   gameUsers: Array<{ name: string; activeSteam: boolean }>
   blockers: string[]; auth: SteamAuthStatus; firstWorld: FirstWorldStatus; lastInstallation: FirstInstallationAttempt | null
+  existingServer: { canPrepare: boolean; blockers: string[]; plan: ExistingServerPlan | null }
 }
 
 export interface GameAdapter {
@@ -197,6 +205,7 @@ export interface ControlConfig {
 // GET /api/{overview,players,logs,mods,versions,saves,backups,settings,client-packages,jobs}.
 // GET /api/client-packages/:id compares one generated profile with the current client requirements.
 // GET /api/jobs accepts JobHistoryQuery and returns Job[] newest first; before is an exclusive job ID.
+// GET /api/jobs/current returns one Job or null: running, first queued, then most recently submitted.
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
 // GET /api/jobs/by-request/:requestId returns the recorded Job, or null if that request has no job yet.
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.

@@ -29,7 +29,10 @@ param(
   [switch]$PrepareOnly,
   [string]$OutputDirectory,
   [switch]$ConfirmStopped,
-  [switch]$RequireNewTask
+  [switch]$RequireNewTask,
+  [switch]$ReviewExisting,
+  [string]$ExpectedReviewHash,
+  [object[]]$ReviewedReferences
 )
 
 $ErrorActionPreference = 'Stop'
@@ -914,6 +917,26 @@ function Register-GameStartTask([string]$Name, [object]$Definition, [switch]$Req
   Register-ScheduledTask @taskRegistration | Out-Null
 }
 
+function Restore-GameTaskOnFailure([string]$Name, [string]$OriginalXml) {
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ieq $Name -and $_.TaskPath -ceq '\' })
+  if ([string]::IsNullOrEmpty($OriginalXml)) {
+    # Registration verification failed. A task at this name may now belong to someone else.
+    if ($tasks.Count) { throw 'Unverified start task retained for manual review.' }
+    return
+  }
+  if ($tasks.Count -ne 1 -or [string]$tasks[0].State -eq 'Running') { throw 'Original task cannot be verified for rollback.' }
+  [xml]$original = $OriginalXml
+  [xml]$current = Export-ScheduledTask -TaskName $Name -TaskPath '\' -ErrorAction Stop
+  $selector = "/*[local-name()='Task']/*[local-name()='Settings']/*[local-name()='Enabled']"
+  $enabled = $original.SelectSingleNode($selector)
+  $originallyEnabled = $null -eq $enabled -or $enabled.InnerText -ne 'false'
+  if ($enabled) { [void]$enabled.ParentNode.RemoveChild($enabled) }
+  $enabled = $current.SelectSingleNode($selector)
+  if ($enabled) { [void]$enabled.ParentNode.RemoveChild($enabled) }
+  if ($current.OuterXml -cne $original.OuterXml) { throw 'Changed task definition retained for manual review; original XML is in the backup.' }
+  if ($originallyEnabled -and [string]$tasks[0].State -eq 'Disabled') { Enable-ScheduledTask -InputObject $tasks[0] -ErrorAction Stop | Out-Null }
+}
+
 function Copy-OriginalOrRecordAbsent([string]$Source, [string]$BackupPath, [System.Collections.IDictionary]$Record, [string]$Name) {
   if (Test-Path -LiteralPath $Source) {
     $plain = Get-PlainFile $Source "Existing $Name"
@@ -921,6 +944,68 @@ function Copy-OriginalOrRecordAbsent([string]$Source, [string]$BackupPath, [Syst
     $Record[$Name] = [ordered]@{ existed = $true; file = [IO.Path]::GetFileName($BackupPath); sha256 = (Get-FileHash -LiteralPath $BackupPath -Algorithm SHA256).Hash.ToLowerInvariant() }
   }
   else { $Record[$Name] = [ordered]@{ existed = $false; file = $null; sha256 = $null } }
+}
+
+function Get-OptionalFileHash([string]$File, [string]$Label) {
+  if (-not (Test-Path -LiteralPath $File)) { return $null }
+  return (Get-FileHash -LiteralPath (Get-PlainFile $File $Label) -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Assert-ExistingHost([object]$Config, [object]$User) {
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ieq $Config.StartTaskName })
+  if ($tasks.Count) { throw 'ADOPT_TASK_EXISTS' }
+  $game = ConvertTo-DysonCanonicalPath (Join-Path $Config.GameRoot 'DSPGAME.exe')
+  foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'DSPGAME.exe'" -ErrorAction Stop)) {
+    if ([string]::IsNullOrWhiteSpace([string]$process.ExecutablePath)) { throw 'ADOPT_HOST_BUSY' }
+    try { $running = ConvertTo-DysonCanonicalPath ([string]$process.ExecutablePath) } catch { throw 'ADOPT_HOST_BUSY' }
+    if ($running.Equals($game, [StringComparison]::OrdinalIgnoreCase)) { throw 'ADOPT_HOST_BUSY' }
+  }
+  if (Test-Path -LiteralPath (Join-Path $Config.DataDirectory 'save-restore\active')) { throw 'ADOPT_RESTORE_ACTIVE' }
+  foreach ($process in @(Get-CimInstance Win32_Process -Filter "Name = 'steam.exe'" -ErrorAction Stop)) {
+    if ([int]$process.SessionId -le 0) { continue }
+    $owner = Invoke-CimMethod -InputObject $process -MethodName GetOwnerSid -ErrorAction Stop
+    if ($owner.ReturnValue -eq 0 -and $owner.Sid -ceq $User.Sid) { return }
+  }
+  throw 'ADOPT_STEAM_USER'
+}
+
+function Get-ExistingServerReview([object]$Plan, [object]$Config, [object]$Layout) {
+  $dll = Get-OptionalFileHash $Plan.bridge.dllTarget 'Existing Bridge DLL'
+  $cfg = Get-OptionalFileHash $Plan.bridge.configTarget 'Existing Bridge configuration'
+  $startup = Get-OptionalFileHash $Plan.startupSettings.path 'Existing startup settings'
+  if ($null -ne $startup) { Assert-StartupSettings $Plan.startupSettings.path }
+  $secretIdentity = $null
+  if ($Plan.bridge.secretAction -ceq 'retain') {
+    $secret = Get-Item -LiteralPath (Assert-SecretFile $Plan.bridge.secretFile)
+    $secretIdentity = @($secret.Length, $secret.LastWriteTimeUtc.Ticks)
+  }
+  $linkExists = $Layout.LinkPath -and (Test-Path -LiteralPath $Layout.LinkPath)
+  if ($linkExists) { Assert-ExactDirectoryLink $Layout.LinkPath $Layout.LinkTarget $Layout.LinkType }
+  $baseline = [ordered]@{ config = $Config; bridge = $Plan.bridge; task = $Plan.task; access = $Plan.access; document = $Plan.documentBinding
+    dll = $dll; cfg = $cfg; startup = $startup; secret = $secretIdentity; linkExists = [bool]$linkExists }
+  $algorithm = [Security.Cryptography.SHA256]::Create()
+  try { $hash = ([BitConverter]::ToString($algorithm.ComputeHash($utf8NoBom.GetBytes(($baseline | ConvertTo-Json -Depth 10 -Compress))))).Replace('-', '').ToLowerInvariant() }
+  finally { $algorithm.Dispose() }
+  return [ordered]@{ reviewHash = $hash; bridgeSha256 = $Plan.bridge.sourceSha256; priorDll = $dll; priorConfig = $cfg; priorStartup = $startup
+    bridgeDll = if ($null -eq $dll) { 'create' } else { 'replace' }; bridgeConfig = if ($null -eq $cfg) { 'create' } else { 'replace' }
+    secret = $Plan.bridge.secretAction; startup = if ($null -eq $startup) { 'create' } else { 'retain' }
+    accessChanges = @($Plan.access.changes).Count; existingAccessChecks = @($Plan.access.existingAccessChecks).Count }
+}
+
+function Assert-ReviewedReferences([string]$Root, [object[]]$References) {
+  if ($References.Count -ne 9) { throw 'ADOPT_PLAN_CHANGED' }
+  $seen = @{}
+  foreach ($ref in $References) {
+    $relative = ([string]$ref.file).Replace('\','/')
+    if ($relative -notmatch '^(DSPGAME_Data/Managed|BepInEx/(core|plugins))/[A-Za-z0-9._/-]+\.dll$' -or
+        $relative.Split('/') -contains '..' -or $seen.ContainsKey($relative)) { throw 'ADOPT_PLAN_CHANGED' }
+    $seen[$relative] = $true
+    $file = Join-Path $Root $relative
+    try {
+      $item = Get-Item -LiteralPath (Get-PlainFile $file 'Reviewed assembly' 1073741824)
+      if ($item.Length -ne $ref.bytes -or (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant() -cne $ref.sha256) { throw 'Changed' }
+    } catch { throw 'ADOPT_PLAN_CHANGED' }
+  }
 }
 
 $configuration = Read-ControlConfiguration $ConfigPath
@@ -1014,6 +1099,12 @@ $plan = [ordered]@{
   guarantees = @('game-process-must-be-stopped', 'no-save-migration', 'task-is-not-started')
 }
 
+if ($ReviewExisting) {
+  if (-not $RequireNewTask) { throw 'Existing server adoption requires a new task.' }
+  Assert-ExistingHost $configuration $resolvedGameUser
+  $review = Get-ExistingServerReview $plan $configuration $documentLayout
+  if (-not $PrepareOnly -and $review.reviewHash -cne $ExpectedReviewHash) { throw 'ADOPT_PLAN_CHANGED' }
+}
 if ($PrepareOnly) {
   if ([string]::IsNullOrWhiteSpace($OutputDirectory)) { throw 'OutputDirectory is required with -PrepareOnly.' }
   $output = Get-FullPath $OutputDirectory
@@ -1036,7 +1127,8 @@ if ($PrepareOnly) {
     }
     [IO.File]::WriteAllText((Join-Path $output 'plan.json'), ($plan | ConvertTo-Json -Depth 8), $utf8NoBom)
     $summary = [ordered]@{ prepared = $true; outputDirectory = $output; plan = (Join-Path $output 'plan.json'); bridgeSha256 = $actualBridgeHash; targetChanged = $false }
-    $summary | ConvertTo-Json -Compress
+    if ($ReviewExisting) { $summary.review = $review }
+    $summary | ConvertTo-Json -Depth 4 -Compress
   }
   catch {
     if ($created) {
@@ -1274,6 +1366,18 @@ try {
   }
   Assert-GameStopped $gameExecutable
 
+  if ($ReviewExisting) {
+    # Both account probes can take time. Check reviewed files again before their replacement.
+    Assert-ExistingHost $configuration $resolvedGameUser
+    Assert-ReviewedReferences $configuration.GameRoot $ReviewedReferences
+    if ((Get-OptionalFileHash $bridgeDllTarget 'Bridge DLL') -cne $review.priorDll -or
+        (Get-OptionalFileHash $bridgeConfigTarget 'Bridge configuration') -cne $review.priorConfig -or
+        ($startupCreated -ne ($review.startup -ceq 'create'))) { throw 'ADOPT_PLAN_CHANGED' }
+    if ($startupCreated) {
+      if ([IO.File]::ReadAllText($startupSettingsPath,$utf8NoBom) -cne $defaultStartupSettings) { throw 'ADOPT_PLAN_CHANGED' }
+    } elseif ((Get-OptionalFileHash $startupSettingsPath 'Existing startup settings') -cne $review.priorStartup) { throw 'ADOPT_PLAN_CHANGED' }
+    if ($documentLayout.LinkPath) { Assert-ExactDirectoryLink $documentLayout.LinkPath $documentLayout.LinkTarget $documentLayout.LinkType }
+  }
   if (-not $secretExists) {
     $secretTemporary = Join-Path $secretDirectory ('.dyson-control-secret-' + [guid]::NewGuid().ToString('N') + '.tmp')
     try {
@@ -1331,10 +1435,8 @@ catch {
   $applyError = $_
   if ($taskMutated) {
     try {
-      if ([bool]$backupRecord.task.existed) {
-        Register-ScheduledTask -TaskName $configuration.StartTaskName -TaskPath '\' -Xml ([IO.File]::ReadAllText($taskXmlPath, $utf8NoBom)) -Force | Out-Null
-      }
-      else { Unregister-ScheduledTask -TaskName $configuration.StartTaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue }
+      $originalXml = if ([bool]$backupRecord.task.existed) { [IO.File]::ReadAllText($taskXmlPath, $utf8NoBom) } else { '' }
+      Restore-GameTaskOnFailure $configuration.StartTaskName $originalXml
     } catch { $rollbackErrors += $_ }
   }
   if ($configMutated) {

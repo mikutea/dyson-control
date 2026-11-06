@@ -4,6 +4,8 @@ export const actionLabels: Record<Action, string> = {
   'prepare-steamcmd': '准备 SteamCMD',
   'install-server': '首次安装服务器',
   'prepare-first-world': '重新准备首次建图',
+  'prepare-existing-server': '预览已有服务器接入',
+  'adopt-existing-server': '接入已有服务器',
   start: '启动服务器',
   save: '保存游戏',
   stop: '停止服务器',
@@ -109,6 +111,8 @@ export function formatJobResult(job: Job): string | null {
     case 'prepare-steamcmd': return 'SteamCMD 已就绪，可继续授权'
     case 'install-server': return '服务器安装完成，等待手动首次启动'
     case 'prepare-first-world': return '首次建图已准备，请前往概览手动启动'
+    case 'prepare-existing-server': return '接入预览已生成，可在安装与授权页核对'
+    case 'adopt-existing-server': return '已有服务器已接入，可前往概览手动启动'
     case 'start': return '服务器已启动'
     case 'load-save': return text('saveName') ? `已从存档 ${text('saveName')} 启动服务器` : '已加载所选存档'
     case 'stop': return '服务器已安全停止'

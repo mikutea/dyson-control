@@ -9,7 +9,7 @@ import { GameAdapterError, invalidInput } from './errors.js'
 import { clientPackageDownload, compareClientPackage, listClientPackages, withClientRuntime, writeClientPackage } from './profile.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
-import { importUploadedBackup } from '../backup-import.js'
+import { demoImportArchiveName, importUploadedBackup } from '../backup-import.js'
 import { readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import { assertRestoreImpact, backupMemberBlockers, describeRestore } from './restore-preview.js'
 import { VersionLockStore } from './version-locks.js'
@@ -220,6 +220,8 @@ export class DemoGameAdapter implements GameAdapter {
       case 'rollback-mod-config': return this.#changeModConfig(input, report, true)
       case 'create-client-package': return this.#createClientPackage(report)
       case 'prepare-first-world': throw new GameAdapterError('WINDOWS_REQUIRED', '重新准备首次建图需要实际 Windows 服务器。')
+      case 'prepare-existing-server':
+      case 'adopt-existing-server': throw new GameAdapterError('WINDOWS_REQUIRED', '接入已有服务器需要实际 Windows 主机。')
       case 'prepare-steamcmd':
       case 'install-server': throw new GameAdapterError('WINDOWS_REQUIRED', '首次安装需要 Windows 服务器。')
     }
@@ -231,7 +233,7 @@ export class DemoGameAdapter implements GameAdapter {
     const filePath = this.#downloads.get(key)
     if (!filePath) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested download does not exist.')
     await fs.access(filePath)
-    return { path: filePath, fileName: path.basename(filePath), contentType: 'application/zip' }
+    return { path: filePath, fileName: `${id}.zip`, contentType: 'application/zip' }
   }
 
   #log(level: LogEntry['level'], message: string): void {
@@ -307,17 +309,7 @@ export class DemoGameAdapter implements GameAdapter {
     const existing = this.#backups.findIndex((item) => item.id === backup.id)
     if (existing >= 0) this.#backups[existing] = backup
     else this.#backups.push(backup)
-    const sourceRoot = path.join(this.#config.game.backupDirectory, backup.id)
-    await fs.mkdir(path.join(this.#config.dataDirectory, 'demo-downloads'), { recursive: true })
-    const filePath = path.join(this.#config.dataDirectory, 'demo-downloads', `${backup.id}.zip`)
-    const archiveExists = await fs.access(filePath).then(() => true, () => false)
-    if (!archiveExists) {
-      await writeStoredZip(filePath, [
-        { name: 'manifest.json', data: await fs.readFile(path.join(sourceRoot, 'manifest.json')) },
-        ...await Promise.all(backup.members.map(async (member) => ({ name: member, data: await fs.readFile(path.join(sourceRoot, member)) }))),
-      ])
-    }
-    this.#downloads.set(`backup:${backup.id}`, filePath)
+    this.#downloads.set(`backup:${backup.id}`, path.join(this.#config.game.backupDirectory, backup.id, demoImportArchiveName))
     this.#log('info', `Imported backup ${backup.id}.`)
     return result
   }

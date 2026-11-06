@@ -258,19 +258,21 @@ describe('background runtime monitoring', () => {
     expect(f.open().status().recovery.blockedReason).toMatch(/3 次/)
   })
 
-  it.each([false, true])('does not restart after first installation reuses earlier recovery state (failed: %s)', async failed => {
+  it.each([
+    ['install-server', false], ['install-server', true], ['adopt-existing-server', false], ['adopt-existing-server', true],
+  ] as const)('does not restart after %s with earlier recovery intent (failed: %s)', async (action, failed) => {
     const f = await fixture()
     await f.monitor.sample()
     f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
     expect(f.monitor.status().recovery.wantedRunning).toBe(true)
     f.current.state = 'stopped'; f.current.pid = null
-    if (failed) f.setFailAction('install-server')
-    f.queue.enqueue({ requestId: 'first-install', action: 'install-server', input: { gameUser: 'FixtureUser' } })
+    if (failed) f.setFailAction(action)
+    f.queue.enqueue({ requestId: 'attach-or-install', action, input: action === 'install-server' ? { gameUser: 'FixtureUser' } : { planId: 'fixture-plan' } })
     await f.idle()
     await f.monitor.close()
     const reopened = f.open()
     await reopened.sample(); f.advance(120_000); await reopened.sample(); await f.idle()
-    expect(f.calls.map(call => call.action)).toEqual(['install-server'])
+    expect(f.calls.map(call => call.action)).toEqual([action])
     if (failed) {
       expect(reopened.status().recovery.blockedReason).not.toBeNull()
       expect(reopened.status().recovery.wantedRunning).toBe(true)

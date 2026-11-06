@@ -58,6 +58,7 @@ export class JobStore {
         result_json TEXT
       );
       CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS jobs_current ON jobs((state = 'running') DESC) WHERE state IN ('running', 'queued');
     `)
   }
 
@@ -117,6 +118,15 @@ export class JobStore {
   findByRequestId(requestId: string): Job | null {
     const row = this.#rowByRequestId(requestId)
     return row ? rowToJob(row) : null
+  }
+
+  current(): Job | null {
+    // rowid follows insertion order even when multiple requests share a timestamp.
+    const row = this.#database.prepare(`
+      SELECT * FROM jobs WHERE state IN ('running', 'queued')
+      ORDER BY (state = 'running') DESC, rowid ASC LIMIT 1
+    `).get() ?? this.#database.prepare('SELECT * FROM jobs ORDER BY rowid DESC LIMIT 1').get()
+    return row ? rowToJob(row as unknown as JobRow) : null
   }
 
   list({ action, state, before, limit = 200 }: JobHistoryQuery = {}): Job[] {

@@ -117,6 +117,10 @@ jobs:
         shell: powershell
         run: .\scripts\tests\first-world.fixture.ps1
 
+      - name: Exercise existing-server adoption with mocked Windows tasks
+        shell: powershell
+        run: .\scripts\tests\existing-server.fixture.ps1
+
       - name: Exercise first-install task collision handling
         shell: powershell
         run: .\scripts\tests\first-install-task.fixture.ps1

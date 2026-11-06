@@ -40,7 +40,7 @@ async function fixture(options: { freshStorage?: boolean } = {}) {
   await write(path.join(releaseRoot, 'release-manifest.json'), JSON.stringify({ schema: 1, product: 'dyson-control', packageVersion: '0.1.10', kind: 'complete', bridge: { dll: 'dist/bridge/DysonControlBridge.dll', manifest: 'dist/bridge/bridge-manifest.json', pluginVersion: '0.1.10', bytes: manifest.dll.bytes, sha256: manifest.dll.sha256 } }))
   const host = { taskExists: false, running: false, gameUsers: [{ name: 'FixtureUser', activeSteam: true }] }
   let configureFails = false, leaveTask = false, mismatch = false, addedTask = false
-  const runScript = vi.fn(async (name: string) => {
+  const runScript = vi.fn(async (name: string, _input?: Record<string, unknown>): Promise<unknown> => {
     if (name === 'inspect-server-setup.ps1') return { ...host }
     if (name === 'configure-new-server.ps1') {
       // configure-game.ps1 reads both directories before it can prepare Windows access.
@@ -195,6 +195,103 @@ it('distinguishes the executing installation from a nonterminal record after res
     expect((await f.reopen().status('owner')).lastInstallation).toEqual({ ...live, state: 'incomplete' })
     expect(f.run).toHaveBeenCalledOnce()
   } finally { resume(); await installing }
+})
+
+async function existingFixture() {
+  const f = await fixture()
+  await fs.mkdir(f.config.dataDirectory, { recursive: true })
+  await write(path.join(f.config.game.root, 'DSPGAME.exe'), 'EXISTING SERVER')
+  await f.installMods(f.config.game.root)
+  await fs.unlink(f.config.game.steam!.executable)
+  for (const ext of ['server', 'moddsv']) await write(path.join(f.config.game.saveDirectory, 'existing.' + ext), 'PRESERVE ' + ext)
+  const original = f.runScript.getMockImplementation()!
+  const calls: Record<string, unknown>[] = []
+  let outcome: unknown, duringApply: (() => Promise<void>) | undefined
+  f.runScript.mockImplementation(async (name, input) => {
+    if (name !== 'configure-existing-server.ps1') return original(name, input)
+    calls.push(input!)
+    if (input!.mode === 'prepare') {
+      await fs.mkdir(path.join(f.config.dataDirectory, 'existing-server', String(input!.planId)), { recursive: true })
+      return { prepared: true, targetChanged: false, reviewHash: sha('review'), bridgeSha256: f.manifest.dll.sha256,
+        bridgeDll: 'replace', bridgeConfig: 'create', secret: 'retain', startup: 'retain', accessChanges: 4, existingAccessChecks: 1, privateDetail: f.root }
+    }
+    if (duringApply) await duringApply()
+    if (outcome instanceof Error) throw outcome
+    if (outcome !== undefined) return outcome
+    f.host.taskExists = true
+    return { configured: true, taskStarted: false, savesMoved: false, taskName: f.config.game.startTaskName, bridgeSha256: f.manifest.dll.sha256 }
+  })
+  return { ...f, calls, result: (value: unknown) => { outcome = value }, setDuringApply: (hook: () => Promise<void>) => { duringApply = hook } }
+}
+const noop = () => {}
+const signal = () => new AbortController().signal
+
+it('previews and adopts an existing game without SteamCMD, creating a single-use receipt and preserving the full save set', async () => {
+  const f = await existingFixture()
+  expect(await f.manager.status('owner')).toMatchObject({ steamReady: false, targetEmpty: false, existingServer: { canPrepare: true, plan: null } })
+  const prepared = await f.manager.prepareExisting('FixtureUser', noop, signal())
+  const preview = (await f.reopen().status('owner')).existingServer.plan!
+  expect(prepared).toEqual({ prepared: true, plan: preview })
+  expect(preview).toEqual({ id: expect.any(String), createdAt: expect.any(String), gameUser: 'FixtureUser', state: 'prepared',
+    bridgeSha256: f.manifest.dll.sha256, bridgeDll: 'replace', bridgeConfig: 'create', secret: 'retain', startup: 'retain', accessChanges: 4, existingAccessChecks: 1 })
+  expect(f.host.taskExists).toBe(false)
+  const result = await f.reopen().adoptExisting(preview.id, noop, signal())
+  expect(result).toEqual({ adopted: true, planId: preview.id, savesMoved: false, gameStarted: false })
+  expect(await f.reopen().status('owner')).toMatchObject({ existingServer: { canPrepare: false, plan: { state: 'adopted' } } })
+  await expect(f.manager.adoptExisting(preview.id, noop, signal())).rejects.toMatchObject({ code: 'ADOPT_PLAN_UNAVAILABLE' })
+  expect(f.calls.map(call => call.mode)).toEqual(['prepare', 'apply'])
+  expect(f.calls[1]?.reviewHash).toBe(sha('review'))
+  expect(JSON.stringify(f.calls)).not.toContain(f.config.adminPasswordHash)
+  for (const [ext, bytes] of [['dsv', 'UNRELATED SAVE'], ['server', 'PRESERVE server'], ['moddsv', 'PRESERVE moddsv']]) {
+    expect(await fs.readFile(path.join(f.config.game.saveDirectory, 'existing.' + ext), 'utf8')).toBe(bytes)
+  }
+  expect(await fs.readdir(f.config.game.root)).not.toContain('.dyson-first-world.json')
+  expect(f.run).not.toHaveBeenCalled()
+})
+
+it.each(['reference', 'restore', 'task', 'user'] as const)('consumes an adoption preview when %s changes before apply', async change => {
+  const f = await existingFixture()
+  await f.manager.prepareExisting('FixtureUser', noop, signal())
+  const id = (await f.manager.status('owner')).existingServer.plan!.id
+  if (change === 'reference') await write(path.join(f.config.game.root, references.NebulaModel!), 'CHANGED')
+  if (change === 'restore') await fs.mkdir(path.join(f.config.dataDirectory, 'save-restore', 'active'), { recursive: true })
+  if (change === 'task') f.host.taskExists = true
+  if (change === 'user') f.host.gameUsers[0]!.activeSteam = false
+  await expect(f.manager.adoptExisting(id, noop, signal())).rejects.toThrow()
+  expect(f.calls.map(call => call.mode)).toEqual(['prepare'])
+  expect((await f.reopen().status('owner')).existingServer.plan?.state).toBe('stale')
+  await expect(f.manager.adoptExisting(id, noop, signal())).rejects.toMatchObject({ code: 'ADOPT_PLAN_UNAVAILABLE' })
+})
+
+it('invalidates superseded and Windows target-drifted plans and preserves successful review contents', async () => {
+  const f = await existingFixture()
+  await f.manager.prepareExisting('FixtureUser', noop, signal())
+  const old = (await f.manager.status('owner')).existingServer.plan!.id
+  await f.manager.prepareExisting('FixtureUser', noop, signal())
+  const current = (await f.manager.status('owner')).existingServer.plan!.id
+  expect(current).not.toBe(old)
+  await expect(f.manager.adoptExisting(old, noop, signal())).rejects.toMatchObject({ code: 'ADOPT_PLAN_UNAVAILABLE' })
+  f.result({ errorCode: 'ADOPT_PLAN_CHANGED' })
+  await expect(f.manager.adoptExisting(current, noop, signal())).rejects.toMatchObject({ code: 'ADOPT_PLAN_CHANGED' })
+  expect((await f.reopen().status('owner')).existingServer.plan?.state).toBe('stale')
+  expect(f.host.taskExists).toBe(false)
+})
+
+it('reports an interrupted or unconfirmed adoption without exposing private errors or running a second apply', async () => {
+  const f = await existingFixture()
+  await f.manager.prepareExisting('FixtureUser', noop, signal())
+  const id = (await f.manager.status('owner')).existingServer.plan!.id
+  f.setDuringApply(async () => {
+    expect((await f.manager.status('owner')).existingServer.plan?.state).toBe('applying')
+    expect((await f.reopen().status('owner')).existingServer.plan?.state).toBe('needs-review')
+    await expect(f.reopen().adoptExisting(id, noop, signal())).rejects.toMatchObject({ code: 'ADOPT_PLAN_UNAVAILABLE' })
+  })
+  f.result(new Error(f.root + ' private diagnostics'))
+  const report = vi.fn()
+  await expect(f.manager.adoptExisting(id, report, signal())).rejects.toMatchObject({ code: 'ADOPT_CONFIG_FAILED', message: expect.not.stringContaining(f.root) })
+  expect((await f.manager.status('owner')).existingServer.plan?.state).toBe('needs-review')
+  expect(JSON.stringify(report.mock.calls)).not.toContain(f.root)
+  expect(f.calls.filter(call => call.mode === 'apply')).toHaveLength(1)
 })
 
 it('reads the latest legacy record by start time without changing it or returning private fields', async () => {

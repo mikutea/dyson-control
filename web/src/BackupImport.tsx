@@ -41,7 +41,8 @@ export function BackupImport({ onJob }: { onJob: (job: Job) => void }) {
 
   return <Panel title="导入备份" icon={<Upload />}>
     <div className="backup-import">
-      <p>选择从 Dyson Control 下载的备份 ZIP。导入后可在备份列表中选择恢复。</p>
+      <p>可上传 Dyson Control 备份，或把同名的 <code>.dsv</code>、<code>.server</code> 和已有的 <code>.moddsv</code> 压成 ZIP。普通存档组应放在 ZIP 根目录或同一个一级文件夹内。</p>
+      <p>导入后可在备份列表中预览恢复。只有确认恢复后才会写入游戏存档。</p>
       <div className="backup-import-controls">
         <label className="backup-file"><span>备份文件</span><input ref={input} type="file" accept=".zip,application/zip" disabled={busy} onChange={(event) => {
           setFile(event.target.files?.[0] ?? null)

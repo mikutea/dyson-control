@@ -98,7 +98,7 @@ function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; o
     : formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])
 
   if (!open) return (
-    <button className="job-chip" onClick={() => onOpen(true)}>
+    <button className="job-chip" aria-expanded="false" onClick={() => onOpen(true)}>
       {working ? <span className="job-spinner" /> : <StatusDot state={tone} />}
       <span>{actionLabels[job.action]} · {jobStateLabels[job.state]}</span>
       <ChevronRight />
@@ -108,7 +108,7 @@ function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; o
   return (
     <aside className="job-dock" aria-live="polite">
       <header>
-        <div>{working ? <span className="job-spinner" /> : <StatusDot state={tone} />}<span>当前操作</span></div>
+        <div>{working ? <span className="job-spinner" /> : <StatusDot state={tone} />}<span>{working ? '当前操作' : '最近操作'}</span></div>
         <button className="icon-button" aria-label="收起" onClick={() => onOpen(false)}><X /></button>
       </header>
       <div className="job-main">

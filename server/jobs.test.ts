@@ -1,7 +1,7 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { GameAdapter, Job } from '../shared/contracts.js'
 import { JobQueue, JobStore } from './jobs.js'
 
@@ -9,6 +9,31 @@ const temporaryDirectories: string[] = []
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true, force: true })))
+})
+
+describe('current job', () => {
+  it('prefers the running job, then the oldest waiting job, then the newest submission even with tied timestamps', () => {
+    const store = new JobStore(':memory:')
+    const time = vi.spyOn(Date.prototype, 'toISOString').mockReturnValue('2025-03-01T08:00:00.000Z')
+    try {
+      expect(store.current()).toBeNull()
+      const first = store.create({ requestId: 'first', action: 'save', input: {} }).job
+      const second = store.create({ requestId: 'second', action: 'backup', input: {} }).job
+      const third = store.create({ requestId: 'third', action: 'stop', input: {} }).job
+      expect(store.current()).toEqual(first)
+      // Even if the running job is not the oldest outstanding row, it wins.
+      const active = store.start(second.id)
+      expect(store.current()).toEqual(active)
+      const progress = store.addStep(second.id, 'fixture progress')
+      expect(store.current()).toEqual(progress)
+      store.finish(second.id, 'succeeded', 'fixture result', null)
+      expect(store.current()).toEqual(first)
+      store.interruptQueued(first.id, 'fixture shutdown')
+      expect(store.current()).toEqual(third)
+      const final = store.interruptQueued(third.id, 'fixture shutdown')
+      expect(store.current()).toEqual(final)
+    } finally { time.mockRestore(); store.close() }
+  })
 })
 
 describe('durable job startup recovery', () => {

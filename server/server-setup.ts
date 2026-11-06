@@ -4,6 +4,8 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
 import type { ControlConfig, FirstInstallationAttempt, ReportStep, ServerSetupStatus } from '../shared/contracts.js'
+import { assertScriptOutcome, preparedReview, readExistingPlan, type ExistingPlanRecord } from './existing-server-plan.js'
+import { writeAtomicJson } from './atomic-json.js'
 import { GameAdapterError } from './game/errors.js'
 import { readFirstWorldStatus } from './game/first-world.js'
 import { extractZipBuffer, GameUpdateManager } from './game/updates.js'
@@ -48,10 +50,11 @@ async function hash(file: string): Promise<string> {
   for await (const chunk of createReadStream(file)) digest.update(chunk as Buffer)
   return digest.digest('hex')
 }
-function overlaps(left: string, right: string): boolean {
-  const nested = (a: string, b: string) => { const relative = path.relative(path.resolve(a), path.resolve(b)); return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative)) }
-  return nested(left, right) || nested(right, left)
+function contains(parent: string, child: string): boolean {
+  const relative = path.relative(path.resolve(parent), path.resolve(child))
+  return !path.isAbsolute(relative) && relative !== '..' && !relative.startsWith('..' + path.sep)
 }
+function overlaps(left: string, right: string): boolean { return contains(left, right) || contains(right, left) }
 async function noLinks(target: string): Promise<void> {
   for (let current = path.resolve(target); ; current = path.dirname(current)) {
     const entry = await stat(current)
@@ -93,6 +96,7 @@ export class ServerSetupManager {
   readonly #options: ServerSetupOptions
   readonly #runScript: ScriptRunner
   #activeInstallation: string | null = null
+  #activeAdoption: string | null = null
   readonly #attemptStarts = new Map<string, number>()
   constructor(config: ControlConfig, auth: SteamAuthManager, options: ServerSetupOptions = {}) {
     this.#config = config; this.auth = auth; this.#options = options
@@ -106,10 +110,15 @@ export class ServerSetupManager {
       supported, gameRoot: this.#config.game.root, steamExecutable: executable, accountName: this.#config.game.steam?.accountName ?? '',
       steamReady: false, existingGame: false, targetEmpty: false, bridgeAvailable: false, taskExists: false,
       gameUsers: [], blockers: [], auth: this.auth.status(owner), firstWorld: { state: 'unavailable', message: '' }, lastInstallation: null,
+      existingServer: { canPrepare: false, blockers: [], plan: null },
     }
-    if (!supported) { response.blockers.push('首次安装与 Steam 授权需要 Windows 服务器。'); return response }
+    if (!supported) {
+      response.blockers.push('首次安装与 Steam 授权需要 Windows 服务器。')
+      response.existingServer.blockers.push('接入现有服务器需要 Windows。')
+      return response
+    }
     response.lastInstallation = await this.#lastInstallation()
-    const steam = await stat(executable)
+    const steam = await stat(executable).catch(() => { response.blockers.push('无法读取 SteamCMD 路径，请检查配置。'); return null })
     response.steamReady = !!steam?.isFile() && !steam.isSymbolicLink()
     try {
       response.existingGame = !!await stat(path.join(this.#config.game.root, 'DSPGAME.exe'))
@@ -156,6 +165,19 @@ export class ServerSetupManager {
     if (!host.gameUsers.some(user => user.activeSteam)) response.blockers.push('请先在服务器上登录 Windows，并在该用户下登录拥有游戏的桌面 Steam。')
     try { this.#assertSeparatedPaths() } catch { response.blockers.push('游戏目录必须与面板数据、存档、备份和 SteamCMD 目录分开。') }
     try { await this.#assertStoragePaths() } catch { response.blockers.push('存档或备份路径不是普通目录，请检查配置。') }
+    const existing = response.existingServer
+    try { await this.#checkExistingTarget(hostVerified ? host : null) }
+    catch (error) { existing.blockers.push(error instanceof GameAdapterError ? error.message : '无法读取接入所需的目录，请检查路径和访问权限。') }
+    if (!response.bridgeAvailable) existing.blockers.push('请安装包含匹配 Bridge 的完整面板包。')
+    try {
+      const current = await this.#currentPlan()
+      if (current) {
+        existing.plan = { ...current.plan }
+        if (existing.plan.state === 'applying' && this.#activeAdoption !== existing.plan.id) existing.plan.state = 'needs-review'
+      }
+    } catch { existing.blockers.push('无法读取现有服务器的接入记录，请检查面板数据目录。') }
+    if (this.#activeAdoption) existing.blockers.push('接入任务正在执行。')
+    existing.canPrepare = existing.blockers.length === 0
     return response
   }
 
@@ -280,11 +302,7 @@ export class ServerSetupManager {
     const saveRecord = async (stage?: z.infer<typeof receiptSchema>['stage']) => {
       if (stage) record.stage = stage
       record.updatedAt = new Date().toISOString()
-      const temporary = path.join(operation, `installation-${randomUUID()}.partial`)
-      try {
-        await fs.writeFile(temporary, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
-        await fs.rename(temporary, path.join(operation, 'installation.json'))
-      } finally { await fs.rm(temporary, { force: true }).catch(() => undefined) }
+      await writeAtomicJson(path.join(operation, 'installation.json'), record)
     }
     let promoted = false
     this.#activeInstallation = id
@@ -318,12 +336,7 @@ export class ServerSetupManager {
         await manager.installComponent('nebula', undefined, report, signal)
       }
       await saveRecord('checking-bridge')
-      for (const reference of bridge.manifest.references) {
-        const target = path.join(stagedGame, ...reference.file.replaceAll('\\', '/').split('/'))
-        await noLinks(target)
-        const entry = await stat(target)
-        if (!entry?.isFile() || entry.size !== reference.bytes || await hash(target) !== reference.sha256) fail('SETUP_BRIDGE_INCOMPATIBLE', '下载的游戏或模组与本安装包的 Bridge 编译依据不一致。文件已保留，请使用匹配的完整安装包。')
-      }
+      await this.#checkReferences(stagedGame, bridge.manifest.references)
       await saveRecord('configuring')
       report('游戏与 Bridge 依赖校验通过，正在配置首次启动。')
       await fs.writeFile(path.join(stagedGame, '.dyson-first-world.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: id }) + '\n', { flag: 'wx' })
@@ -371,6 +384,144 @@ export class ServerSetupManager {
       if (error instanceof GameAdapterError) throw error
       fail('SETUP_FAILED', '首次安装未完成，现有文件已保留。请在“安装与授权”核对安装记录和启动任务。')
     } finally { this.#activeInstallation = null }
+  }
+
+  async #checkReferences(root: string, references: z.infer<typeof bridgeManifestSchema>['references']) {
+    for (const reference of references) {
+      const target = path.join(root, ...reference.file.replaceAll('\\', '/').split('/'))
+      await noLinks(target)
+      const entry = await stat(target)
+      if (!entry?.isFile() || entry.size !== reference.bytes || await hash(target) !== reference.sha256) {
+        fail('SETUP_BRIDGE_INCOMPATIBLE', '游戏或模组与本安装包的 Bridge 编译依据不一致，请使用匹配的完整安装包。')
+      }
+    }
+  }
+
+  get #planDirectory() { return path.join(this.#config.dataDirectory, 'existing-server') }
+  async #currentPlan(): Promise<ExistingPlanRecord | null> {
+    await noLinks(path.join(this.#planDirectory, 'current.json'))
+    const record = await readExistingPlan(this.#planDirectory)
+    if (record?.plan.state === 'prepared' && await stat(path.join(this.#planDirectory, record.plan.id, 'claimed'))) {
+      // A crash can occur between claiming a plan and publishing its next state.
+      record.plan.state = 'needs-review'
+    }
+    return record
+  }
+  async #savePlan(record: ExistingPlanRecord): Promise<void> {
+    try { await writeAtomicJson(path.join(this.#planDirectory, 'current.json'), record) }
+    catch { fail('ADOPT_PLAN_WRITE_FAILED', '无法保存接入记录，请检查面板存储和 Windows 任务状态。') }
+  }
+  async #checkExistingTarget(host: HostStatus | null, user?: string): Promise<void> {
+    const { game, dataDirectory } = this.#config
+    const exe = path.join(game.root, 'DSPGAME.exe')
+    await noLinks(exe)
+    const entry = await stat(exe)
+    if (!entry?.isFile() || !entry.size) fail('ADOPT_GAME_MISSING', '请先配置已安装的 DSP/Nebula 游戏目录。')
+    if (!host || typeof host.running !== 'boolean' || typeof host.taskExists !== 'boolean' || !Array.isArray(host.gameUsers)) fail('ADOPT_HOST_UNKNOWN', '未能确认 Windows 游戏进程和启动任务，请检查面板服务权限。')
+    if (host.taskExists) fail('ADOPT_TASK_EXISTS', '已存在同名启动任务，请在 Windows 核对任务归属。')
+    if (host.running) fail('ADOPT_HOST_BUSY', '请先停止已有服务器并确认游戏进程已退出。')
+    if (!host.gameUsers.some(item => item.activeSteam === true && (user === undefined || item.name === user))) fail('ADOPT_STEAM_USER', '请在服务器上登录所选 Windows 用户，并在其交互会话中运行桌面 Steam。')
+    const protectedFolders = [game.bridgeDirectory, path.dirname(game.bridgeSecretFile)]
+    const runtimeFolders = [game.root, game.saveDirectory, game.backupDirectory, path.dirname(game.logFile)]
+    const saveAccess = path.basename(game.saveDirectory).toLowerCase() === 'save' ? path.dirname(game.saveDirectory) : game.saveDirectory
+    const managedDocs = path.join(dataDirectory, 'dyson-control-documents', 'Dyson Sphere Program')
+    const writableFolders = [game.root, saveAccess, path.dirname(game.logFile)]
+    const driveRoot = [dataDirectory, ...runtimeFolders, ...protectedFolders, saveAccess].some(folder => path.dirname(path.resolve(folder)) === path.resolve(folder))
+    const exposesControl = overlaps(game.root, dataDirectory) || writableFolders.some(folder => overlaps(folder, dataDirectory) && !contains(managedDocs, folder))
+    const exposesPrivate = overlaps(game.bridgeDirectory, path.dirname(game.bridgeSecretFile)) || protectedFolders.some(folder =>
+      contains(folder, dataDirectory) || [...runtimeFolders, saveAccess].some(runtimeFolder => overlaps(runtimeFolder, folder)))
+    if (driveRoot || exposesControl || exposesPrivate) {
+      fail('ADOPT_PATH_UNSAFE', '接入目录不能是磁盘根目录。请将游戏、存档和备份与 Bridge 通信、密钥目录分开。')
+    }
+    await noLinks(dataDirectory)
+    if (!(await stat(dataDirectory))?.isDirectory()) fail('ADOPT_STORAGE_INVALID', '面板数据目录必须存在并可读取。')
+    for (const target of [game.bridgeDirectory, game.bridgeSecretFile, path.dirname(game.logFile),
+      path.join(game.root, 'BepInEx', 'plugins', 'dyson-control', 'DysonControlBridge.dll'),
+      path.join(game.root, 'BepInEx', 'config', 'net.miyuo.dyson-control.bridge.cfg'), path.join(dataDirectory, 'game-startup', 'settings.json')]) {
+      await noLinks(target)
+    }
+    for (const folder of [game.saveDirectory, game.backupDirectory]) {
+      await noLinks(folder)
+      if (!(await stat(folder))?.isDirectory()) fail('ADOPT_STORAGE_INVALID', '配置的已有存档和备份目录必须存在并可读取。')
+    }
+    const restore = path.join(dataDirectory, 'save-restore', 'active')
+    await noLinks(restore)
+    if (await stat(restore)) fail('ADOPT_RESTORE_ACTIVE', '存在尚未完成的存档恢复，请先完成恢复。')
+  }
+  async #existingInputs(gameUser: string, signal: AbortSignal) {
+    this.#assertWindows()
+    signal.throwIfAborted()
+    await this.#checkExistingTarget(await this.#host().catch(() => null), gameUser)
+    const bridge = await this.#bridge().catch(() => fail('ADOPT_BRIDGE_INVALID', '接入需要包含匹配 Bridge 的完整面板包。'))
+    await this.#checkReferences(this.#config.game.root, bridge.manifest.references)
+    const { root, saveDirectory, backupDirectory, logFile, bridgeDirectory, bridgeSecretFile, startTaskName } = this.#config.game
+    const config = { dataDirectory: this.#config.dataDirectory, game: { root, saveDirectory, backupDirectory, logFile, bridgeDirectory, bridgeSecretFile, startTaskName } }
+    const binding = createHash('sha256').update(JSON.stringify([config, gameUser, bridge.manifest])).digest('hex')
+    signal.throwIfAborted()
+    return { config, gameUser, bridgeDirectory: bridge.directory, bridgeSha256: bridge.manifest.dll.sha256, references: bridge.manifest.references, binding }
+  }
+  async #existingScript(input: unknown, signal: AbortSignal): Promise<unknown> {
+    const output = await this.#runScript<unknown>('configure-existing-server.ps1', input, signal, 4 * 60_000)
+      .catch(() => fail('ADOPT_CONFIG_FAILED', 'Windows 配置器未返回可确认的结果，请核对游戏目录和启动任务。'))
+    assertScriptOutcome(output)
+    return output
+  }
+
+  async prepareExisting(gameUser: string, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    try {
+      this.#assertWindows()
+      if (this.#activeAdoption) fail('ADOPT_BUSY', '接入任务正在执行。')
+      await this.#currentPlan() // Never overwrite unreadable evidence.
+      const id = randomUUID()
+      report('正在核对现有服务器与 Bridge 的九项编译依赖。')
+      const { binding, ...input } = await this.#existingInputs(gameUser, signal)
+      const response = preparedReview.safeParse(await this.#existingScript({ mode: 'prepare', planId: id, ...input }, signal))
+      if (!response.success || response.data.bridgeSha256 !== input.bridgeSha256) fail('ADOPT_PREVIEW_UNCONFIRMED', '未能确认预览结果，请检查 Windows 配置。')
+      const { reviewHash, prepared: _prepared, targetChanged: _targetChanged, ...summary } = response.data
+      const record: ExistingPlanRecord = { schema: 1, binding, reviewHash, plan: { id, createdAt: new Date().toISOString(), gameUser, state: 'prepared', ...summary } }
+      signal.throwIfAborted()
+      await this.#savePlan(record)
+      report('变更预览已生成，请在“安装与授权”审查后确认接入。')
+      return { prepared: true, plan: record.plan }
+    } catch (error) {
+      if (error instanceof GameAdapterError) throw error
+      fail('ADOPT_PREVIEW_FAILED', '未能生成接入预览，请检查游戏文件、用户和本机存储权限。')
+    }
+  }
+
+  async adoptExisting(planId: string, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    this.#assertWindows()
+    const record = await this.#currentPlan().catch(() => fail('ADOPT_PLAN_UNREADABLE', '无法读取接入预览，请核对面板存储。'))
+    if (!record || record.plan.id !== planId || record.plan.state !== 'prepared') fail('ADOPT_PLAN_UNAVAILABLE', '这个接入预览已失效或已使用，请核对最近的接入记录。')
+    signal.throwIfAborted()
+    const claim = path.join(this.#planDirectory, planId, 'claimed')
+    await noLinks(claim)
+    await fs.writeFile(claim, 'claimed\n', { flag: 'wx', mode: 0o600 }).catch(() => fail('ADOPT_PLAN_UNAVAILABLE', '此计划不能再次使用，请核对最近的接入记录。'))
+    let configuring = false
+    this.#activeAdoption = planId
+    try {
+      record.plan.state = 'applying'
+      await this.#savePlan(record)
+      report('正在复核游戏依赖、预览目标与启动任务。')
+      const { binding, ...input } = await this.#existingInputs(record.plan.gameUser, signal)
+      if (binding !== record.binding) fail('ADOPT_PLAN_CHANGED', '预览后服务器配置或完整包发生变化，请重新生成预览。')
+      configuring = true
+      const result = z.object({ configured: z.literal(true), taskStarted: z.literal(false), savesMoved: z.literal(false), taskName: z.literal(this.#config.game.startTaskName), bridgeSha256: z.literal(input.bridgeSha256) })
+        .safeParse(await this.#existingScript({ mode: 'apply', planId, reviewHash: record.reviewHash, ...input }, signal))
+      if (!result.success) fail('ADOPT_RESULT_UNKNOWN', 'Windows 配置结果未能确认，请核对接入任务。')
+      const host = await this.#host()
+      if (host.taskExists !== true || host.running !== false) fail('ADOPT_RESULT_UNKNOWN', '未能确认启动任务已就绪且游戏保持停止，请人工核对。')
+      signal.throwIfAborted()
+      record.plan.state = 'adopted'
+      await this.#savePlan(record)
+      report('启动任务已配置，存档保留在原处。可从概览手动启动。')
+      return { adopted: true, planId, gameStarted: false, savesMoved: false }
+    } catch (error) {
+      record.plan.state = !configuring || (error instanceof GameAdapterError && error.code === 'ADOPT_PLAN_CHANGED') ? 'stale' : 'needs-review'
+      await this.#savePlan(record).catch(() => undefined)
+      if (error instanceof GameAdapterError) throw error
+      fail('ADOPT_RESULT_UNKNOWN', '接入未完成，请检查变更记录和游戏任务，确认后再生成新的预览。')
+    } finally { this.#activeAdoption = null }
   }
 
   #assertWindows(): void {

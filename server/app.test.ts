@@ -27,6 +27,36 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('authenticates the single current-job snapshot and keeps a queued submission behind the running job', async () => {
+    const f = await createFixture()
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    f.adapter.run = async (action, _input, report) => {
+      if (action === 'save') { report('fixture active'); await pending }
+      return { action }
+    }
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const url = '/api/jobs/current'
+      expect((await app.inject({ url })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      const headers = { cookie }
+      expect((await app.inject({ url: url + '?limit=200', headers })).statusCode).toBe(400)
+      const empty = await app.inject({ url, headers })
+      expect(empty.json()).toEqual({ data: null })
+      expect(empty.headers['cache-control']).toBe('no-store')
+      const submit = (action: Action) => app.inject({ method: 'POST', url: '/api/actions', headers,
+        payload: { action, requestId: 'dock-' + action, input: {} } })
+      const first: Job = (await submit('save')).json().data
+      const second: Job = (await submit('backup')).json().data
+      expect((await app.inject({ url, headers })).json().data).toMatchObject({ id: first.id, state: 'running', message: 'fixture active' })
+      expect((await app.inject({ url: '/api/jobs/by-request/dock-backup', headers })).json().data).toMatchObject({ id: second.id, state: 'queued' })
+      release()
+      await waitForJobs(app, cookie, 2)
+      expect((await app.inject({ url, headers })).json().data).toMatchObject({ id: second.id, state: 'succeeded' })
+    } finally { release(); await app.close() }
+  })
+
   it('finds older filtered jobs and pages past a tied timestamp even when a new job arrives', async () => {
     const f = await createFixture()
     const databasePath = join(f.directory, 'history.sqlite')
@@ -214,6 +244,8 @@ describe('Dyson Control API', () => {
       status: async () => { throw new Error('Not needed') },
       prepareSteam: async report => { calls.push('prepare'); report('fixture preparation'); await gate; return { prepared: true } },
       install: async () => { calls.push('install'); return { installed: true, gameStarted: false } },
+      prepareExisting: async () => { throw new Error('Unexpected existing-server preview') },
+      adoptExisting: async () => { throw new Error('Unexpected existing-server apply') },
     } })
     await app.ready()
     try {
@@ -231,6 +263,44 @@ describe('Dyson Control API', () => {
       const jobs = (await app.inject({ method: 'GET', url: '/api/jobs', headers: { cookie } })).json().data
       expect(jobs).toHaveLength(2)
       expect(jobs.every((job: Job) => job.state === 'succeeded')).toBe(true)
+    } finally { release(); await app.close() }
+  })
+
+  it('queues typed existing-server preview and apply requests once under administrator authentication', async () => {
+    const f = await createFixture()
+    const calls: string[] = []
+    const planId = randomUUID()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:', serverSetup: {
+      status: async () => { throw new Error('Unused setup read') },
+      prepareSteam: async () => { throw new Error('Unexpected Steam setup') },
+      install: async () => { throw new Error('Unexpected fresh install') },
+      prepareExisting: async user => { calls.push(`preview:${user}`); await gate; return { prepared: true, plan: { id: planId } } },
+      adoptExisting: async id => { calls.push(`apply:${id}`); return { adopted: true, planId: id, gameStarted: false, savesMoved: false } },
+    } })
+    try {
+      const preview = { requestId: 'adopt-preview', action: 'prepare-existing-server', input: { gameUser: 'FixtureUser' } }
+      const apply = { requestId: 'adopt-apply', action: 'adopt-existing-server', input: { planId } }
+      expect((await app.inject({ method: 'POST', url: '/api/actions', payload: preview })).statusCode).toBe(401)
+      const headers = { cookie: await loginCookie(app) }
+      const submit = (payload: Record<string, unknown>) => app.inject({ method: 'POST', url: '/api/actions', headers, payload })
+      expect((await app.inject({ method: 'POST', url: '/api/actions', headers: { ...headers, origin: 'https://other.example.test' }, payload: apply })).statusCode).toBe(403)
+      for (const payload of [{ ...preview, input: { gameUser: 'FixtureUser', configPath: 'foreign' } }, { ...apply, input: { planId: '../outside' } }]) {
+        expect((await submit(payload)).statusCode).toBe(400)
+      }
+      const first = await submit(preview)
+      expect(first.statusCode).toBe(202)
+      expect((await submit(preview)).json().data.id).toBe(first.json().data.id)
+      const second = await submit(apply)
+      expect(second.statusCode).toBe(202)
+      expect((await submit(apply)).json().data.id).toBe(second.json().data.id)
+      expect(calls).toEqual(['preview:FixtureUser'])
+      release()
+      const jobs = await waitForJobs(app, headers.cookie, 2)
+      expect(jobs.find(job => job.action === 'adopt-existing-server')?.result).toMatchObject({ gameStarted: false, savesMoved: false })
+      expect(calls).toEqual(['preview:FixtureUser', `apply:${planId}`])
+      expect(f.adapter.calls).toHaveLength(0)
     } finally { release(); await app.close() }
   })
 
