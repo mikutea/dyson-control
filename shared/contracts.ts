@@ -120,6 +120,12 @@ export interface GameSettings {
 export interface GameSettingsHistoryEntry {
   id: string; createdAt: string; operation: 'write' | 'rollback'; settings: GameSettings
 }
+export type ServerSettingKey = Exclude<keyof GameSettings, 'readOnlyFields'>
+export interface SettingsRollbackPreview {
+  historyId: string; expectedRevision: string; canRollback: boolean
+  fields: Array<{ key: ServerSettingKey; current: string | number | null; selected: string | number | null
+    effect: 'panel' | 'client-packages' | 'backup-retention' | 'next-start' | 'demo' | 'read-only' }>
+}
 export interface VersionLock { package: string; version: string; lockedAt: string }
 export interface RuntimeSettings {
   backupEveryMinutes: number; autoRestart: boolean; minimumFreeDiskGiB: number; minimumUps: number
@@ -229,6 +235,7 @@ export interface GameAdapter {
   restorePreview(backupId: string): Promise<BackupRestorePreview>
   settings(): Promise<GameSettings>
   settingsHistory(): Promise<GameSettingsHistoryEntry[]>
+  settingsRollbackPreview(historyId: string): Promise<SettingsRollbackPreview>
   clientPackages(): Promise<ClientPackage[]>
   clientPackagePlan?(): Promise<ClientPackagePlan>
   clientPackageDetails?(id: string): Promise<ClientPackageDetails>

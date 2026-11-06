@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { GameSettings } from '../../shared/contracts.js'
-import { SettingsHistoryManager, settingsHistoryLimit } from './settings-history.js'
+import { describeSettingsRollback, SettingsHistoryManager, settingsHistoryLimit } from './settings-history.js'
 
 const temporaryDirectories: string[] = []
 afterEach(async () => {
@@ -24,6 +24,19 @@ async function fixture(): Promise<{ root: string; historyRoot: string; manager: 
 }
 
 describe('server settings history', () => {
+  it('previews a saved schema 1 record without capability metadata using the current task capabilities', async () => {
+    const { manager, historyRoot } = await fixture()
+    const { readOnlyFields: _oldMetadata, ...old } = baseSettings
+    const entry = await manager.snapshot(old, 'write')
+    const file = path.join(historyRoot, entry.id + '.json'), original = await fs.readFile(file)
+    const reopened = await new SettingsHistoryManager({ historyDirectory: historyRoot }).selected(entry.id)
+    expect(reopened.settings.readOnlyFields).toBeUndefined()
+    const current: GameSettings = { ...baseSettings, targetUps: 80, readOnlyFields: ['maxPlayers', 'autosaveMinutes', 'targetUps'] }
+    const preview = describeSettingsRollback(reopened, current, 'windows')
+    expect(preview.canRollback).toBe(false)
+    expect(preview.fields.find(field => field.key === 'targetUps')).toEqual({ key: 'targetUps', current: 80, selected: 60, effect: 'read-only' })
+    expect(await fs.readFile(file)).toEqual(original)
+  })
   it('stores and reads only validated public settings snapshots', async () => {
     const { manager } = await fixture()
     const write = await manager.snapshot(baseSettings, 'write')

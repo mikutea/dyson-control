@@ -9,6 +9,7 @@ import { GameAdapterError, invalidInput } from './errors.js'
 import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { modConfigRollbackPreview, prepareModConfigRollback, prepareModConfigWrite, publicModConfig } from './mod-config.js'
 import { timestampId } from './system.js'
+import { assertSettingsRollback, describeSettingsRollback } from './settings-history.js'
 import { importUploadedBackup } from '../backup-import.js'
 import { exportBackup } from './backup-export.js'
 import { BackupRetention } from './backup-retention.js'
@@ -143,6 +144,14 @@ export class DemoGameAdapter implements GameAdapter {
   async backups(): Promise<Backup[]> { return this.#retention.list() }
   async settings(): Promise<GameSettings> { return structuredClone(this.#settings) }
   async settingsHistory(): Promise<GameSettingsHistoryEntry[]> { return structuredClone(this.#settingsHistory).reverse() }
+  #selectedSettings(id: unknown) {
+    const entry = this.#settingsHistory.find(item => item.id === id)
+    if (!entry) throw new GameAdapterError('SETTINGS_HISTORY_NOT_FOUND', '未找到此设置版本。')
+    return entry
+  }
+  async settingsRollbackPreview(historyId: string) {
+    return describeSettingsRollback(this.#selectedSettings(historyId), this.#settings, 'demo')
+  }
   async clientPackages(): Promise<ClientPackage[]> { return listClientPackages(this.#packageDirectory) }
 
   async clientPackagePlan() { return readClientPackagePlan(this.#settings.address, () => this.#clientMods()) }
@@ -233,8 +242,8 @@ export class DemoGameAdapter implements GameAdapter {
       }
       case 'write-settings': return this.#writeSettings(input, report)
       case 'rollback-settings': {
-        const entry = this.#settingsHistory.find(item => item.id === input.historyId)
-        if (!entry) throw new GameAdapterError('SETTINGS_HISTORY_NOT_FOUND', '未找到此设置版本。')
+        const entry = this.#selectedSettings(input.historyId)
+        assertSettingsRollback(describeSettingsRollback(entry, this.#settings, 'demo'), input.expectedRevision)
         return this.#writeSettings({ settings: entry.settings }, report, 'rollback')
       }
       case 'install-update': return this.#installUpdate(input, report)

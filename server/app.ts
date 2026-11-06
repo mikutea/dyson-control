@@ -67,7 +67,7 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'write-mod-config': z.object({ configId: idSchema, content: z.string().max(256 * 1024), expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   'rollback-mod-config': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   'write-settings': z.object({ settings: settingsSchema }).strict(),
-  'rollback-settings': z.object({ historyId: idSchema }).strict(),
+  'rollback-settings': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'create-client-package': emptyObjectSchema,
   'kick-player': z.object({ playerId: z.string().regex(playerIdPattern) }).strict(),
 }
@@ -357,6 +357,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
   app.get('/api/settings', async (request) => { assertNoQuery(request); return data(await adapter.settings()) })
   app.get('/api/settings-history', async request => { assertNoQuery(request); return data(await adapter.settingsHistory()) })
+  app.get('/api/settings-history/:id/rollback-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.settingsRollbackPreview(id))
+  })
   app.get('/api/client-package-plan', async request => {
     assertNoQuery(request)
     if (!adapter.clientPackagePlan) throw new ApiError(501, 'client_plan_unavailable', '当前适配器无法检查客户端包。')
@@ -664,6 +669,7 @@ function gameErrorStatus(code: string): number {
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
   if (code === 'SETTINGS_HISTORY_NOT_FOUND') return 404
+  if (['SETTINGS_ROLLBACK_CHANGED', 'SETTINGS_ROLLBACK_UNAVAILABLE', 'SETTINGS_PREVIEW_INVALID'].includes(code)) return 409
   if (['MOD_NOT_FOUND', 'MOD_REMOVAL_HISTORY_NOT_FOUND'].includes(code)) return 404
   if (['MOD_VERSION_CHANGED', 'MOD_DEPENDENCY_ACTIVE', 'MOD_DEPENDENCY_MISSING', 'MOD_REMOVAL_DESTINATION_EXISTS', 'MOD_REMOVAL_PATH_INVALID', 'MOD_REMOVAL_LIMIT_EXCEEDED', 'MOD_CHANGED'].includes(code)) return 409
   if (['MOD_CONFIG_NOT_FOUND', 'MOD_CONFIG_HISTORY_NOT_FOUND'].includes(code)) return 404

@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
-import type { RecoveryStartReadiness } from '../../shared/contracts.js'
+import type { RecoveryStartReadiness, SettingsRollbackPreview } from '../../shared/contracts.js'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import type {
   Action, Backup, BackupRestorePreview, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameDownload, GameSettings, GameSettingsHistoryEntry,
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModConfigRollbackPreview, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
@@ -25,7 +26,7 @@ import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network
 import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
-import { SettingsHistoryManager } from './settings-history.js'
+import { assertSettingsRollback, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
 import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, timestampId } from './system.js'
 import { GameUpdateManager } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
@@ -44,6 +45,40 @@ interface InspectResult {
 interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
 interface StoredSettings { schema: 1; serverName: string; backupKeep: number; address: string }
 interface StartupSettings { schema: 1; targetUps: number; saveName: string | null }
+interface SettingsFile { bytes: Buffer; sha256: string }
+interface RollbackSettingsState {
+  inspection: InspectResult; stored: StoredSettings; startup: StartupSettings; current: GameSettings; entry: GameSettingsHistoryEntry
+  panelFile: SettingsFile | null; startupFile: SettingsFile; preview: SettingsRollbackPreview
+}
+
+async function readSettingsFile(file: string): Promise<SettingsFile | null> {
+  try {
+    const directory = await fs.lstat(path.dirname(file))
+    if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('Invalid settings directory')
+    const stat = await fs.lstat(file).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (!stat) return null
+    if (!plainRestoreFile(stat) || stat.size > 64 * 1024) throw new Error('Invalid settings file')
+    const handle = await fs.open(file, 'r')
+    try {
+      const opened = await handle.stat()
+      if (!plainRestoreFile(opened) || stat.dev !== opened.dev || stat.ino !== opened.ino) throw new Error('Settings file changed')
+      const bytes = await buffer(handle.createReadStream({ end: stat.size }))
+      const after = await fs.lstat(file)
+      if (bytes.length !== stat.size || !plainRestoreFile(after) || stat.dev !== after.dev || stat.ino !== after.ino ||
+        stat.size !== after.size || stat.ctimeMs !== after.ctimeMs) throw new Error('Settings file changed')
+      return { bytes, sha256: createHash('sha256').update(bytes).digest('hex') }
+    } finally { await handle.close() }
+  } catch (cause) { throw new GameAdapterError('SETTINGS_PREVIEW_INVALID', '无法核对当前设置文件，请检查文件类型、权限和内容后重试。', { cause }) }
+}
+
+async function assertSettingsFile(file: string, expected: string | null) {
+  if (((await readSettingsFile(file))?.sha256 ?? null) !== expected) {
+    throw new GameAdapterError('SETTINGS_ROLLBACK_CHANGED', '设置文件已变化，请重新预览后恢复。')
+  }
+}
 type WindowsScriptRunner = <T>(name: string, input: unknown, signal?: AbortSignal, timeoutMs?: number) => Promise<T>
 interface WindowsAdapterOptions {
   inspect?: () => Promise<InspectResult>
@@ -237,14 +272,17 @@ export class WindowsGameAdapter implements GameAdapter {
     await this.#enforceAutomaticBackupRetention()
   }
 
-  async #replaceJsonFile(filePath: string, value: unknown): Promise<void> {
+  async #replaceJsonFile(filePath: string, value: unknown, expected?: string | null): Promise<void> {
     const existing = await fs.lstat(filePath).catch(() => null)
     if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
       throw new GameAdapterError('SETTINGS_PATH_INVALID', `Settings path is not a plain file: ${filePath}`)
     }
     const temporary = `${filePath}.partial-${randomUUID()}`
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    try { await fs.rename(temporary, filePath) } catch (error) {
+    await fs.writeFile(temporary, Buffer.isBuffer(value) ? value : `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    try {
+      if (expected !== undefined) await assertSettingsFile(filePath, expected)
+      await fs.rename(temporary, filePath)
+    } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => undefined)
       throw error
     }
@@ -476,15 +514,15 @@ export class WindowsGameAdapter implements GameAdapter {
     return this.#settingsForInspection(await this.#inspect())
   }
 
-  #settingsForInspection(inspection: InspectResult): GameSettings {
-    const fallbackTarget = inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? this.#startupSettings.targetUps
+  #settingsForInspection(inspection: InspectResult, stored = this.#settings, startup = this.#startupSettings): GameSettings {
+    const fallbackTarget = inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? startup.targetUps
     return {
-      serverName: this.#settings.serverName,
+      serverName: stored.serverName,
       maxPlayers: null,
-      targetUps: inspection.tasks.startManaged ? this.#startupSettings.targetUps : fallbackTarget,
+      targetUps: inspection.tasks.startManaged ? startup.targetUps : fallbackTarget,
       autosaveMinutes: null,
-      backupKeep: this.#settings.backupKeep,
-      address: this.#settings.address,
+      backupKeep: stored.backupKeep,
+      address: stored.address,
       readOnlyFields: inspection.tasks.startManaged ? ['maxPlayers', 'autosaveMinutes'] : ['maxPlayers', 'targetUps', 'autosaveMinutes']
     }
   }
@@ -492,6 +530,28 @@ export class WindowsGameAdapter implements GameAdapter {
   async settingsHistory(): Promise<GameSettingsHistoryEntry[]> {
     await this.#initialization
     return this.#settingsHistory.history()
+  }
+
+  async #rollbackSettingsState(entry: GameSettingsHistoryEntry): Promise<RollbackSettingsState> {
+    const [inspection, panelFile, startupFile] = await Promise.all([
+      this.#inspect(true), readSettingsFile(this.#settingsPath), readSettingsFile(this.#startupSettingsPath)
+    ])
+    try {
+      if (typeof inspection.tasks?.start !== 'boolean' || typeof inspection.tasks.startManaged !== 'boolean' ||
+        (inspection.tasks.startManaged && !inspection.tasks.start)) throw new Error('Unknown startup task capability')
+      if (!startupFile) throw new Error('Missing startup settings')
+      const stored = panelFile ? validateStoredSettings(JSON.parse(panelFile.bytes.toString('utf8'))) :
+        { schema: 1 as const, serverName: this.#config.game.serverName, backupKeep: 20, address: this.#config.game.address }
+      const startup = validateStartupSettings(JSON.parse(startupFile.bytes.toString('utf8')))
+      const current = this.#settingsForInspection(inspection, stored, startup)
+      return { inspection, stored, startup, current, entry, panelFile, startupFile,
+        preview: describeSettingsRollback(entry, current, 'windows', [panelFile?.sha256 ?? null, startupFile.sha256]) }
+    } catch (cause) { throw new GameAdapterError('SETTINGS_PREVIEW_INVALID', '当前面板或启动设置无效，请检查后重新预览。', { cause }) }
+  }
+
+  async settingsRollbackPreview(historyId: string) {
+    await this.#initialization
+    return (await this.#rollbackSettingsState(await this.#settingsHistory.selected(historyId))).preview
   }
 
   async clientPackages(): Promise<ClientPackage[]> {
@@ -1284,40 +1344,66 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #rollbackSettings(input: Record<string, unknown>, report: ReportStep): Promise<Record<string, unknown>> {
+    report('正在恢复历史服务器设置')
     const selected = await this.#settingsHistory.selected(input.historyId)
-    return this.#applySettings(selected.settings, 'rollback', report, selected.id)
+    const state = await this.#rollbackSettingsState(selected)
+    assertSettingsRollback(state.preview, input.expectedRevision)
+    const target = { ...selected.settings }
+    // Reviewed restores can apply the writable fields while leaving an unmanaged UPS alone.
+    // Older callers keep their all-or-nothing behavior.
+    if (input.expectedRevision !== undefined && !state.inspection.tasks.startManaged) target.targetUps = state.current.targetUps
+    return this.#applySettings(target, 'rollback', report, state)
   }
 
   async #applySettings(
     value: unknown,
     operation: GameSettingsHistoryEntry['operation'],
     report: ReportStep,
-    restoredFromHistoryId?: string
+    rollback?: RollbackSettingsState
   ): Promise<Record<string, unknown>> {
     const settings = validateSettings(value)
-    const inspection = await this.#inspect(true)
+    const inspection = rollback?.inspection ?? await this.#inspect(true)
+    const previousStartup = rollback?.startup ?? this.#startupSettings
     const currentTarget = inspection.tasks.startManaged
-      ? this.#startupSettings.targetUps
-      : inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? this.#startupSettings.targetUps
+      ? previousStartup.targetUps
+      : inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? previousStartup.targetUps
     if (!inspection.tasks.startManaged && settings.targetUps !== currentTarget) {
       throw new GameAdapterError('UNSUPPORTED_SETTING', 'targetUps cannot be changed because the configured start task does not use Dyson Control start-game.ps1.')
     }
-    const previousStored = structuredClone(this.#settings)
+    const previousStored = rollback?.stored ?? this.#settings
     const nextStored: StoredSettings = {
       schema: 1, serverName: settings.serverName, backupKeep: settings.backupKeep, address: settings.address
     }
-    const previousStartup = structuredClone(this.#startupSettings)
-    const nextStartup: StartupSettings = { ...this.#startupSettings, targetUps: settings.targetUps }
-    const previousPublic = this.#settingsForInspection(inspection)
+    const nextStartup: StartupSettings = { ...previousStartup, targetUps: settings.targetUps }
+    const previousPublic = rollback?.current ?? this.#settingsForInspection(inspection)
+    const panelChanged = !rollback || settings.serverName !== previousStored.serverName || settings.address !== previousStored.address || settings.backupKeep !== previousStored.backupKeep
+    const startupChanged = inspection.tasks.startManaged && (!rollback || settings.targetUps !== previousStartup.targetUps)
+    const panelPayload = rollback?.panelFile ? { ...JSON.parse(rollback.panelFile.bytes.toString('utf8')), ...nextStored } : nextStored
+    if (!rollback) report('正在保存服务器设置')
     const history = await this.#settingsHistory.snapshot(previousPublic, operation)
-    report(operation === 'rollback' ? '正在恢复历史服务器设置' : '正在保存服务器设置')
     let storedWritten = false
     try {
-      await this.#replaceJsonFile(this.#settingsPath, nextStored)
-      storedWritten = true
-      if (inspection.tasks.startManaged) await this.#replaceJsonFile(this.#startupSettingsPath, nextStartup)
+      if (rollback) {
+        // Creating the protective snapshot may rotate out the selected oldest entry.
+        const beforeWrite = await this.#rollbackSettingsState(rollback.entry)
+        assertSettingsRollback(beforeWrite.preview, rollback.preview.expectedRevision)
+      }
+      if (panelChanged) {
+        await this.#replaceJsonFile(this.#settingsPath, panelPayload, rollback ? rollback.panelFile?.sha256 ?? null : undefined)
+        storedWritten = true
+      }
+      if (startupChanged) {
+        const payload = rollback ? { ...JSON.parse(rollback.startupFile.bytes.toString('utf8')), ...nextStartup } : nextStartup
+        await this.#replaceJsonFile(this.#startupSettingsPath, payload, rollback?.startupFile.sha256)
+      }
     } catch (error) {
-      if (storedWritten) try { await this.#replaceJsonFile(this.#settingsPath, previousStored) } catch (rollbackError) {
+      if (storedWritten) try {
+        const expected = rollback ? createHash('sha256').update(JSON.stringify(panelPayload, null, 2) + '\n').digest('hex') : undefined
+        if (rollback && !rollback.panelFile) {
+          await assertSettingsFile(this.#settingsPath, expected!)
+          await fs.unlink(this.#settingsPath)
+        } else await this.#replaceJsonFile(this.#settingsPath, rollback?.panelFile?.bytes ?? previousStored, expected)
+      } catch (rollbackError) {
         throw new GameAdapterError('SETTINGS_ROLLBACK_FAILED', 'Startup settings failed and the previous dashboard settings could not be restored.', {
           cause: new AggregateError([error, rollbackError])
         })
@@ -1331,11 +1417,12 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     this.#settings = nextStored
     if (inspection.tasks.startManaged) this.#startupSettings = nextStartup
+    else if (rollback) this.#startupSettings = previousStartup
     const removedBackups = await this.#enforceAutomaticBackupRetention(report)
     const applied = await this.settings()
     return {
       historyId: history.id,
-      ...(restoredFromHistoryId ? { restoredFromHistoryId } : {}),
+      ...(rollback ? { restoredFromHistoryId: rollback.entry.id } : {}),
       settings: applied,
       appliedScope: [
         'dashboard identity', 'address used by client packages', 'automatic backup retention',

@@ -1,0 +1,10 @@
+.dialog.dialog-detailed:has(.settings-rollback) { width: min(37rem, 100%); max-height: calc(100dvh - 2rem); overflow-y: auto; }
+.settings-rollback { text-align: left; margin-bottom: 1rem; overflow-wrap: anywhere; }
+.settings-rollback table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: .84rem; }
+.settings-rollback th, .settings-rollback td { text-align: left; vertical-align: top; padding: .55rem .4rem; border-bottom: 1px solid var(--line); }
+.settings-rollback thead th { color: var(--muted); font-size: .72rem; font-weight: 500; }
+.settings-rollback th:first-child { width: 40%; padding-left: 0; }
+.settings-rollback th small { display: block; margin-top: .2rem; color: var(--muted); font-size: .69rem; font-weight: 400; }
+.settings-restored-value { color: var(--green); }
+.dialog .settings-rollback p { margin: .6rem 0; font-size: .76rem; }
+.dialog .settings-retention-note { color: var(--amber); }

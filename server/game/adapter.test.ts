@@ -1360,6 +1360,97 @@ describe('Windows adapter fixture behavior', () => {
     await expect(adapter.settingsHistory()).resolves.toEqual([])
   })
 
+  it('previews real on-disk settings and refuses stale rollbacks without replacing external changes', async () => {
+    const fixture = await config('windows')
+    const panel = path.join(fixture.dataDirectory, 'game-settings.json'), startup = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({ process: null,
+      versions: { game: null, nebula: null, bepinex: null }, tasks: { start: true, startManaged: true, configuredTargetUps: null } }) })
+    const run = (action: 'write-settings' | 'rollback-settings', input: Record<string, unknown>, report = (_message: string) => {}) =>
+      adapter.run(action, input, report, new AbortController().signal)
+    await run('write-settings', { settings: { ...await adapter.settings(), serverName: 'Second', targetUps: 90 } })
+    const [entry] = await adapter.settingsHistory()
+    const preview = await adapter.settingsRollbackPreview(entry!.id)
+    expect(preview).toMatchObject({ historyId: entry!.id, canRollback: true, fields: expect.arrayContaining([
+      { key: 'serverName', current: 'Second', selected: 'Fixture Server', effect: 'panel' },
+      { key: 'targetUps', current: 90, selected: 60, effect: 'next-start' },
+      { key: 'maxPlayers', current: null, selected: null, effect: 'read-only' }
+    ]) })
+    const panelBefore = await fs.readFile(panel)
+    const changedStartup = JSON.stringify({ schema: 1, targetUps: 80, saveName: '外部选档', existingExtra: 'kept' })
+    await fs.writeFile(startup, changedStartup)
+    const restore = (revision: string, report?: (message: string) => void) => run('rollback-settings', {
+      historyId: entry!.id, expectedRevision: revision }, report)
+    await expect(restore(preview.expectedRevision)).rejects.toMatchObject({ code: 'SETTINGS_ROLLBACK_CHANGED' })
+    expect(await fs.readFile(panel)).toEqual(panelBefore)
+    expect(await fs.readFile(startup, 'utf8')).toBe(changedStartup)
+    const fresh = await adapter.settingsRollbackPreview(entry!.id)
+    expect(fresh.fields.find(row => row.key === 'targetUps')?.current).toBe(80)
+    const changedPanel = JSON.stringify({ ...JSON.parse(panelBefore.toString()), serverName: '并发改名', existingExtra: 17 })
+    await expect(restore(fresh.expectedRevision, message => {
+      if (message === '正在恢复历史服务器设置') writeFileSync(panel, changedPanel)
+    })).rejects.toMatchObject({ code: 'SETTINGS_ROLLBACK_CHANGED' })
+    expect(await fs.readFile(panel, 'utf8')).toBe(changedPanel)
+    expect(await adapter.settingsHistory()).toEqual([entry])
+    await restore((await adapter.settingsRollbackPreview(entry!.id)).expectedRevision)
+    expect(JSON.parse(await fs.readFile(startup, 'utf8'))).toEqual({ schema: 1, targetUps: 60, saveName: '外部选档', existingExtra: 'kept' })
+    expect(JSON.parse(await fs.readFile(panel, 'utf8'))).toMatchObject({ serverName: 'Fixture Server', existingExtra: 17 })
+    expect((await adapter.settingsHistory())[0]!.settings.serverName).toBe('并发改名')
+    const same = await adapter.settingsRollbackPreview(entry!.id)
+    expect(same.canRollback).toBe(false)
+    await expect(restore(same.expectedRevision)).rejects.toMatchObject({ code: 'SETTINGS_ROLLBACK_UNAVAILABLE' })
+    expect(await adapter.settingsHistory()).toHaveLength(2)
+  })
+
+  it('preserves legacy all-or-nothing rollback and applies only reviewed writable settings after a task change', async () => {
+    const fixture = await config('windows')
+    let managed = true
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({ process: null,
+      versions: { game: null, nebula: null, bepinex: null }, tasks: { start: true, startManaged: managed, configuredTargetUps: 80 } }) })
+    const run = (action: 'write-settings' | 'rollback-settings', input: Record<string, unknown>) =>
+      adapter.run(action, input, () => {}, new AbortController().signal)
+    await run('write-settings', { settings: { ...await adapter.settings(), serverName: 'Second', targetUps: 95 } })
+    const entry = (await adapter.settingsHistory())[0]!
+    const prior = await adapter.settingsRollbackPreview(entry.id)
+    managed = false
+    await expect(run('rollback-settings', { historyId: entry.id, expectedRevision: prior.expectedRevision })).rejects.toMatchObject({ code: 'SETTINGS_ROLLBACK_CHANGED' })
+    await expect(run('rollback-settings', { historyId: entry.id })).rejects.toMatchObject({ code: 'UNSUPPORTED_SETTING' })
+    const preview = await adapter.settingsRollbackPreview(entry.id)
+    expect(preview.fields.find(row => row.key === 'targetUps')).toMatchObject({ current: 80, selected: 60, effect: 'read-only' })
+    const startup = path.join(fixture.dataDirectory, 'game-startup', 'settings.json'), before = await fs.readFile(startup)
+    await run('rollback-settings', { historyId: entry.id, expectedRevision: preview.expectedRevision })
+    expect(await fs.readFile(startup)).toEqual(before)
+    expect(await adapter.settings()).toMatchObject({ serverName: 'Fixture Server', targetUps: 80 })
+    expect((await adapter.settingsRollbackPreview(entry.id)).canRollback).toBe(false)
+  })
+
+  it('restores the exact prior panel bytes when an external startup edit arrives between the two replacements', async () => {
+    const fixture = await config('windows')
+    const adapter = new WindowsGameAdapter(fixture, { inspect: async () => ({ process: null,
+      versions: { game: null, nebula: null, bepinex: null }, tasks: { start: true, startManaged: true, configuredTargetUps: null } }) })
+    const signal = new AbortController().signal
+    await adapter.run('write-settings', { settings: { ...await adapter.settings(), serverName: 'Second', targetUps: 90 } }, () => {}, signal)
+    const entry = (await adapter.settingsHistory())[0]!
+    const panel = path.join(fixture.dataDirectory, 'game-settings.json'), startup = path.join(fixture.dataDirectory, 'game-startup', 'settings.json')
+    const priorPanel = JSON.stringify({ ...JSON.parse(await fs.readFile(panel, 'utf8')), externalField: 'original' })
+    await fs.writeFile(panel, priorPanel)
+    const preview = await adapter.settingsRollbackPreview(entry.id)
+    const external = JSON.stringify({ schema: 1, targetUps: 88, saveName: 'NewWorld' })
+    const rename = fs.rename.bind(fs)
+    let intervened = false
+    const intercept = vi.spyOn(fs, 'rename').mockImplementation(async (source, target) => {
+      await rename(source, target)
+      if (target === panel && !intervened) { intervened = true; await fs.writeFile(startup, external) }
+    })
+    try {
+      await expect(adapter.run('rollback-settings', { historyId: entry.id, expectedRevision: preview.expectedRevision }, () => {}, signal))
+        .rejects.toMatchObject({ code: 'SETTINGS_ROLLBACK_CHANGED' })
+    } finally { intercept.mockRestore() }
+    expect(intervened).toBe(true)
+    expect(await fs.readFile(panel, 'utf8')).toBe(priorPanel)
+    expect(await fs.readFile(startup, 'utf8')).toBe(external)
+    expect(await adapter.settingsHistory()).toEqual([entry])
+  })
+
   it('selects the restored save for managed startup and bounds automatic backup retention', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })

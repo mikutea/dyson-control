@@ -31,6 +31,42 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('authenticates settings restore previews and reuses the guarded rollback job on retries', async () => {
+    const f = await createFixture()
+    const adapter = new DemoGameAdapter(f.config)
+    const original = await adapter.settings()
+    const app = await buildApp({ config: f.config, adapter, databasePath: ':memory:' })
+    try {
+      const headers = { cookie: await loginCookie(app) }
+      const submit = (requestId: string, action: string, input: Record<string, unknown>) =>
+        app.inject({ method: 'POST', url: '/api/actions', headers, payload: { requestId, action, input } })
+      await submit('settings-preview-setup', 'write-settings', { settings: { ...original, maxPlayers: 32, autosaveMinutes: 7 } })
+      await waitForJobs(app, headers.cookie, 1)
+      const [entry] = await adapter.settingsHistory()
+      const url = '/api/settings-history/' + entry!.id + '/rollback-preview'
+      expect((await app.inject({ url })).statusCode).toBe(401)
+      expect((await app.inject({ url: url + '?unexpected=1', headers })).statusCode).toBe(400)
+      expect((await app.inject({ url: '/api/settings-history/missing/rollback-preview', headers })).statusCode).toBe(404)
+      const read = await app.inject({ url, headers })
+      expect(read.headers['cache-control']).toBe('no-store')
+      const preview = read.json().data
+      expect(preview).toMatchObject({ historyId: entry!.id, canRollback: true, fields: expect.arrayContaining([
+        { key: 'maxPlayers', current: 32, selected: 16, effect: 'demo' },
+        { key: 'autosaveMinutes', current: 7, selected: 10, effect: 'demo' }
+      ]) })
+      expect(await adapter.settingsHistory()).toEqual([entry])
+      const input = { historyId: entry!.id, expectedRevision: preview.expectedRevision }
+      expect((await submit('settings-bad-revision', 'rollback-settings', { ...input, expectedRevision: 'bad' })).statusCode).toBe(400)
+      const first = await submit('settings-reviewed', 'rollback-settings', input)
+      expect(first.statusCode).toBe(202)
+      await waitForJobs(app, headers.cookie, 2)
+      const repeat = await submit('settings-reviewed', 'rollback-settings', input)
+      expect(repeat.json().data.id).toBe(first.json().data.id)
+      expect(await adapter.settings()).toEqual(original)
+      expect(await adapter.settingsHistory()).toHaveLength(2)
+      expect((await app.inject({ url, headers })).json().data.canRollback).toBe(false)
+    } finally { await app.close() }
+  })
   it('authenticates the read-only mod configuration rollback preview and confirms its revision through the job queue', async () => {
     const fixture = await createFixture()
     const adapter = new DemoGameAdapter(fixture.config)
@@ -1275,6 +1311,7 @@ async function createFixture(delayMs = 0): Promise<{ directory: string; config: 
       return { serverName: 'Fixture server', maxPlayers: 16, targetUps: 60, autosaveMinutes: 10, backupKeep: 20, address: '127.0.0.1:8469' }
     },
     async settingsHistory() { return [] },
+    async settingsRollbackPreview() { throw new Error('No fixture settings history') },
     async clientPackages(): Promise<ClientPackage[]> { return [] },
     async run(action, input, report, signal) {
       adapter.calls.push({ action, input })
