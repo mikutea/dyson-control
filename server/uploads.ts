@@ -123,6 +123,8 @@ export class BackupUploadStore {
         fs.rm(metadataPart, { force: true }),
         fs.rm(metadataPath, { force: true }),
       ])
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code === 'ENOSPC' || code === 'EDQUOT') throw new ApiError(507, 'upload_storage_full', '上传暂存目录所在磁盘空间不足，请释放空间后重新上传。')
       throw error
     }
   }

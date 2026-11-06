@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import fs, { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -24,6 +24,39 @@ afterEach(async () => {
 })
 
 describe('uploaded backup import', () => {
+  it.each(['windows', 'demo'] as const)('checks the destination volume before extracting a %s import', async mode => {
+    const { config } = await createFixture()
+    config.mode = mode
+    await mkdir(config.game.backupDirectory, { recursive: true })
+    const uploads = new BackupUploadStore(config.dataDirectory)
+    const zip = createBackupArchive('small-volume', 'World')
+    const input = await uploads.stage('space-check', Readable.from(zip), new AbortController().signal)
+    const memberBytes = Buffer.byteLength('dsv fixture' + 'server fixture')
+    const need = memberBytes + (mode === 'demo' ? zip.length : 0)
+    const stat = await fs.statfs(config.game.backupDirectory, { bigint: true })
+    const space = vi.spyOn(fs, 'statfs').mockResolvedValueOnce({ ...stat, bsize: 1n, bavail: BigInt(need - 1) })
+    try {
+      await expect(importUploadedBackup(config, { uploadId: input.uploadId }, () => {}, new AbortController().signal))
+        .rejects.toMatchObject({ code: 'BACKUP_IMPORT_SPACE', message: expect.stringContaining(`至少需要 ${need.toLocaleString('zh-CN')} 字节`) })
+      expect(space).toHaveBeenCalledWith(config.game.backupDirectory, { bigint: true })
+      expect(await readdir(config.game.backupDirectory)).toEqual([])
+      expect(await readdir(uploads.directory)).toEqual([])
+    } finally { space.mockRestore() }
+  })
+
+  it('cleans the import and reports destination space exhaustion after preflight', async () => {
+    const { config } = await createFixture()
+    const uploads = new BackupUploadStore(config.dataDirectory)
+    const input = await uploads.stage('late-space', Readable.from(createBackupArchive('full-volume', 'World')), new AbortController().signal)
+    const publication = vi.spyOn(fs, 'rename').mockRejectedValueOnce(Object.assign(new Error('fixture disk full'), { code: 'ENOSPC' }))
+    try {
+      await expect(importUploadedBackup(config, { uploadId: input.uploadId }, () => {}, new AbortController().signal))
+        .rejects.toMatchObject({ code: 'BACKUP_IMPORT_SPACE', message: expect.stringContaining('磁盘空间不足') })
+      expect(await readdir(config.game.backupDirectory)).toEqual([])
+      expect(await readdir(uploads.directory)).toEqual([])
+    } finally { publication.mockRestore() }
+  })
+
   it('streams a deflated archive, verifies every member, and atomically imports the save set', async () => {
     const fixture = await createFixture()
     const archive = createBackupArchive('backup-1', 'Imported Save', [], 'automatic-before-restore')

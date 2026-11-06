@@ -206,6 +206,12 @@ export async function importUploadedBackup(
     const plan = await planImport(archivePath, directory, digest, metadata.createdAt, signal)
     const finalRoot = inside(backupDirectory, plan.id)
     await assertDestinationAvailable(finalRoot, plan.id)
+    const memberBytes = plan.members.reduce((sum, member) => sum + member.entry.uncompressedSize, 0)
+    const requiredBytes = memberBytes + (config.mode === 'demo' ? metadata.bytes : 0)
+    const space = await fs.statfs(backupDirectory, { bigint: true }).catch(() => null)
+    if (space && space.bsize > 0n && space.bavail >= 0n && space.bavail * space.bsize < BigInt(requiredBytes)) {
+      throw importError('BACKUP_IMPORT_SPACE', `备份目录至少需要 ${requiredBytes.toLocaleString('zh-CN')} 字节，当前可用 ${(space.bavail * space.bsize).toLocaleString('zh-CN')} 字节。请释放空间后重新导入。`)
+    }
     try { claim = await reserveStage(config, metadata, plan.saveName) }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
@@ -222,9 +228,10 @@ export async function importUploadedBackup(
       if (copiedHash.digest('hex') !== digest) throw importError('UPLOAD_CHECKSUM_FAILED', '复制上传文件时内容发生变化。')
     }
     const manifest: BackupManifest = { schema: 1, id: plan.id, saveName: plan.saveName, createdAt: plan.createdAt, reason: 'imported', members: [] }
-    report(`正在导入存档备份 ${plan.saveName}`)
+    report(`正在导入存档备份 ${plan.saveName}，共 ${plan.members.length} 个文件、${memberBytes.toLocaleString('zh-CN')} 字节`)
     for (const { fileName, entry, expectedSha256 } of plan.members) {
       signal.throwIfAborted()
+      report(`正在解压并校验 ${fileName}（${entry.uncompressedSize.toLocaleString('zh-CN')} 字节）`)
       const sourceStream = await entrySource(source, entry, directory.centralOffset)
       const output = createWriteStream(inside(partialRoot, fileName), { flags: 'wx' })
       const { bytes, sha256 } = await consumeEntry(sourceStream, entry, output, signal)
@@ -242,6 +249,12 @@ export async function importUploadedBackup(
       bytes: manifest.members.reduce((total, member) => total + member.bytes, 0),
       createdAt: manifest.createdAt, reason: manifest.reason, importedAt: new Date().toISOString(),
     }
+  } catch (cause) {
+    const code = (cause as NodeJS.ErrnoException)?.code
+    if (code === 'ENOSPC' || code === 'EDQUOT') {
+      throw importError('BACKUP_IMPORT_SPACE', '导入时磁盘空间不足，请检查备份目录和上传暂存目录所在磁盘后重试。', cause)
+    }
+    throw cause
   } finally {
     if (claim && !await removeStage(claim)) throw importError('IMPORT_STAGE_CHANGED', '导入暂存目录的归属或内容已变化，已保留现场。')
     if (!stageConflict) await uploads.remove(input.uploadId)

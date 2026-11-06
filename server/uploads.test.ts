@@ -1,8 +1,8 @@
-import { mkdtemp, readdir, rm } from 'node:fs/promises'
+import fs, { mkdtemp, readdir, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { BackupUploadStore } from './uploads.js'
 
 const directories: string[] = []
@@ -12,6 +12,18 @@ afterEach(async () => {
 })
 
 describe('backup upload staging', () => {
+  it('reports an exhausted upload volume and releases the partial upload', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'dyson-upload-'))
+    directories.push(directory)
+    const uploads = new BackupUploadStore(directory)
+    const write = vi.spyOn(fs, 'rename').mockRejectedValueOnce(Object.assign(new Error('fixture quota exceeded'), { code: 'EDQUOT' }))
+    try {
+      await expect(uploads.stage('no-space', Readable.from(Buffer.from('fixture zip')), new AbortController().signal))
+        .rejects.toMatchObject({ statusCode: 507, code: 'upload_storage_full' })
+      expect(await readdir(uploads.directory)).toEqual([])
+    } finally { write.mockRestore() }
+  })
+
   it('persists request id, size and digest and reuses the durable idempotency record', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'dyson-upload-'))
     directories.push(directory)
