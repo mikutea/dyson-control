@@ -27,6 +27,74 @@ async function fixture(content: string) {
 }
 
 describe('Windows game log tail', () => {
+  it('returns an empty list during rotation and reads the new log once it exists', async () => {
+    const { adapter, logFile } = await fixture('old log\n')
+    await adapter.logs()
+    const open = fs.open
+    vi.spyOn(fs, 'open').mockImplementationOnce(async (...args) => {
+      await fs.rename(logFile, `${logFile}.old`)
+      return open(...args)
+    })
+    expect(await adapter.logs()).toEqual([]) // Removed between inspection and open.
+    expect(await adapter.logs()).toEqual([]) // Still missing on the next inspection.
+    await fs.writeFile(logFile, 'new log\n')
+    expect(await adapter.logs()).toEqual([expect.objectContaining({ message: 'new log' })])
+  })
+
+  it('reports a directory at the log path and resumes after the file is restored', async () => {
+    const { adapter, logFile } = await fixture('original log\n')
+    const before = await adapter.logs()
+    await fs.rename(logFile, `${logFile}.old`)
+    await fs.mkdir(logFile)
+    await expect(adapter.logs()).rejects.toMatchObject({ code: 'LOG_UNAVAILABLE', message: expect.stringContaining('普通文件') })
+    await fs.rmdir(logFile)
+    await fs.rename(`${logFile}.old`, logFile)
+    expect(await adapter.logs()).toEqual(before)
+  })
+
+  it('rejects a file symlink without opening its target', async ({ skip }) => {
+    const { adapter, logFile } = await fixture('target contents\n')
+    await adapter.logs()
+    await fs.rename(logFile, `${logFile}.target`)
+    try { await fs.symlink(`${logFile}.target`, logFile, 'file') } catch (error) {
+      if (process.platform === 'win32' && (error as NodeJS.ErrnoException).code === 'EPERM') return skip('Windows file symlink privilege unavailable')
+      throw error
+    }
+    const open = vi.spyOn(fs, 'open')
+    await expect(adapter.logs()).rejects.toMatchObject({ code: 'LOG_UNAVAILABLE' })
+    expect(open).not.toHaveBeenCalled()
+  })
+
+  it.each(['lstat', 'open'] as const)('reports a permission failure from %s and reads again on retry', async operation => {
+    const { adapter, logFile } = await fixture('log contents\n')
+    const before = await adapter.logs()
+    vi.spyOn(fs, operation).mockRejectedValueOnce(Object.assign(new Error(logFile), { code: 'EACCES' }))
+    await expect(adapter.logs()).rejects.toMatchObject({ name: 'GameAdapterError', code: 'LOG_UNAVAILABLE', message: expect.not.stringContaining(logFile) })
+    expect(await adapter.logs()).toEqual(before)
+  })
+
+  it.each(['stat', 'read'] as const)('reports a handle %s failure and closes the file', async operation => {
+    const { adapter, logFile } = await fixture('log contents\n')
+    const before = await adapter.logs()
+    const handle = await fs.open(logFile, 'r')
+    vi.spyOn(handle, operation).mockRejectedValueOnce(Object.assign(new Error(logFile), { code: 'EIO' }))
+    vi.spyOn(fs, 'open').mockResolvedValueOnce(handle)
+    await expect(adapter.logs()).rejects.toMatchObject({ name: 'GameAdapterError', code: 'LOG_UNAVAILABLE', message: expect.not.stringContaining(logFile) })
+    expect(handle.fd).toBe(-1)
+    expect(await adapter.logs()).toEqual(before)
+  })
+
+  it('rejects a different file substituted between inspection and open before reading it', async () => {
+    const { adapter, logFile } = await fixture('configured log\n')
+    await adapter.logs()
+    const handle = await fs.open(`${logFile}.other`, 'w+')
+    const read = vi.spyOn(handle, 'read')
+    vi.spyOn(fs, 'open').mockResolvedValueOnce(handle)
+    await expect(adapter.logs()).rejects.toMatchObject({ code: 'LOG_UNAVAILABLE' })
+    expect(read).not.toHaveBeenCalled()
+    expect(handle.fd).toBe(-1)
+  })
+
   it('omits NUL padding rows without consuming the 500-message limit or changing the file', async () => {
     const lines = Array.from({ length: 500 }, (_, index) => `[Info] Message ${index}`)
     const content = `${lines.join('\r\n')}\r\n${'\0'.repeat(8000)}\r\n\0 \t\0\r\n\0\0`

@@ -5,7 +5,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   Action, Backup, ClientPackage, ComponentVersion, ControlConfig, ControlUpdateOperation, GameAdapter,
   GameSettings, Job, LogEntry, Mod, Overview, Player, Save,
@@ -13,6 +13,8 @@ import type {
 import { hashPassword } from './auth.js'
 import { LoginGuard } from './auth.js'
 import { buildApp } from './app.js'
+import { JobStore } from './jobs.js'
+import { readGameLogs } from './game/logs.js'
 import { MAINTENANCE_MARKER } from './health.js'
 import { ControlUpdateError } from './control-updates.js'
 import { SteamAuthManager } from './steam-auth.js'
@@ -24,6 +26,45 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('finds older filtered jobs and pages past a tied timestamp even when a new job arrives', async () => {
+    const f = await createFixture()
+    const databasePath = join(f.directory, 'history.sqlite')
+    const seed = new JobStore(databasePath)
+    const record = (action: Action, state: 'succeeded' | 'failed' | 'interrupted') => {
+      const { job } = seed.create({ requestId: randomUUID(), action, input: {} })
+      return seed.finish(job.id, state, 'fixture outcome', null)
+    }
+    const timestamp = vi.spyOn(Date.prototype, 'toISOString').mockReturnValue('2025-01-01T00:00:00.000Z')
+    let matching: string[]
+    try {
+      matching = [record('backup', 'failed').id, record('backup', 'failed').id].sort().reverse()
+      record('save', 'failed')
+      record('backup', 'interrupted')
+    } finally { timestamp.mockRestore() }
+    for (let i = 0; i < 201; i++) record('save', 'succeeded')
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath })
+    try {
+      const url = '/api/jobs?action=backup&state=failed&limit=1'
+      expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401)
+      const headers = { cookie: await loginCookie(app) }
+      const get = (url: string) => app.inject({ method: 'GET', url, headers })
+      const recent: Job[] = (await get('/api/jobs')).json().data
+      expect(recent).toHaveLength(200)
+      expect(recent.every(job => job.state === 'succeeded')).toBe(true)
+      const first: Job[] = (await get(url)).json().data
+      expect(first.map(job => job.id)).toEqual(matching.slice(0, 1))
+      record('backup', 'failed')
+      const next: Job[] = (await get(`${url}&before=${first[0].id}`)).json().data
+      expect(next.map(job => job.id)).toEqual(matching.slice(1))
+      expect((await get(`${url}&before=${next[0].id}`)).json().data).toEqual([])
+      for (const invalid of ['limit=0', 'limit=201', 'action=unknown', 'state=unknown', 'before=invalid', 'offset=1']) {
+        expect((await get(`/api/jobs?${invalid}`)).statusCode).toBe(400)
+      }
+      expect((await get(`/api/jobs?before=${randomUUID()}`)).statusCode).toBe(404)
+      expect(f.adapter.calls).toHaveLength(0)
+    } finally { await app.close(); seed.close() }
+  })
+
   it('authenticates and deduplicates first-world preparation through the game action queue', async () => {
     const f = await createFixture()
     const prepared = { prepared: true, installationId: 'first-install-11111111-1111-1111-1111-111111111111', started: false }
@@ -541,6 +582,39 @@ describe('Dyson Control API', () => {
     expect(response.body).toBe('first line\nlast line\n')
     expect(response.headers['x-log-truncated']).toBe('false')
     await app.close()
+  })
+
+  it('distinguishes an absent log from an unreadable one and serves the recovered file', async () => {
+    const fixture = await createFixture()
+    const file = fixture.config.game.logFile
+    fixture.adapter.source = 'windows'
+    fixture.adapter.logs = () => readGameLogs(file)
+    const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:' })
+    try {
+      const headers = { cookie: await loginCookie(app) }
+      const get = (url: string) => app.inject({ method: 'GET', url, headers })
+      expect((await get('/api/logs')).json().data).toEqual([])
+      expect((await get('/api/logs/download')).statusCode).toBe(404)
+      await mkdir(file)
+      for (const url of ['/api/logs', '/api/logs/download']) {
+        const response = await get(url)
+        expect(response.statusCode).toBe(503)
+        expect(response.json().error.code).toBe('LOG_UNAVAILABLE')
+        expect(response.body).not.toContain(fixture.directory)
+      }
+      await rename(file, join(fixture.directory, 'wrong-log-directory'))
+      await writeFile(file, '')
+      expect((await get('/api/logs/download')).rawPayload).toHaveLength(0)
+      const limit = 16 * 1024 * 1024
+      const suffix = Buffer.from('\n[Info] A\n')
+      const content = Buffer.concat([Buffer.from('discarded prefix'), Buffer.alloc(limit - suffix.length, 32), suffix])
+      await writeFile(file, content)
+      expect((await get('/api/logs')).json().data[0].message).toBe('[Info] A')
+      const recovered = await get('/api/logs/download')
+      expect(recovered.statusCode).toBe(200)
+      expect(recovered.headers['x-log-truncated']).toBe('true')
+      expect(recovered.rawPayload.equals(content.subarray(-limit))).toBe(true)
+    } finally { await app.close() }
   })
 
   it('rate limits repeated login failures and returns Chinese API errors', async () => {

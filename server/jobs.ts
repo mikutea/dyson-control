@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { Action, GameAdapter, Job, JobState } from '../shared/contracts.js'
+import type { Action, GameAdapter, Job, JobHistoryQuery, JobState } from '../shared/contracts.js'
 import { ApiError } from './errors.js'
 
 interface JobRow {
@@ -119,8 +119,19 @@ export class JobStore {
     return row ? rowToJob(row) : null
   }
 
-  list(limit = 200): Job[] {
-    const rows = this.#database.prepare('SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as unknown as JobRow[]
+  list({ action, state, before, limit = 200 }: JobHistoryQuery = {}): Job[] {
+    const conditions: string[] = []
+    const values: string[] = []
+    if (action) { conditions.push('action = ?'); values.push(action) }
+    if (state) { conditions.push('state = ?'); values.push(state) }
+    if (before) {
+      const cursor = this.#database.prepare('SELECT created_at FROM jobs WHERE id = ?').get(before)
+      if (!cursor) throw new ApiError(404, 'job_not_found', '作为分页起点的操作不存在，请返回第一页。')
+      conditions.push('(created_at, id) < (?, ?)')
+      values.push(String(cursor.created_at), before)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = this.#database.prepare(`SELECT * FROM jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(...values, limit) as unknown as JobRow[]
     return rows.map(rowToJob)
   }
 

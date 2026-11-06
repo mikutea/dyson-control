@@ -95,6 +95,7 @@ function OverviewPage({ refreshToken, overview: streamedOverview, onOverview, ru
           </Panel>
         </div>
         <Panel title="最近活动" icon={<Activity />}>
+          {logs.error && logs.data && <p role="status" className="connection-warning">刷新失败：{logs.error} 当前显示上次读取的消息。</p>}
           {logs.loading && !logs.data ? <LoadingBlock /> : logs.error && !logs.data ? <ErrorBlock message={logs.error} retry={logs.reload} /> : !logs.data?.length ? <EmptyBlock title="暂时没有活动" description="服务器的新消息会显示在这里" /> : <div className="activity-list">{logs.data.slice(0, 6).map((entry) => <div key={entry.id}><StatusDot state={entry.level === 'error' ? 'bad' : entry.level === 'warning' ? 'warning' : 'good'} /><p>{entry.message}</p><time>{entry.time ? formatDate(entry.time) : '时间未记录'}</time></div>)}</div>}
         </Panel>
       </div>
@@ -184,9 +185,15 @@ function ServerPage({ refreshToken, overview: streamedOverview, onOverview, runA
   const [logLevel, setLogLevel] = useState('all')
   const [logSearch, setLogSearch] = useState('')
   useEffect(() => {
-    const timer = window.setTimeout(() => void logs.reload(), 5000)
-    return () => window.clearTimeout(timer)
-  }, [logs.reload])
+    if (logs.loading) return
+    let active = true
+    const poll = async () => {
+      await logs.reload()
+      if (active) timer = window.setTimeout(poll, 5000)
+    }
+    let timer = window.setTimeout(poll, 5000)
+    return () => { active = false; window.clearTimeout(timer) }
+  }, [logs.loading, logs.reload])
   const filteredLogs = logs.data?.filter((entry) => (logLevel === 'all' || entry.level === logLevel) && entry.message.toLocaleLowerCase().includes(logSearch.toLocaleLowerCase())) ?? []
   const overview = streamedOverview || overviewResource.data
   useEffect(() => { if (overviewResource.data) onOverview(overviewResource.data) }, [overviewResource.data, onOverview])
@@ -207,6 +214,7 @@ function ServerPage({ refreshToken, overview: streamedOverview, onOverview, runA
     <RuntimeStatusPanel refreshToken={refreshToken} />
     <Panel title="运行记录" icon={<Activity />} action={<a className="button button-quiet" href="/api/logs/download"><Download /><span>下载日志</span></a>}>
       <div className="log-filters"><label><span>级别</span><select value={logLevel} onChange={(event) => setLogLevel(event.target.value)}><option value="all">全部级别</option><option value="info">信息</option><option value="warning">提醒</option><option value="error">错误</option></select></label><label><span>搜索日志</span><input type="search" value={logSearch} onChange={(event) => setLogSearch(event.target.value)} placeholder="输入关键词" /></label><small>每 5 秒刷新</small></div>
+      {logs.error && logs.data && <p role="status" className="connection-warning">刷新失败：{logs.error} 当前显示上次读取的消息，将自动重试。</p>}
       <ResourceBody resource={logs} emptyTitle="暂无运行记录" emptyDescription="服务器开始运行后会显示新消息">
         {() => filteredLogs.length ? <div className="log-list">{filteredLogs.map((entry) => <div key={entry.id}><time>{entry.time ? formatFullDate(entry.time) : '时间未记录'}</time><span className={`log-level log-${entry.level}`}>{entry.level === 'error' ? '错误' : entry.level === 'warning' ? '提醒' : '信息'}</span><p>{entry.message}</p></div>)}</div> : <EmptyBlock title="没有匹配的记录" description="调整级别或关键词查看其他记录" />}
       </ResourceBody>

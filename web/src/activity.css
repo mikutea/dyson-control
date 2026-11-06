@@ -8,9 +8,21 @@
 .activity-log-warning { margin: .8rem 1rem; }
 .activity-log-list p { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 
+.operation-history-filters { display: grid; grid-template-columns: minmax(0, 14rem) minmax(0, 9rem) max-content; align-items: end; gap: .75rem; padding: 1rem; }
+.operation-history-filters label { min-width: 0; }
+.operation-history-filters select { width: 100%; padding: .55rem .65rem; border: 1px solid var(--line-strong); border-radius: .5rem; background: #0c1926; color: var(--text); color-scheme: dark; font: inherit; font-size: .78rem; }
+.operation-history-pages { display: flex; align-items: center; flex-wrap: wrap; gap: .45rem; padding: .45rem 1rem; border-block: 1px solid var(--line); }
+.operation-history-pages > span { margin-inline-end: auto; color: var(--muted); font-size: .74rem; }
+.activity-panel .job-history-head > div, .activity-panel .job-history li > span { min-width: 0; overflow-wrap: anywhere; }
+
 @media (max-width: 640px) {
   .activity-log-actions { width: 100%; }
   .activity-log-actions .button { flex: 1; }
   .activity-log-actions .button:last-child { flex-basis: 100%; }
   .activity-log-filters small { width: 100%; padding-bottom: 0; }
+}
+
+@media (max-width: 480px) {
+  .operation-history-filters { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
+  .operation-history-filters .button { justify-self: start; }
 }

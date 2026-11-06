@@ -854,7 +854,7 @@ export class WindowsGameAdapter implements GameAdapter {
   async #selectBackupDefault(): Promise<string> {
     const saves = await this.saves()
     if (this.#currentSave && saves.some((save) => save.name === this.#currentSave!.name)) return this.#currentSave.name
-    if (saves.length === 0) throw new GameAdapterError('SAVE_NOT_FOUND', 'No complete save set exists.')
+    if (saves.length === 0) throw new GameAdapterError('SAVE_NOT_FOUND', '没有可备份的完整存档。首次开服请先保存游戏；已有存档请检查同名的 .dsv 和 .server 文件。')
     return saves[0]!.name
   }
 

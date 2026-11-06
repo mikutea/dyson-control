@@ -2,7 +2,6 @@ import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
 import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
 import { createReadStream, existsSync } from 'node:fs'
-import { lstat } from 'node:fs/promises'
 import { resolve, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
@@ -17,6 +16,7 @@ import { RuntimeMonitor, runtimeSettingsSchema } from './runtime.js'
 import { PlayerHistoryStore } from './player-history.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
+import { openGameLog } from './game/logs.js'
 import { playerIdPattern } from './game/bridge.js'
 import { ControlUpdateError, ControlUpdateManager } from './control-updates.js'
 import { SteamAuthManager } from './steam-auth.js'
@@ -318,7 +318,15 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/settings', async (request) => { assertNoQuery(request); return data(await adapter.settings()) })
   app.get('/api/settings-history', async request => { assertNoQuery(request); return data(await adapter.settingsHistory()) })
   app.get('/api/client-packages', async (request) => { assertNoQuery(request); return data(await adapter.clientPackages()) })
-  app.get('/api/jobs', async (request) => { assertNoQuery(request); return data(store.list()) })
+  app.get('/api/jobs', async request => {
+    const query = z.object({
+      action: actionSchema.optional(),
+      state: z.enum(['queued', 'running', 'succeeded', 'failed', 'interrupted']).optional(),
+      before: z.string().uuid().optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }).strict().parse(request.query)
+    return data(store.list(query))
+  })
   app.get('/api/runtime', async (request) => { assertNoQuery(request); return data(runtime.status()) })
   app.get('/api/runtime/history', async (request) => {
     const { hours } = z.object({ hours: z.coerce.number().int().min(1).max(168).default(24) }).strict().parse(request.query)
@@ -552,6 +560,7 @@ function cookieOptions(request: FastifyRequest) {
 }
 
 function gameErrorStatus(code: string): number {
+  if (code === 'LOG_UNAVAILABLE') return 503
   if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
@@ -590,12 +599,17 @@ const MAX_LOG_DOWNLOAD_BYTES = 16 * 1024 * 1024
 
 async function sendLogDownload(logPath: string, request: FastifyRequest, reply: FastifyReply) {
   assertNoQuery(request)
-  const stat = await lstat(logPath).catch(() => null)
-  if (!stat?.isFile() || stat.isSymbolicLink()) throw new ApiError(404, 'log_not_found', '服务器日志文件不存在。')
-  const start = Math.max(0, stat.size - MAX_LOG_DOWNLOAD_BYTES)
+  const log = await openGameLog(logPath)
+  if (!log) throw new ApiError(404, 'log_not_found', '服务器日志文件不存在。')
+  const size = Number(log.stat.size)
+  const start = Math.max(0, size - MAX_LOG_DOWNLOAD_BYTES)
   const name = basename(logPath).replace(/[^A-Za-z0-9._-]/g, '_') || 'server.log'
   reply.type('text/plain; charset=utf-8')
   reply.header('content-disposition', `attachment; filename="${name}"`)
   reply.header('x-log-truncated', start > 0 ? 'true' : 'false')
-  return reply.send(createReadStream(logPath, stat.size === 0 ? undefined : { start, end: stat.size - 1 }))
+  if (!size) {
+    await log.handle.close()
+    return reply.send(Buffer.alloc(0))
+  }
+  return reply.send(log.handle.createReadStream({ start, end: size - 1 }))
 }

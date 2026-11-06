@@ -120,6 +120,7 @@ export interface RuntimeStatus {
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
 export interface JobStep { time: string; message: string }
 export interface Job { id: string; requestId: string; action: Action; state: JobState; createdAt: string; startedAt: string | null; finishedAt: string | null; message: string; steps: JobStep[]; result: Record<string, unknown> | null }
+export interface JobHistoryQuery { action?: Action; state?: JobState; before?: string; limit?: number }
 export interface ActionRequest { requestId: string; action: Action; input?: Record<string, unknown> }
 export interface ApiErrorBody { error: { code: string; message: string } }
 export interface Session { authenticated: boolean; username: 'administrator'; source: 'demo' | 'windows' }
@@ -175,6 +176,7 @@ export interface ControlConfig {
 // HTTP responses are { data: T }. GET /api/session is also available before login.
 // POST /api/session {password}; DELETE /api/session. One administrator session.
 // GET /api/{overview,players,logs,mods,versions,saves,backups,settings,client-packages,jobs}.
+// GET /api/jobs accepts JobHistoryQuery and returns Job[] newest first; before is an exclusive job ID.
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.

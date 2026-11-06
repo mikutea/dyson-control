@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto'
-import fs from 'node:fs/promises'
+import { constants, type BigIntStats } from 'node:fs'
+import fs, { type FileHandle } from 'node:fs/promises'
 import type { LogEntry } from '../../shared/contracts.js'
+import { GameAdapterError } from './errors.js'
 
 function recordedTime(line: string): string | null {
   const match = /^\uFEFF?\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)(?=\]|\s|$)/.exec(line)
@@ -15,17 +17,43 @@ function recordedTime(line: string): string | null {
   return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null
 }
 
-export async function readGameLogs(filePath: string): Promise<LogEntry[]> {
-  const pathStat = await fs.stat(filePath).catch(() => null)
-  if (!pathStat?.isFile()) return []
-  const handle = await fs.open(filePath, 'r')
+function logReadFailed(cause: unknown): never {
+  throw new GameAdapterError('LOG_UNAVAILABLE', '无法读取游戏日志，请检查日志路径、存储状态和控制服务的读取权限。', { cause })
+}
+
+function missingOrFailed(error: NodeJS.ErrnoException): null {
+  if (error.code === 'ENOENT') return null
+  return logReadFailed(error)
+}
+
+export async function openGameLog(filePath: string): Promise<{ handle: FileHandle; stat: BigIntStats } | null> {
+  const pathStat = await fs.lstat(filePath, { bigint: true }).catch(missingOrFailed)
+  if (!pathStat) return null
+  if (!pathStat.isFile()) throw new GameAdapterError('LOG_UNAVAILABLE', '请检查日志路径，确保它指向普通文件。')
+  const handle = await fs.open(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)).catch(missingOrFailed)
+  if (!handle) return null
   try {
-    const stat = await handle.stat({ bigint: true })
-    if (!stat.isFile()) return []
+    const stat = await handle.stat({ bigint: true }).catch(logReadFailed)
+    // Windows lacks O_NOFOLLOW. Verify the handle refers to the file we inspected before reading any bytes.
+    if (!stat.isFile() || stat.dev !== pathStat.dev || stat.ino !== pathStat.ino) {
+      throw new GameAdapterError('LOG_UNAVAILABLE', '日志文件在打开时发生变化，请刷新后重试。')
+    }
+    return { handle, stat }
+  } catch (error) {
+    await handle.close().catch(logReadFailed)
+    throw error
+  }
+}
+
+export async function readGameLogs(filePath: string): Promise<LogEntry[]> {
+  const log = await openGameLog(filePath)
+  if (!log) return []
+  const { handle, stat } = log
+  try {
     const bytesToRead = Number(stat.size < 512n * 1024n ? stat.size : 512n * 1024n)
     const position = stat.size - BigInt(bytesToRead)
     const buffer = Buffer.alloc(bytesToRead)
-    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, position)
+    const { bytesRead } = await handle.read(buffer, 0, bytesToRead, position).catch(logReadFailed)
     const data = buffer.subarray(0, bytesRead)
     // Discard the possibly partial first line before decoding UTF-8.
     const firstLineStart = position > 0n ? data.indexOf(0x0a) + 1 : 0
@@ -51,5 +79,5 @@ export async function readGameLogs(filePath: string): Promise<LogEntry[]> {
       end = newline
     }
     return entries
-  } finally { await handle.close() }
+  } finally { await handle.close().catch(logReadFailed) }
 }
