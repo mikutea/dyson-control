@@ -32,7 +32,7 @@ export function ClientsPage({ refreshToken, runAction, operationActive }: { refr
           <PackageDetails key={`${selected.id}-${revision}`} item={selected} />
         </>}
     </Panel>
-    <p className="client-import-note">玩家可在 r2modman 配置选择页依次选择 <b>Import/Update → Import new profile → From file</b>，导入下载的 .r2z。模组下载完成后，用与服务器相同的游戏版本启动该配置并实际入服。</p>
+    <p className="client-import-note">在 r2modman 配置选择页点 <b>Import / Update → From file</b>，选择 .r2z，核对模组后点 <b>Import → Import new profile → Create</b>。下载完成后从该配置启动游戏。</p>
   </>
 }
 

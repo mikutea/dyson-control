@@ -32,7 +32,7 @@ export function ClientJoinGuide({ item, digest }: { item: ClientPackage; digest:
         '1. 准备与服务器版本一致的正版戴森球计划。将配置包保存到本机。',
         '2. 在 PowerShell 运行下面的命令，并按提示输入配置包的完整路径。核对结果与上方 SHA-256 一致。',
         "(Get-FileHash -Algorithm SHA256 -LiteralPath (Read-Host '请输入配置包的完整路径')).Hash", '',
-        '3. 在 r2modman 选择 Dyson Sphere Program。选择 Import/Update → Import new profile → From file，导入上方配置包并等待模组下载完成。',
+        '3. 在 r2modman 选择 Dyson Sphere Program。在配置选择页点 Import / Update → From file，选择上方 .r2z。在 Packages to be installed 页核对下面列出的版本，点 Import → Import new profile。确认配置名后点 Create，并等待所有模组下载完成。',
         '4. 从刚导入的配置启动游戏。在 Nebula 多人联机界面输入游戏地址 ' + address + '，进入服务器。', '',
         '配置包锁定的模组版本', ...mods.map(mod => mod.name + '  ' + mod.version), '',
       ].join('\r\n')
