@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import fs, { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import fs, { link, mkdir, mkdtemp, readFile, readdir, rename, rm, unlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -17,6 +17,9 @@ import { buildApp } from './app.js'
 import { JobStore } from './jobs.js'
 import { readGameLogs } from './game/logs.js'
 import { DemoGameAdapter } from './game/demo.js'
+import { WindowsGameAdapter } from './game/windows.js'
+import { extractZipBuffer } from './game/updates.js'
+import { buildStoredZip } from './game/zip.js'
 import { MAINTENANCE_MARKER } from './health.js'
 import { ControlUpdateError } from './control-updates.js'
 import { SteamAuthManager } from './steam-auth.js'
@@ -697,7 +700,7 @@ describe('Dyson Control API', () => {
     vi.spyOn(adapter, 'download').mockImplementationOnce(async (kind, selectedId) => {
       const verified = await readDownload(kind, selectedId)
       expect(verified.verifiedBytes).toBeDefined()
-      await writeFile(verified.path, Buffer.alloc(verified.verifiedBytes!.length, 0x41))
+      await writeFile(verified.path!, Buffer.alloc(verified.verifiedBytes!.length, 0x41))
       return verified
     })
     const app = await buildApp({ config: fixture.config, adapter, databasePath: ':memory:' })
@@ -727,6 +730,65 @@ describe('Dyson Control API', () => {
     expect(response.body).toBe('fixture archive')
     expect(response.headers['content-disposition']).toContain('client bundle.zip')
     await app.close()
+  })
+
+  it.each(['windows', 'demo'] as const)('exports verified members despite an unrelated linked ZIP in the %s cache', async mode => {
+    const { config, directory } = await createFixture()
+    config.mode = mode
+    config.dataDirectory = join(directory, 'data')
+    config.game.root = join(directory, 'game')
+    config.game.saveDirectory = join(directory, 'saves')
+    config.game.backupDirectory = join(directory, 'backups')
+    config.game.bridgeDirectory = join(directory, 'bridge')
+    const id = 'historic-backup', saveName = '旧星系'
+    const group = join(config.game.backupDirectory, id)
+    const downloads = join(config.dataDirectory, mode === 'windows' ? 'downloads' : 'demo-downloads')
+    await Promise.all([mkdir(group, { recursive: true }), mkdir(downloads, { recursive: true })])
+    const files = ['.dsv', '.server', '.moddsv'].map(ext => ({ name: saveName + ext, data: Buffer.from('verified-' + ext) }))
+    const manifest = Buffer.from(JSON.stringify({ schema: 1, id, saveName, createdAt: '2020-01-01T00:00:00Z', reason: 'imported',
+      members: files.map(({ name, data }) => ({ fileName: name, bytes: data.length, sha256: createHash('sha256').update(data).digest('hex') })) }))
+    await writeFile(join(group, 'manifest.json'), manifest)
+    for (const file of files) await writeFile(join(group, file.name), file.data)
+    const foreign = join(directory, 'unrelated.zip')
+    const wrong = buildStoredZip([{ name: 'manifest.json', data: manifest }, ...files.map(file => ({ ...file, data: Buffer.alloc(file.data.length, 0x41) }))])
+    await writeFile(foreign, wrong)
+    await link(foreign, join(downloads, id + '.zip'))
+    await link(foreign, join(group, 'uploaded.zip'))
+    const adapter = mode === 'demo' ? new DemoGameAdapter(config) : new WindowsGameAdapter(config, {
+      inspect: async () => ({ process: null, tasks: { start: true, startManaged: true, configuredTargetUps: null },
+        versions: { game: null, nebula: null, bepinex: null } })
+    })
+    const app = await buildApp({ config, adapter, databasePath: ':memory:' })
+    try {
+      const url = '/api/backups/' + id + '/download'
+      expect((await app.inject({ url })).statusCode).toBe(401)
+      const headers = { cookie: await loginCookie(app) }
+      const get = () => app.inject({ url, headers })
+      const [first, second] = await Promise.all([get(), get()])
+      expect(first.statusCode).toBe(200)
+      expect(second.statusCode).toBe(200)
+      expect(first.rawPayload).toEqual(second.rawPayload)
+      expect(first.rawPayload).not.toEqual(wrong)
+      const extracted = join(directory, 'exported')
+      await extractZipBuffer(first.rawPayload, extracted)
+      expect((await readdir(extracted)).sort()).toEqual(['manifest.json', ...files.map(file => file.name)].sort())
+      expect(await readFile(join(extracted, 'manifest.json'))).toEqual(manifest)
+      for (const file of files) expect(await readFile(join(extracted, file.name))).toEqual(file.data)
+
+      const member = join(group, files[1]!.name)
+      await writeFile(member, Buffer.alloc(files[1]!.data.length, 0x41))
+      const damaged = await get()
+      expect(damaged.statusCode).toBe(409)
+      expect(damaged.json().error.code).toBe('BACKUP_VERIFICATION_FAILED')
+      await unlink(member)
+      const external = join(directory, 'linked-server')
+      await writeFile(external, files[1]!.data)
+      await link(external, member)
+      expect((await get()).statusCode).toBe(409)
+      expect(await readFile(external)).toEqual(files[1]!.data)
+      expect(await readFile(foreign)).toEqual(wrong)
+      expect(await readFile(join(downloads, id + '.zip'))).toEqual(wrong)
+    } finally { await app.close() }
   })
 
   it('accepts unavailable settings as null and never forwards derived read-only metadata', async () => {

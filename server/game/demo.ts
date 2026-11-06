@@ -9,8 +9,8 @@ import { GameAdapterError, invalidInput } from './errors.js'
 import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { modConfigRollbackPreview, prepareModConfigRollback, prepareModConfigWrite, publicModConfig } from './mod-config.js'
 import { timestampId } from './system.js'
-import { writeStoredZip } from './zip.js'
-import { demoImportArchiveName, importUploadedBackup } from '../backup-import.js'
+import { importUploadedBackup } from '../backup-import.js'
+import { exportBackup } from './backup-export.js'
 import { BackupRetention } from './backup-retention.js'
 import { readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import { assertRestoreImpact, backupMemberBlockers, describeRestore } from './restore-preview.js'
@@ -260,15 +260,9 @@ export class DemoGameAdapter implements GameAdapter {
     }
   }
 
-  async download(kind: 'backup' | 'client', id: string): Promise<GameDownload> {
+  async download(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload> {
     if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
-    const manifest = await readBackupManifest(this.#config.game.backupDirectory, id)
-    const original = path.join(this.#config.game.backupDirectory, id, demoImportArchiveName)
-    const cache = path.join(this.#packageDirectory, id + '.zip')
-    const filePath = manifest.reason === 'imported' && await fs.lstat(original).then(stat => stat.isFile(), () => false) ? original : cache
-    const file = await fs.lstat(filePath).catch(() => null)
-    if (!file?.isFile() || file.isSymbolicLink()) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '找不到这份备份下载。')
-    return { path: filePath, fileName: `${id}.zip`, contentType: 'application/zip' }
+    return exportBackup(this.#config.game.backupDirectory, id, signal)
   }
 
   #log(level: LogEntry['level'], message: string): void {
@@ -317,12 +311,6 @@ export class DemoGameAdapter implements GameAdapter {
     await fs.mkdir(backupRoot)
     for (const file of files) await fs.writeFile(path.join(backupRoot, file.name), file.data, { flag: 'wx' })
     await fs.writeFile(path.join(backupRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' })
-    await fs.mkdir(this.#packageDirectory, { recursive: true })
-    const filePath = path.join(this.#config.dataDirectory, 'demo-downloads', `${id}.zip`)
-    await writeStoredZip(filePath, [
-      { name: 'manifest.json', data: `${JSON.stringify(manifest, null, 2)}\n` },
-      ...files.map((file) => ({ name: file.name, data: file.data }))
-    ])
     return { backupId: id, saveName: save.name, members: save.members }
   }
 

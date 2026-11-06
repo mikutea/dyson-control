@@ -158,7 +158,10 @@ export interface RuntimeStatus {
 export type RecoveryStartReadiness = 'ready' | 'game-present' | 'task-unavailable' | 'steam-missing' | 'steam-other-user' | 'session-ambiguous' | 'unknown'
 export interface StartupReadiness { state: RecoveryStartReadiness; message: string; checkedAt: string }
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
-export interface GameDownload { path: string; fileName: string; contentType: string; verifiedBytes?: Uint8Array }
+export type GameDownload = { fileName: string; contentType: string } & (
+  { path: string; verifiedBytes?: Uint8Array; stream?: never } |
+  { stream: import('node:stream').Readable; path?: never; verifiedBytes?: never }
+)
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
 export interface ClientPackageBlocker {
   code: 'INVALID_INPUT' | 'PACKAGE_LOCK_INCOMPLETE' | 'MOD_SIDE_UNCONFIRMED' | 'MOD_PACKAGE_UNIDENTIFIED' |
@@ -230,7 +233,7 @@ export interface GameAdapter {
   clientPackagePlan?(): Promise<ClientPackagePlan>
   clientPackageDetails?(id: string): Promise<ClientPackageDetails>
   run(action: Action, input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>>
-  download?(kind: 'backup' | 'client', id: string): Promise<GameDownload>
+  download?(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload>
   close?(): Promise<void>
 }
 

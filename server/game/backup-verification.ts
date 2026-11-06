@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { createReadStream, type Stats } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
+import type { Readable } from 'node:stream'
+import { buffer } from 'node:stream/consumers'
 import { z } from 'zod'
 import type { ReportStep } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
@@ -16,12 +18,17 @@ const manifestSchema = z.object({
 })
 export type BackupManifest = z.infer<typeof manifestSchema>
 
+async function hashStream(source: Readable): Promise<string> {
+  const hash = createHash('sha256')
+  for await (const chunk of source) hash.update(chunk)
+  return hash.digest('hex')
+}
+
 export async function hashBackupMember(filePath: string, signal?: AbortSignal): Promise<string> {
   signal?.throwIfAborted()
-  const hash = createHash('sha256')
-  for await (const chunk of createReadStream(filePath, { signal })) hash.update(chunk)
+  const hash = await hashStream(createReadStream(filePath, { signal }))
   signal?.throwIfAborted()
-  return hash.digest('hex')
+  return hash
 }
 
 async function backupStat(file: string) {
@@ -34,29 +41,48 @@ async function backupStat(file: string) {
 async function backupRoot(directory: string, id: string): Promise<string> {
   safeId(id, 'backupId')
   const root = ensureInside(directory, path.join(directory, id))
-  const stat = await backupStat(root)
-  if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', '备份目录不存在或不是普通目录。')
+  for (const folder of [directory, root]) {
+    const stat = await backupStat(folder)
+    if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', '备份目录不存在或不是普通目录。')
+  }
   return root
 }
 
-export async function readBackupManifest(directory: string, id: string): Promise<BackupManifest> {
+function sameRegularFile(before: Stats, after: Stats | null): boolean {
+  return !!after?.isFile() && !after.isSymbolicLink() && after.nlink === 1 && after.dev === before.dev &&
+    after.ino === before.ino && after.size === before.size && after.mtimeMs === before.mtimeMs && after.ctimeMs === before.ctimeMs
+}
+
+export async function readBackupManifestRecord(directory: string, id: string) {
   const root = await backupRoot(directory, id)
   try {
     const file = path.join(root, 'manifest.json')
     const stat = await fs.lstat(file)
-    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024 * 1024) throw new Error('Invalid manifest file')
-    const manifest = manifestSchema.parse(JSON.parse(await fs.readFile(file, 'utf8')))
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 1024 * 1024) throw new Error('Invalid manifest file')
+    const handle = await fs.open(file, 'r')
+    let bytes: Buffer
+    try {
+      if (!sameRegularFile(stat, await handle.stat())) throw new Error('Manifest changed before reading')
+      bytes = await buffer(handle.createReadStream({ end: stat.size }))
+      if (bytes.length !== stat.size || !sameRegularFile(stat, await backupStat(file))) throw new Error('Manifest changed during reading')
+    } finally { await handle.close() }
+    const manifest = manifestSchema.parse(JSON.parse(bytes.toString('utf8')))
     if (manifest.id !== id || new Set(manifest.members.map(member => member.fileName)).size !== manifest.members.length ||
       !manifest.members.some(member => member.fileName === `${manifest.saveName}.dsv`) ||
       !manifest.members.some(member => member.fileName === `${manifest.saveName}.server`) ||
       manifest.members.some(member => !extensions.some(extension => member.fileName === `${manifest.saveName}${extension}`))) throw new Error('Invalid save members')
-    return manifest
+    return { manifest, bytes }
   } catch (error) {
     throw new GameAdapterError('BACKUP_MANIFEST_INVALID', '备份清单无效或缺失，未确认此备份完整。', { cause: error })
   }
 }
 
-export async function verifyBackupFiles(directory: string, manifest: BackupManifest, signal?: AbortSignal, report?: ReportStep): Promise<string> {
+export async function readBackupManifest(directory: string, id: string): Promise<BackupManifest> {
+  return (await readBackupManifestRecord(directory, id)).manifest
+}
+
+export async function verifyBackupFiles(directory: string, manifest: BackupManifest, signal?: AbortSignal, report?: ReportStep,
+  readMember: (source: Readable, member: BackupManifest['members'][number]) => Promise<string> = hashStream): Promise<string> {
   signal?.throwIfAborted()
   const root = await backupRoot(directory, manifest.id)
   const unlisted = extensions.map(extension => manifest.saveName + extension).filter(name => !manifest.members.some(member => member.fileName === name))
@@ -71,16 +97,22 @@ export async function verifyBackupFiles(directory: string, manifest: BackupManif
     report?.(`正在校验 ${member.fileName} 的大小与 SHA-256`)
     const file = ensureInside(root, path.join(root, member.fileName))
     const before = await backupStat(file)
-    if (!before?.isFile() || before.isSymbolicLink() || before.size !== member.bytes) {
+    if (!before?.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.size !== member.bytes) {
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份成员缺失、类型异常或大小不匹配：${member.fileName}。`)
     }
     let hash: string
-    try { hash = await hashBackupMember(file, signal) } catch (error) {
+    try {
+      const handle = await fs.open(file, 'r')
+      try {
+        if (!sameRegularFile(before, await handle.stat())) throw new Error('Backup member changed before reading')
+        hash = await readMember(handle.createReadStream({ signal, end: member.bytes }), member)
+      } finally { await handle.close() }
+    } catch (error) {
       signal?.throwIfAborted()
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `无法读取备份成员：${member.fileName}；请检查文件权限和存储是否可用。`, { cause: error })
     }
     const after = await backupStat(file)
-    if (hash !== member.sha256 || !after?.isFile() || after.isSymbolicLink() || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
+    if (hash !== member.sha256 || !sameRegularFile(before, after)) {
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份成员内容不匹配或在校验期间变化：${member.fileName}。`)
     }
   }

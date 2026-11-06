@@ -651,7 +651,7 @@ function cookieOptions(request: FastifyRequest) {
 function gameErrorStatus(code: string): number {
   if (code === 'LOG_UNAVAILABLE') return 503
   if (['RESTORE_STATE_UNKNOWN', 'RESTORE_STORAGE_UNAVAILABLE', 'BACKUP_STORAGE_UNAVAILABLE'].includes(code)) return 503
-  if (['BACKUP_MANIFEST_INVALID', 'RESTORE_STARTUP_INVALID'].includes(code)) return 409
+  if (['BACKUP_MANIFEST_INVALID', 'BACKUP_VERIFICATION_FAILED', 'RESTORE_STARTUP_INVALID'].includes(code)) return 409
   if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
@@ -677,13 +677,26 @@ async function sendDownload(
 ) {
   assertNoQuery(request)
   if (!adapter.download) throw new ApiError(404, 'download_not_available', '当前下载不可用。')
-  const download = await adapter.download(kind, id)
-  if (!download.verifiedBytes && !existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
-  const name = basename(download.fileName)
-  const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
-  reply.type(download.contentType)
-  reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
-  return reply.send(download.verifiedBytes ?? createReadStream(download.path))
+  const abort = new AbortController()
+  const onClose = () => { if (!reply.raw.writableFinished) abort.abort() }
+  reply.raw.once('close', onClose)
+  if (reply.raw.destroyed) onClose()
+  let stream: Readable | undefined
+  try {
+    const download = await adapter.download(kind, id, abort.signal)
+    stream = download.stream
+    abort.signal.throwIfAborted()
+    if (!download.stream && !download.verifiedBytes && !existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
+    const name = basename(download.fileName)
+    const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
+    reply.type(download.contentType)
+    reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
+    if (download.stream) return await reply.send(download.stream)
+    return await reply.send(download.verifiedBytes ?? createReadStream(download.path))
+  } finally {
+    stream?.destroy()
+    reply.raw.off('close', onClose)
+  }
 }
 
 const MAX_LOG_DOWNLOAD_BYTES = 16 * 1024 * 1024

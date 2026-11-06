@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ControlConfig, GameAdapter } from '../../shared/contracts.js'
 import { buildApp } from '../app.js'
@@ -9,6 +10,7 @@ import { hashPassword } from '../auth.js'
 import { BackupRetention } from './backup-retention.js'
 import { DemoGameAdapter } from './demo.js'
 import { WindowsGameAdapter } from './windows.js'
+import { extractZipBuffer } from './updates.js'
 import { buildStoredZip } from './zip.js'
 
 let root: string
@@ -72,7 +74,8 @@ describe('automatic backup retention', () => {
     const before = await groupSnapshot(dir)
     const downloads = path.join(config.dataDirectory, mode === 'demo' ? 'demo-downloads' : 'downloads')
     const cache = path.join(downloads, id + '.zip')
-    if (mode === 'windows') await fs.writeFile(cache, buildStoredZip(before.map(([name, data]) => ({ name: String(name), data }))))
+    await fs.mkdir(downloads, { recursive: true })
+    await fs.writeFile(cache, buildStoredZip(before.map(([name, data]) => ({ name: String(name), data }))))
     const zipBefore = await fs.readFile(cache)
     expect(await run(adapter, 'set-backup-retained', { backupId: id, retained: true })).toEqual({ backupId: id, retained: true })
     await run(adapter, 'set-backup-retained', { backupId: id, retained: true })
@@ -84,7 +87,9 @@ describe('automatic backup retention', () => {
     adapter = openAdapter()
     expect((await adapter.backups()).find(item => item.id === id)?.retained).toBe(true)
     const download = await adapter.download!('backup', id)
-    expect(await fs.readFile(download.path)).toEqual(zipBefore)
+    const extracted = path.join(root, 'downloaded')
+    await extractZipBuffer(await buffer(download.stream!), extracted)
+    expect(await groupSnapshot(extracted)).toEqual(before)
     expect(await groupSnapshot(dir)).toEqual(before)
 
     await run(adapter, 'write-settings', { settings: { ...await adapter.settings(), backupKeep: 2 } })

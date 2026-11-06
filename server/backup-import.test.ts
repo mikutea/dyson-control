@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promis
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
+import { buffer } from 'node:stream/consumers'
 import { promisify } from 'node:util'
 import { deflateRawSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
@@ -12,6 +13,7 @@ import { BackupImportError, importUploadedBackup } from './backup-import.js'
 import { readBackupManifest, verifyBackupFiles } from './game/backup-verification.js'
 import { DemoGameAdapter } from './game/demo.js'
 import { WindowsGameAdapter } from './game/windows.js'
+import { extractZipBuffer } from './game/updates.js'
 import { buildStoredZip } from './game/zip.js'
 import { BackupUploadStore } from './uploads.js'
 
@@ -97,7 +99,7 @@ describe('ordinary save ZIP import', () => {
     return { uploadId: metadata.uploadId }
   }
 
-  it('imports a root stored pair, keeps same-name versions separate, and returns the checked original in demo', async () => {
+  it('imports a root stored pair, keeps same-name versions separate, and exports the verified pair with its manifest in demo', async () => {
     const { config } = await createFixture()
     const adapter = new DemoGameAdapter(config)
     const archive = buildStoredZip(raw(['星团.dsv', '星团.server']))
@@ -107,9 +109,15 @@ describe('ordinary save ZIP import', () => {
     expect(result).toMatchObject({ backupId: id, saveName: '星团', members: ['星团.dsv', '星团.server'], reason: 'imported' })
     const manifest = await readBackupManifest(config.game.backupDirectory, id)
     expect(await verifyBackupFiles(config.game.backupDirectory, manifest)).toBe(join(config.game.backupDirectory, id))
-    const original = await adapter.download('backup', id)
-    expect(original.fileName).toBe(id + '.zip')
-    expect(await readFile(original.path)).toEqual(archive)
+    const download = await adapter.download('backup', id)
+    expect(download.fileName).toBe(id + '.zip')
+    const exported = join(dirname(config.dataDirectory), 'exported')
+    await extractZipBuffer(await buffer(download.stream!), exported)
+    expect((await readdir(exported)).sort()).toEqual(['manifest.json', '星团.dsv', '星团.server'])
+    expect(JSON.parse(await readFile(join(exported, 'manifest.json'), 'utf8'))).toEqual(manifest)
+    for (const member of manifest.members) {
+      expect(createHash('sha256').update(await readFile(join(exported, member.fileName))).digest('hex')).toBe(member.sha256)
+    }
     const existing = await readFile(join(config.game.backupDirectory, id, 'manifest.json'))
     const retry = await stage(config, archive, 'second-request')
     await expect(adapter.run('import-backup', retry, () => {}, signal())).rejects.toMatchObject({ code: 'BACKUP_DESTINATION_EXISTS', message: expect.stringContaining(id) })

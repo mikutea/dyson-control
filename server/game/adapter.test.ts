@@ -4,6 +4,7 @@ import { writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import { promisify } from 'node:util'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ControlConfig } from '../../shared/contracts.js'
@@ -297,7 +298,7 @@ describe('backup restore impact', () => {
     expect(original.filter(item => runningProtection.includes(item.id)).map(item => [item.saveName, item.reason]).sort()).toEqual([
       ['DemoGalaxy', 'automatic-before-restore'], ['Sandbox', 'automatic-before-restore']
     ])
-    const exports = new Map(await Promise.all(original.map(async item => [item.id, await fs.readFile((await adapter.download!('backup', item.id)).path)] as const)))
+    const exports = new Map(await Promise.all(original.map(async item => [item.id, await buffer((await adapter.download!('backup', item.id)).stream!)] as const)))
     const restored = createGameAdapter(settings)
     await restored.run('stop', {}, () => {}, new AbortController().signal)
     expect(await restored.backups()).toEqual(original)
@@ -312,7 +313,7 @@ describe('backup restore impact', () => {
     ])
     for (const [id, bytes] of exports) {
       await expect(restored.run('verify-backup', { backupId: id }, () => {}, new AbortController().signal)).resolves.toMatchObject({ backupId: id })
-      expect(await fs.readFile((await restored.download!('backup', id)).path)).toEqual(bytes)
+      expect(await buffer((await restored.download!('backup', id)).stream!)).toEqual(bytes)
     }
   })
 })
@@ -897,7 +898,9 @@ describe('demo adapter', () => {
     await adapter.run('toggle-mod', { modId: 'factory-locator', enabled: false }, () => undefined, signal)
     await adapter.run('install-update', { component: 'nebula', version: '0.9.23' }, () => undefined, signal)
     const client = await adapter.run('create-client-package', {}, () => undefined, signal)
-    expect((await adapter.download!('backup', String(backup.backupId))).fileName).toMatch(/\.zip$/)
+    const download = await adapter.download!('backup', String(backup.backupId))
+    expect(download.fileName).toMatch(/\.zip$/)
+    expect((await buffer(download.stream!)).length).toBeGreaterThan(0)
     expect((await adapter.download!('client', String(client.packageId))).fileName).toMatch(/\.r2z$/)
     await adapter.run('restore', { backupId: backup.backupId }, () => undefined, signal)
     await adapter.run('restart', {}, () => undefined, signal)
@@ -2184,7 +2187,7 @@ describe('Windows adapter fixture behavior', () => {
     const result = await adapter.run('create-client-package', {}, () => undefined, new AbortController().signal)
     const download = await adapter.download('client', String(result.packageId))
     const extracted = path.join(path.dirname(fixture.dataDirectory), 'client-extracted')
-    await extractZipBuffer(await fs.readFile(download.path), extracted)
+    await extractZipBuffer(await fs.readFile(download.path!), extracted)
     const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8')) as { mods: Array<{ name: string; version: { major: number; minor: number; patch: number } }> }
     expect(profile.mods).toContainEqual({ name: 'xiaoye97-BepInEx', version: { major: 5, minor: 4, patch: 17 }, enabled: true })
     expect(profile.mods).not.toContainEqual(expect.objectContaining({ name: 'xiaoye97-BepInEx', version: { major: 5, minor: 4, patch: 21 } }))
@@ -2269,7 +2272,7 @@ describe('Windows adapter fixture behavior', () => {
     expect((await adapter.mods()).find(mod => mod.id === initial.id)).toMatchObject({ side: 'client', sideSource: 'administrator' })
     const exported = await adapter.run('create-client-package', {}, () => undefined, new AbortController().signal)
     const extracted = path.join(path.dirname(fixture.dataDirectory), 'side-client-extracted')
-    await extractZipBuffer(await fs.readFile((await adapter.download('client', String(exported.packageId))).path), extracted)
+    await extractZipBuffer(await fs.readFile((await adapter.download('client', String(exported.packageId))).path!), extracted)
     const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8')) as { mods: Array<{ name: string }> }
     expect(profile.mods).toContainEqual(expect.objectContaining({ name: 'owner-Feature' }))
 

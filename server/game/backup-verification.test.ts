@@ -1,10 +1,12 @@
 import { createHash } from 'node:crypto'
 import { writeFileSync } from 'node:fs'
-import fs from 'node:fs/promises'
+import fs, { type FileHandle } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { hashBackupMember, readBackupManifest, runBackupVerification, type BackupManifest } from './backup-verification.js'
+import { exportBackup } from './backup-export.js'
+import { BackupZipWriter } from './zip.js'
 
 const directories: string[] = []
 afterEach(async () => { for (const directory of directories.splice(0)) await fs.rm(directory, { recursive: true, force: true }) })
@@ -130,5 +132,27 @@ describe('backup integrity verification', () => {
     const reports: string[] = []
     await expect(runBackupVerification('missing-directory', { backupId: 'missing' }, message => reports.push(message), controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
     expect(reports).toEqual([])
+  })
+
+  it('closes its unnamed archive when a download is canceled during member compression', async () => {
+    const f = await fixture(), controller = new AbortController()
+    let output: FileHandle | undefined, temp: string | undefined
+    const open = fs.open.bind(fs)
+    const capture = vi.spyOn(fs, 'open').mockImplementation(async (file, flags, mode) => {
+      const handle = await open(file, flags, mode)
+      if (flags === 'wx+') { output = handle; temp = String(file) }
+      return handle
+    })
+    const add = BackupZipWriter.prototype.add
+    const cancel = vi.spyOn(BackupZipWriter.prototype, 'add').mockImplementation(function (this: BackupZipWriter, name, size, source, signal) {
+      if (name.endsWith('.dsv')) source.once('data', () => controller.abort())
+      return add.call(this, name, size, source, signal)
+    })
+    try {
+      await expect(exportBackup(f.directory, f.manifest.id, controller.signal)).rejects.toMatchObject({ name: 'AbortError' })
+      expect(output?.fd).toBe(-1)
+      await expect(fs.lstat(temp!)).rejects.toMatchObject({ code: 'ENOENT' })
+      expect(await fs.readFile(path.join(f.root, f.manifest.members[0]!.fileName), 'utf8')).toBe('original-.dsv')
+    } finally { capture.mockRestore(); cancel.mockRestore() }
   })
 })

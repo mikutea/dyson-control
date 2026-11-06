@@ -8,6 +8,7 @@ import type {
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModConfigRollbackPreview, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { exportBackup } from './backup-export.js'
 import { BackupRetention } from './backup-retention.js'
 import { hashBackupMember as sha256, readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import {
@@ -593,22 +594,12 @@ export class WindowsGameAdapter implements GameAdapter {
     unsupported(action, 'the Windows adapter does not implement this action')
   }
 
-  async download(kind: 'backup' | 'client', id: string): Promise<GameDownload> {
+  async download(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload> {
     await this.#initialization
     safeId(id, `${kind} id`)
     if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
 
-    const manifest = await this.#readBackupManifest(id)
-    const backupRoot = await this.#verifyBackup(manifest)
-    const archivePath = path.join(this.#downloadDirectory, `${id}.zip`)
-    if (!(await pathExists(archivePath))) {
-      const entries = [
-        { sourcePath: path.join(backupRoot, 'manifest.json'), entryName: 'manifest.json' },
-        ...manifest.members.map((member) => ({ sourcePath: path.join(backupRoot, member.fileName), entryName: member.fileName }))
-      ]
-      await this.#runScript('archive-files.ps1', { outputPath: archivePath, entries }, undefined, 5 * 60_000)
-    }
-    return { path: archivePath, fileName: `${id}.zip`, contentType: 'application/zip' }
+    return exportBackup(this.#config.game.backupDirectory, id, signal)
   }
 
   async #save(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
