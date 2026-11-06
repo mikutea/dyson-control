@@ -23,7 +23,7 @@ import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { clientPackageDownload, compareClientPackage, displayModName, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, displayModName, displayModVersion, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
 import { assertSettingsRollback, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
@@ -453,7 +453,7 @@ export class WindowsGameAdapter implements GameAdapter {
     const matches = records.filter(record => record.packageIdentity === packageId.toLowerCase())
     if (matches.length > 1) {
       const active = matches.filter(record => record.dto.enabled)
-      return active.length === 1 && active[0]!.dto.version !== 'unknown' ? active[0]!.dto.version : null
+      return active.length === 1 ? displayModVersion(active[0]!.dto.version) : null
     }
     const recorded = await this.#updates.installedPackageVersion(packageId)
     if (recorded) return recorded
@@ -590,9 +590,10 @@ export class WindowsGameAdapter implements GameAdapter {
       if (group.length === 1) return first
       const active = group.filter(record => record.dto.enabled)
       const effective = active.length === 1 ? active[0]!.dto : null
-      return { ...(effective ?? first), name: displayModName((effective ?? first).name, index), enabled: active.length > 0, version: effective?.version ?? 'unknown',
+      return { ...(effective ?? first), name: displayModName((effective ?? first).name, index), enabled: active.length > 0,
+        version: effective && displayModVersion(effective.version) || 'unknown',
         required: group.some(record => record.dto.required), description: '',
-        installations: group.map(({ dto, location }) => ({ path: location, version: dto.version, enabled: dto.enabled })) }
+        installations: group.map(({ dto, location }) => ({ path: location, version: displayModVersion(dto.version) ?? 'unknown', enabled: dto.enabled })) }
     })
     return this.#modSides.apply(mods)
   }

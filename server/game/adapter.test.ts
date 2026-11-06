@@ -2294,6 +2294,16 @@ describe('Windows adapter fixture behavior', () => {
     expect(await adapter.clientPackagePlan()).toMatchObject({ ready: true, mods: expect.arrayContaining([{ name: 'Maker-Feature', version: '2.0.0' }]) })
     await fs.rename(active, path.join(root, 'disabled-plugins', 'Z-current'))
     expect(await adapter.clientPackagePlan()).toMatchObject({ ready: true, mods: [{ name: 'xiaoye97-BepInEx', version: '5.4.17' }] })
+    for (const folder of ['A-old', 'Z-current']) {
+      await fs.writeFile(path.join(root, 'disabled-plugins', folder, 'manifest.json'), JSON.stringify({
+        name: 'C:\\fixture-private\\mod\nspoof', version_number: 'C:\\fixture-private\\version\nspoof',
+      }))
+    }
+    const inventory = await adapter.mods()
+    expect(inventory[0]!.installations?.map(copy => [copy.path, copy.version])).toEqual([
+      ['BepInEx/disabled-plugins/A-old', 'unknown'], ['BepInEx/disabled-plugins/Z-current', 'unknown'],
+    ])
+    expect(JSON.stringify(inventory)).not.toContain('fixture-private')
   })
 
   it('exports exact package versions from BOM-prefixed installed manifests', async () => {

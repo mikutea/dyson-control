@@ -52,6 +52,9 @@ interface PreparedPackage { plan: ClientPackagePlan; bytes: Buffer | null }
 export function displayModName(name: string, index?: number): string {
   return /^[\p{L}\p{N}_ .-]{1,200}$/u.test(name) ? name : (index === undefined ? '未识别模组' : `未识别模组 ${index + 1}`)
 }
+export function displayModVersion(version: string): string | null {
+  return /^[\w.+-]{1,100}$/.test(version) && version !== 'unknown' ? version : null
+}
 
 function preparePackage(profileName: string, address: string, mods: Mod[]): PreparedPackage {
   const blockers: ClientPackageBlocker[] = []
@@ -72,7 +75,7 @@ function preparePackage(profileName: string, address: string, mods: Mod[]): Prep
   for (const [index, mod] of candidates.entries()) {
     if (conflicts.has(mod.id)) continue
     const modName = displayModName(mod.name, index)
-    const version = /^[\w.+-]{1,100}$/.test(mod.version) && mod.version !== 'unknown' ? mod.version : null
+    const version = displayModVersion(mod.version)
     const issue = (code: ClientPackageBlocker['code'], message: string) => blockers.push({ code, modName, version, message })
     const previous = blockers.length
     if (mod.side === 'unknown') issue('MOD_SIDE_UNCONFIRMED', '请在模组页确认此版本的适用端。')
