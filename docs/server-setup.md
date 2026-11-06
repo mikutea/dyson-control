@@ -46,6 +46,12 @@ Windows 交互登录使用 Microsoft `node-pty` 的 ConPTY 支持，依赖固定
 
 失败的下载文件和 `dataDirectory/first-install/<id>/installation.json` 会保留。如果配置失败且确认没有启动任务或游戏进程，会把本次新安装目录移回暂存目录；不能确认任务清理成功时保留原目录并记录 `needs-review`。不会自动重试、覆盖已有游戏、迁移存档或启动服务器。
 
+重新打开“安装与授权”，可看到通过安装前检查后最近一次首次安装的结果、最后记录的阶段，以及有记录的游戏 Build、开始时间和更新时间。旧记录没有更新时间，也可能没有失败阶段。面板只在这一安装任务仍在执行时显示“正在安装”；面板重启后留下的下载或配置记录显示“安装结果未确认”。游戏文件和启动任务的存在不代表这次安装成功。
+
+- **安装失败，已保留文件**：到“活动 → 管理操作”查看失败步骤。解决问题后，确认目标目录为空且没有游戏进程或启动任务，再手动安装。
+- **需要人工核对 / 结果未确认**：保留现场，先核对 Windows 游戏进程、启动任务、目标目录和暂存文件。打开页面不会清理文件、续装或启动游戏。
+- **无法读取安装记录**：检查安装记录及面板服务的读取权限，修复后刷新。没有有效的完成记录时，页面不会用旧的成功结果代替。
+
 安装完成后，在自己的主机上实际启动，确认 Bridge 联通、保存和匹配客户端加入。需要外网联机时，再按[连接自己的服务器](networking.md)配置自己的地址。防火墙、端口转发、外网地址和图形版 Steam 登录不会在安装时自动修改。
 
 参考：[Valve SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)、[Valve 账号授权说明](https://partner.steamgames.com/doc/sdk/uploading)、[Nebula 无界面服务器说明](https://github.com/NebulaModTeam/nebula/wiki/Setup-Headless-Server)。

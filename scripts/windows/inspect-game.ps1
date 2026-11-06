@@ -19,9 +19,15 @@ $logFile = Get-FullPathOrNull $argsObject.logFile
 
 $matchingProcesses = @(
   Get-CimInstance Win32_Process -Filter "Name = 'DSPGAME.exe'" | Where-Object {
-    if ($null -eq $_.ExecutablePath) { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$_.ExecutablePath)) {
+      if ($argsObject.requireProcessIdentity) { throw 'Cannot identify a DSPGAME.exe process for restore.' }
+      return $false
+    }
     try { return (ConvertTo-DysonCanonicalPath ([string]$_.ExecutablePath)).Equals($canonicalGameExe, [StringComparison]::OrdinalIgnoreCase) }
-    catch { return $false }
+    catch {
+      if ($argsObject.requireProcessIdentity) { throw 'Cannot identify a DSPGAME.exe process for restore.' }
+      return $false
+    }
   }
 )
 if ($matchingProcesses.Count -gt 1) {

@@ -1,17 +1,17 @@
 import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
-  Activity, Archive, Box, CircleGauge, Clock3, CloudDownload, Cpu, Database,
+  Activity, Archive, Box, CircleGauge, Clock3, Cpu, Database,
   Download, FileArchive, Gamepad2, HardDrive, MemoryStick, PackageCheck, Play, Power,
   RefreshCw, RotateCcw, Save as SaveIcon, Server as ServerIcon, Settings2, ShieldCheck,
   Square, TimerReset, UserRound, Users, Wifi,
 } from 'lucide-react'
 import type {
-  Backup, ClientPackage, ComponentVersion, GameSettings, Job, LogEntry, Mod, Overview,
+  Backup, ComponentVersion, GameSettings, Job, LogEntry, Mod, Overview,
   Page, Player, Save, VersionLock,
 } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, MetricBar, PageHeader, Panel, StatusDot } from './components'
-import { formatBytes, formatDate, formatDuration, formatFullDate, percent, serverStateLabels } from './format'
+import { formatBackupReason, formatBytes, formatDate, formatDuration, formatFullDate, percent, serverStateLabels } from './format'
 import { useResource } from './hooks'
 import { BackupImport } from './BackupImport'
 import { ModCatalog } from './ModCatalog'
@@ -27,6 +27,8 @@ import { ControlUpdates } from './ControlUpdates'
 import { ComponentVersionCard } from './ComponentVersionCard'
 import { ServerSetup } from './ServerSetup'
 import { ActivityPage } from './ActivityPage'
+import { ClientsPage } from './ClientsPage'
+import { RestorePreview } from './RestorePreview'
 
 interface PagesProps { page: Page; refreshToken: number; overview: Overview | null; onOverview: (overview: Overview) => void; runAction: RunAction; onJob: (job: Job) => void; operationActive: boolean }
 
@@ -147,6 +149,7 @@ function ModsPage({ refreshToken, runAction }: PagesProps) {
 function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }: PagesProps) {
   const saves = useResource<Save[]>('/saves', refreshToken)
   const backups = useResource<Backup[]>('/backups', refreshToken)
+  const [selectedBackup, setSelectedBackup] = useState<Backup | null>(null)
   return <><PageHeader title="存档" description="管理当前存档与可恢复的备份" actions={<Button variant="primary" icon={<Archive />} onClick={() => runAction('backup')}>立即备份</Button>} />
     <div className="split-grid">
       <Panel title="游戏存档" icon={<Database />}>
@@ -158,26 +161,17 @@ function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }
         <ResourceBody resource={backups} emptyTitle="还没有备份" emptyDescription="创建备份后可随时在这里恢复">
           {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}>
             <span className="file-icon"><ShieldCheck /></span>
-            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {backup.reason === 'automatic-before-load-save' ? '切换存档前' : backup.reason}</small></div>
+            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {formatBackupReason(backup.reason)}</small></div>
             <a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a>
             <Button variant="quiet" icon={<ShieldCheck />} aria-label={`校验备份 ${backup.saveName}`} disabled={operationActive || Boolean(backups.error)} onClick={() => runAction('verify-backup', { backupId: backup.id })}>校验</Button>
-            <Button variant="quiet" icon={<RotateCcw />} onClick={() => runAction('restore', { backupId: backup.id }, { title: `恢复 ${backup.saveName}？`, description: '当前存档将被替换。系统会先为当前存档创建一份可恢复的备份。', label: '恢复备份', danger: true })}>恢复</Button>
+            <Button variant="quiet" icon={<RotateCcw />} aria-label={`预览恢复 ${backup.saveName}`} onClick={() => setSelectedBackup(backup)}>恢复</Button>
           </div>)}</div>}
         </ResourceBody>
       </Panel>
-    </div><BackupImport onJob={onJob} /></>
+    </div><BackupImport onJob={onJob} />
+    {selectedBackup && <RestorePreview key={selectedBackup.id} backup={selectedBackup} operationActive={operationActive} refreshToken={refreshToken} runAction={runAction} onClose={() => setSelectedBackup(null)} />}</>
 }
 
-function ClientsPage({ refreshToken, runAction }: PagesProps) {
-  const packages = useResource<ClientPackage[]>('/client-packages', refreshToken)
-  return <><PageHeader title="客户端" description="为玩家准备与服务器一致的客户端包" actions={<Button variant="primary" icon={<Box />} onClick={() => runAction('create-client-package')}>创建客户端包</Button>} />
-    <div className="client-intro"><Gamepad2 /><div><h2>让新玩家快速加入</h2><p>配置包记录所需模组和连接地址。下载后将文件发给玩家，在 r2modman 中导入。</p></div></div>
-    <Panel title="可下载的客户端包" icon={<CloudDownload />}>
-      <ResourceBody resource={packages} emptyTitle="还没有客户端包" emptyDescription="点击上方按钮创建第一份客户端包">
-        {(items) => <div className="package-list">{items.map((item) => <div key={item.id}><span className="package-icon"><Box /></span><div><strong>{item.name}</strong><p>{item.modCount} 个模组 · {formatBytes(item.bytes)}</p><small>创建于 {formatFullDate(item.createdAt)}</small></div><a className="button button-primary" href={item.downloadUrl || `/api/client-packages/${encodeURIComponent(item.id)}/download`}><Download /><span>下载</span></a></div>)}</div>}
-      </ResourceBody>
-    </Panel></>
-}
 
 function ServerPage({ refreshToken, overview: streamedOverview, onOverview, runAction }: PagesProps) {
   const overviewResource = useResource<Overview>('/overview', refreshToken)

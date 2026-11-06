@@ -1,4 +1,4 @@
-import type { ActionRequest, ApiErrorBody, Job } from '../../shared/contracts'
+import type { ApiErrorBody, Job } from '../../shared/contracts'
 
 type Envelope<T> = { data: T }
 
@@ -59,8 +59,8 @@ export function remove<T>(path: string) {
   return api<T>(path, { method: 'DELETE' })
 }
 
-export function submitAction(action: ActionRequest['action'], input: Record<string, unknown> = {}) {
-  return post<Job>('/actions', { requestId: crypto.randomUUID(), action, input } satisfies ActionRequest)
+export function newRequestId(): string {
+  return Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('')
 }
 
 export function uploadBackup(file: File, requestId: string, signal: AbortSignal, onProgress: (percent: number) => void): Promise<Job> {

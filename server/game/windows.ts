@@ -3,7 +3,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type {
-  Action, Backup, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameSettings, GameSettingsHistoryEntry,
+  Action, Backup, BackupRestorePreview, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameDownload, GameSettings, GameSettingsHistoryEntry,
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
@@ -19,7 +19,8 @@ import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { createR2ModmanPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, listClientPackages, withClientRuntime, writeClientPackage } from './profile.js'
+import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
 import { SettingsHistoryManager } from './settings-history.js'
 import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, timestampId } from './system.js'
@@ -38,7 +39,6 @@ interface InspectResult {
 }
 
 interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
-interface ClientManifest { item: ClientPackage; fileName: string }
 interface StoredSettings { schema: 1; serverName: string; backupKeep: number; address: string }
 interface StartupSettings { schema: 1; targetUps: number; saveName: string | null }
 type WindowsScriptRunner = <T>(name: string, input: unknown, signal?: AbortSignal, timeoutMs?: number) => Promise<T>
@@ -55,7 +55,6 @@ interface WindowsAdapterOptions {
   pollIntervalMs?: number
 }
 
-const saveExtensions = ['.dsv', '.server', '.moddsv'] as const
 const requiredModPattern = /(?:^|[-_.])(nebula(?:multiplayermod)?|bepinex|dspmodsave|dysoncontrolbridge)(?:$|[-_.])/i
 const componentPackageIds = { nebula: 'nebula-NebulaMultiplayerMod', bepinex: 'xiaoye97-BepInEx' } as const
 const incompleteUpdateRecoveryCodes = new Set(['UPDATE_ROLLBACK_FAILED', 'STEAM_UPDATE_ROLLBACK_FAILED', 'STEAM_ROLLBACK_RECOVERY_FAILED', 'MOD_TOGGLE_ROLLBACK_FAILED'])
@@ -269,13 +268,14 @@ export class WindowsGameAdapter implements GameAdapter {
     return expired.length
   }
 
-  async #inspect(fresh = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
+  async #inspect(fresh = false, requireProcessIdentity = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
     await this.#initialization
     if (!fresh && this.#inspectCache && this.#clock() - this.#inspectCache.at < 2_000) return this.#inspectCache.value
     const value = this.#inspectOverride
       ? await this.#inspectOverride()
       : await this.#runScript<InspectResult>('inspect-game.ps1', {
           gameRoot: this.#config.game.root,
+          requireProcessIdentity,
           saveDirectory: this.#config.game.saveDirectory,
           logFile: this.#config.game.logFile,
           managedStartScript: resolveWindowsScript('start-game.ps1'),
@@ -506,18 +506,12 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async clientPackages(): Promise<ClientPackage[]> {
     await this.#initialization
-    const entries = await fs.readdir(this.#packageDirectory, { withFileTypes: true })
-    const results: ClientPackage[] = []
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue
-      try {
-        const manifest = JSON.parse(await fs.readFile(path.join(this.#packageDirectory, entry.name), 'utf8')) as ClientManifest
-        const archive = path.join(this.#packageDirectory, manifest.fileName)
-        const stat = await fs.lstat(archive)
-        if (stat.isFile() && !stat.isSymbolicLink() && stat.size === manifest.item.bytes) results.push(manifest.item)
-      } catch { /* Ignore incomplete package metadata. */ }
-    }
-    return results.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    return listClientPackages(this.#packageDirectory)
+  }
+
+  async clientPackageDetails(id: string) {
+    await this.#initialization
+    return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
   }
 
   async mods(): Promise<Mod[]> { return this.#modSides.apply((await this.#scanMods()).map((record) => record.dto)) }
@@ -594,19 +588,10 @@ export class WindowsGameAdapter implements GameAdapter {
     unsupported(action, 'the Windows adapter does not implement this action')
   }
 
-  async download(kind: 'backup' | 'client', id: string): Promise<{ path: string; fileName: string; contentType: string }> {
+  async download(kind: 'backup' | 'client', id: string): Promise<GameDownload> {
     await this.#initialization
     safeId(id, `${kind} id`)
-    if (kind === 'client') {
-      const manifestPath = path.join(this.#packageDirectory, `${id}.json`)
-      let manifest: ClientManifest
-      try { manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as ClientManifest } catch { throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested client package does not exist.') }
-      if (manifest.item.id !== id || path.basename(manifest.fileName) !== manifest.fileName) throw new GameAdapterError('PACKAGE_MANIFEST_INVALID', 'Client package metadata is invalid.')
-      const filePath = ensureInside(this.#packageDirectory, path.join(this.#packageDirectory, manifest.fileName))
-      const stat = await fs.lstat(filePath).catch(() => null)
-      if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== manifest.item.bytes) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested client package does not exist.')
-      return { path: filePath, fileName: manifest.item.name, contentType: 'application/zip' }
-    }
+    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
 
     const manifest = await this.#readBackupManifest(id)
     const backupRoot = await this.#verifyBackup(manifest)
@@ -741,10 +726,13 @@ export class WindowsGameAdapter implements GameAdapter {
     return result
   }
 
-  async #start(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
-    if ((await this.#inspect(true)).process) return { alreadyRunning: true, state: 'running' }
+  async #start(report: ReportStep, signal: AbortSignal, afterRestore = false): Promise<Record<string, unknown>> {
+    if (afterRestore) {
+      await this.#requireStoppedForRestore()
+      if (await this.#saveRestore.hasPending()) throw new GameAdapterError('SAVE_RESTORE_PENDING', '存在尚未完成的存档恢复，请检查任务记录并保持停服。')
+    } else if ((await this.#inspect(true)).process) return { alreadyRunning: true, state: 'running' }
     if (!this.#config.game.startTaskName) unsupported('start', 'no start scheduled task is configured')
-    await this.#recoverInterruptedSaveRestore(report)
+    if (!afterRestore) await this.#recoverInterruptedSaveRestore(report)
     await this.#updates.recoverInterrupted(report, signal)
     await this.#steamUpdates?.recoverInterrupted(report, signal)
     report('正在启动服务器')
@@ -754,19 +742,22 @@ export class WindowsGameAdapter implements GameAdapter {
     return { state: 'running', pid: processId, bridgeReady: true }
   }
 
-  async #startWithTimeout(report: ReportStep): Promise<Record<string, unknown>> {
+  async #startWithTimeout(report: ReportStep, afterRestore = false): Promise<Record<string, unknown>> {
     // Completing a mutation or recovering an interrupted operation must allow
     // the same cold-start interval as a direct start, plus task setup time.
-    return this.#start(report, AbortSignal.timeout(this.#startupTimeoutMs + this.#lifecycleTimeoutMs))
+    return this.#start(report, AbortSignal.timeout(this.#startupTimeoutMs + this.#lifecycleTimeoutMs), afterRestore)
   }
 
-  async #stop(report: ReportStep, signal: AbortSignal, saveFirst: boolean): Promise<Record<string, unknown>> {
-    const before = await this.#inspect(true)
+  async #stop(report: ReportStep, signal: AbortSignal, saveFirst: boolean, savedProcessId?: number): Promise<Record<string, unknown>> {
+    const before = savedProcessId === undefined ? await this.#inspect(true) : await this.#inspectForRestore()
     if (!before.process) return { alreadyStopped: true, state: 'stopped' }
     const expectedProcessId = before.process.pid
+    if (savedProcessId !== undefined && expectedProcessId !== savedProcessId) {
+      throw new GameAdapterError('GAME_STOP_PROCESS_CHANGED', '保存后游戏进程已变化，未停止新进程。请重新检查恢复预览。')
+    }
     let saveResult: Record<string, unknown> | null = null
     if (saveFirst) saveResult = await this.#save(report, signal)
-    const current = await this.#inspect(true)
+    const current = savedProcessId === undefined ? await this.#inspect(true) : await this.#inspectForRestore()
     if (!current.process) return { state: 'stopped', save: saveResult }
     if (current.process.pid !== expectedProcessId) {
       throw new GameAdapterError('GAME_STOP_PROCESS_CHANGED', 'The DSP process changed before the Bridge stop request could be sent.')
@@ -859,29 +850,23 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #existingSaveMemberCount(name: string): Promise<number> {
-    let count = 0
-    for (const extension of saveExtensions) {
-      const fileName = `${name}${extension}`
-      const memberPath = ensureInside(this.#config.game.saveDirectory, path.join(this.#config.game.saveDirectory, fileName))
-      const stat = await fs.lstat(memberPath).catch(() => null)
-      if (!stat) continue
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new GameAdapterError('SAVE_MEMBER_INVALID', `Cannot replace abnormal save member: ${fileName}`)
-      count++
-    }
-    return count
+    const members = await readSaveMembers(this.#config.game.saveDirectory, name)
+    const unsafe = members.find(member => !member.stat.isFile() || member.stat.isSymbolicLink())
+    if (unsafe) throw new GameAdapterError('SAVE_MEMBER_INVALID', `存档成员 ${unsafe.fileName} 不是普通文件。`)
+    return members.length
   }
 
   async #createBackup(name: string, reason: string, report: ReportStep, expectedReceipt: SaveReceipt | null = null): Promise<BackupManifest> {
     if (!validSaveName(name)) invalidInput('The save name is invalid.')
-    const sourceMembers: Array<{ fileName: string; sourcePath: string; stat: Awaited<ReturnType<typeof fs.lstat>> }> = []
-    for (const extension of saveExtensions) {
-      const fileName = `${name}${extension}`
-      const sourcePath = ensureInside(this.#config.game.saveDirectory, path.join(this.#config.game.saveDirectory, fileName))
-      const stat = await fs.lstat(sourcePath).catch(() => null)
-      if (stat?.isFile() && !stat.isSymbolicLink()) sourceMembers.push({ fileName, sourcePath, stat })
+    const sourceMembers = await readSaveMembers(this.#config.game.saveDirectory, name)
+    if (reason === 'automatic-before-restore') {
+      const blockers = targetMemberBlockers(sourceMembers)
+      if (blockers.length) throw new GameAdapterError('SAVE_MEMBER_INVALID', blockers.join(' '))
     }
+    const unsafe = sourceMembers.find(member => !member.stat.isFile() || member.stat.isSymbolicLink())
+    if (unsafe) throw new GameAdapterError('SAVE_MEMBER_INVALID', `存档成员 ${unsafe.fileName} 不是普通文件，无法完整备份。`)
     if (!sourceMembers.some((member) => member.fileName.endsWith('.dsv')) || !sourceMembers.some((member) => member.fileName.endsWith('.server'))) {
-      throw new GameAdapterError('SAVE_SET_INCOMPLETE', `${name} does not have both .dsv and .server files.`)
+      throw new GameAdapterError('SAVE_SET_INCOMPLETE', `存档 ${name} 缺少同名的 .dsv 或 .server，无法建立完整备份。请检查存档后重试。`)
     }
     if (expectedReceipt) {
       const expected = new Map<string, { bytes: number; ticks: bigint }>([
@@ -918,9 +903,12 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         members.push({ fileName: source.fileName, bytes: copied.size, sha256: await sha256(destination) })
       }
+      const finalMembers = await readSaveMembers(this.#config.game.saveDirectory, name)
+      if (finalMembers.length !== sourceMembers.length) throw new GameAdapterError('BACKUP_SOURCE_CHANGED', '创建备份期间存档成员数量发生变化，请重试。')
       for (const source of sourceMembers) {
-        const sourceAfterSet = await fs.lstat(source.sourcePath).catch(() => null)
-        if (!sourceAfterSet?.isFile() || sourceAfterSet.isSymbolicLink() || sourceAfterSet.size !== source.stat.size || sourceAfterSet.mtimeMs !== source.stat.mtimeMs) {
+        const sourceAfterSet = finalMembers.find(member => member.fileName === source.fileName)?.stat
+        if (!sourceAfterSet?.isFile() || sourceAfterSet.isSymbolicLink() || sourceAfterSet.nlink !== source.stat.nlink ||
+            sourceAfterSet.size !== source.stat.size || sourceAfterSet.mtimeMs !== source.stat.mtimeMs) {
           throw new GameAdapterError('BACKUP_SOURCE_CHANGED', `The save set changed while it was being backed up: ${source.fileName}`)
         }
       }
@@ -943,19 +931,77 @@ export class WindowsGameAdapter implements GameAdapter {
     return verifyBackupFiles(this.#config.game.backupDirectory, manifest, signal)
   }
 
+  async #inspectForRestore(): Promise<InspectResult> {
+    try {
+      const inspection = await this.#inspect(true, true)
+      if (typeof inspection.tasks?.start !== 'boolean' || typeof inspection.tasks.startManaged !== 'boolean' ||
+          !(inspection.process === null || (Number.isSafeInteger(inspection.process?.pid) && inspection.process.pid > 0 &&
+            Number.isFinite(Date.parse(inspection.process.startedAt))))) throw new Error('Invalid process or task inspection')
+      return inspection
+    } catch (cause) {
+      throw new GameAdapterError('RESTORE_STATE_UNKNOWN', '无法确认游戏进程和启动任务。请检查主机状态及进程读取权限后重试。', { cause })
+    }
+  }
+
+  async #readRestoreStartup(): Promise<{ settings: StartupSettings; sha256: string }> {
+    try {
+      const stat = await fs.lstat(this.#startupSettingsPath)
+      if (!plainRestoreFile(stat) || stat.size > 64 * 1024) throw new Error('Invalid startup settings file')
+      const contents = await fs.readFile(this.#startupSettingsPath)
+      return { settings: validateStartupSettings(JSON.parse(contents.toString('utf8'))), sha256: createHash('sha256').update(contents).digest('hex') }
+    } catch (cause) {
+      throw new GameAdapterError('RESTORE_STARTUP_INVALID', '无法确认现有启动存档设置。请检查启动配置后重试。', { cause })
+    }
+  }
+
+  async #requireStoppedForRestore(): Promise<void> {
+    const inspection = await this.#inspectForRestore()
+    if (inspection.process) throw new GameAdapterError('RESTORE_GAME_RESTARTED', '检测到游戏进程，请检查服务器状态后重新预览。')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', '无法确认 Dyson Control 管理的启动任务。请检查游戏接入后重新预览。')
+    }
+  }
+
+  async #describeRestore(manifest: BackupManifest, inspection: InspectResult): Promise<BackupRestorePreview> {
+    const [target, startup, blockers, pending, bridgeReady] = await Promise.all([
+      readSaveMembers(this.#config.game.saveDirectory, manifest.saveName), this.#readRestoreStartup(),
+      backupMemberBlockers(this.#config.game.backupDirectory, manifest), this.#saveRestore.hasPending(),
+      inspection.process
+        ? assertBridgeReady(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, inspection.process.pid).then(() => true, () => false)
+        : true
+    ])
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) blockers.push('请选择 Dyson Control 管理的启动任务，恢复后才能指定启动存档。')
+    if (pending) blockers.push('上次存档恢复尚未完成。请在停服后使用“启动”让控制服务先处理上次恢复，查看任务记录后重新预览。')
+    if (!bridgeReady) blockers.push('当前游戏进程的 Bridge 尚未就绪，无法确认保存和停服。请检查 Bridge 后重新预览。')
+    return describeRestore(manifest, {
+      existing: target.map(member => member.fileName), targetBlockers: targetMemberBlockers(target),
+      runningIdentity: inspection.process ? `${inspection.process.pid}/${inspection.process.startedAt}` : null,
+      previousStartupSaveName: startup.settings.saveName, blockers
+    })
+  }
+
+  async restorePreview(backupId: string): Promise<BackupRestorePreview> {
+    const manifest = await this.#readBackupManifest(backupId)
+    return this.#describeRestore(manifest, await this.#inspectForRestore())
+  }
+
   async #restore(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.backupId !== 'string') invalidInput('backupId is required.')
     const manifest = await this.#readBackupManifest(input.backupId)
     report('正在校验待恢复的存档备份')
     const backupRoot = await this.#verifyBackup(manifest, signal)
-    const inspection = await this.#inspect(true)
+    const inspection = await this.#inspectForRestore()
     const wasRunning = Boolean(inspection.process)
-    if (!inspection.tasks.startManaged) {
-      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', 'The configured start task does not use Dyson Control start-game.ps1, so the restored save cannot be selected safely for restart.')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', '无法确认 Dyson Control 管理的启动任务。请检查游戏接入后重新预览。')
     }
-    if (wasRunning && await this.#saveRestore.hasPending()) {
-      throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', 'An interrupted save restore can only be recovered while the game is stopped.')
+    if (input.previewKey === undefined && await this.#saveRestore.hasPending()) {
+      if (wasRunning) throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '恢复上次中断的事务需要先停服。请查看任务记录后重试。')
+      await this.#recoverInterruptedSaveRestore(report)
     }
+    const preview = await this.#describeRestore(manifest, inspection)
+    assertRestoreImpact(preview, input.previewKey)
+    signal.throwIfAborted()
     let saved: SaveReceipt | null = null
     let stoppedForRestore = false
     if (inspection.process) {
@@ -963,19 +1009,23 @@ export class WindowsGameAdapter implements GameAdapter {
       saved = await requestBridgeSave(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, signal, 45_000, inspection.process.pid)
       if (saved.state !== 'succeeded') throw new GameAdapterError('BRIDGE_SAVE_FAILED', `The pre-restore save failed: ${saved.errorCode}`)
       this.#lastSaveReceipt = saved
+      if (input.previewKey !== undefined) {
+        // The signed save itself may have created an optional target member. Recheck before disconnecting players.
+        assertRestoreImpact(await this.#describeRestore(manifest, await this.#inspectForRestore()), input.previewKey)
+      }
       try {
-        await this.#stop(report, signal, false)
+        await this.#stop(report, signal, false, inspection.process.pid)
         stoppedForRestore = true
       } catch (error) {
         let stopped: boolean
-        try { stopped = !(await this.#inspect(true)).process } catch (inspectionError) {
+        try { stopped = !(await this.#inspectForRestore()).process } catch (inspectionError) {
           throw new GameAdapterError('RESTORE_STOP_STATE_UNKNOWN', 'Stopping for restore failed and the current game state could not be verified.', {
             cause: new AggregateError([error, inspectionError])
           })
         }
         if (stopped) {
           report('恢复尚未开始，正在恢复服务器运行状态')
-          try { await this.#startWithTimeout(report) } catch (restartError) {
+          try { await this.#startWithTimeout(report, true) } catch (restartError) {
             throw new GameAdapterError('RESTORE_STOP_RECOVERY_START_FAILED', 'Stopping for restore failed after the server exited, and the server could not be restarted.', {
               cause: new AggregateError([error, restartError])
             })
@@ -985,16 +1035,25 @@ export class WindowsGameAdapter implements GameAdapter {
       }
     }
 
-    await this.#recoverInterruptedSaveRestore(report)
     const protectedBackups: string[] = []
     const startupSelectionApplied = true
-    const nextStartup = { ...this.#startupSettings, saveName: manifest.saveName }
+    let transactionPrepared = false
     try {
+      await this.#requireStoppedForRestore()
+      const startup = await this.#readRestoreStartup()
+      const nextStartup = { ...startup.settings, saveName: manifest.saveName }
+      const target = await readSaveMembers(this.#config.game.saveDirectory, manifest.saveName)
+      if (input.previewKey !== undefined) assertReviewedTarget(preview, target.map(member => member.fileName), startup.settings.saveName)
+      let targetProtection: BackupManifest['members'] = []
       for (const name of new Set([manifest.saveName, saved?.saveName].filter((value): value is string => Boolean(value)))) {
-        if (await this.#existingSaveMemberCount(name) > 0) {
-          protectedBackups.push((await this.#createBackup(name, 'automatic-before-restore', report)).id)
+        // A successful Bridge save must have a restorable set after stop, even when it is distinct from the target.
+        if (name === saved?.saveName || target.length > 0) {
+          const protection = await this.#createBackup(name, 'automatic-before-restore', report)
+          protectedBackups.push(protection.id)
+          if (name === manifest.saveName) targetProtection = protection.members
         }
       }
+      if (input.previewKey !== undefined) assertReviewedTarget(preview, targetProtection.map(member => member.fileName), startup.settings.saveName)
       report(`正在恢复存档 ${manifest.saveName}`)
       await this.#saveRestore.replace({
         saveName: manifest.saveName,
@@ -1003,22 +1062,26 @@ export class WindowsGameAdapter implements GameAdapter {
           sourcePath: path.join(backupRoot, member.fileName),
           sha256: member.sha256
         })),
-        startupSettings: nextStartup
+        startupSettings: nextStartup, protection: { members: targetProtection, startupSha256: startup.sha256 }
       }, async () => {
-        if ((await this.#inspect(true)).process) {
-          throw new GameAdapterError('RESTORE_GAME_RESTARTED', 'The game started after the restore transaction was prepared; no save members were replaced.')
-        }
+        transactionPrepared = true
+        await this.#requireStoppedForRestore()
       }, signal)
       this.#startupSettings = nextStartup
     } catch (error) {
-      try { await this.#recoverInterruptedSaveRestore(report) } catch (rollbackError) {
-        throw new GameAdapterError('RESTORE_ROLLBACK_FAILED', 'Restore failed and the previous save set could not be recovered completely.', {
+      try {
+        if (await this.#saveRestore.hasPending()) {
+          if (!transactionPrepared) throw new GameAdapterError('SAVE_RESTORE_PENDING', '检测到其他未完成的存档恢复事务，请先检查任务记录。')
+          await this.#recoverInterruptedSaveRestore(report)
+        }
+      } catch (rollbackError) {
+        throw new GameAdapterError('RESTORE_ROLLBACK_FAILED', '无法确认中断的存档事务已恢复。请保持停服、检查任务记录和保护备份，再处理上次恢复。', {
           cause: new AggregateError([error, rollbackError])
         })
       }
       if (stoppedForRestore && (!(error instanceof GameAdapterError) || error.code !== 'RESTORE_ROLLBACK_FAILED')) {
         report('恢复未完成，正在恢复服务器运行状态')
-        try { await this.#startWithTimeout(report) } catch (restartError) {
+        try { await this.#startWithTimeout(report, true) } catch (restartError) {
           throw new GameAdapterError('RESTORE_RECOVERY_START_FAILED', 'Restore failed and the previously running server could not be restarted.', {
             cause: new AggregateError([error, restartError])
           })
@@ -1030,7 +1093,7 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#currentSave = startupSelectionApplied && restoredSave ? { name: manifest.saveName, savedAt: restoredSave.modifiedAt } : null
     let restarted = false
     if (wasRunning) {
-      try { await this.#startWithTimeout(report); restarted = true } catch (error) {
+      try { await this.#startWithTimeout(report, true); restarted = true } catch (error) {
         throw new GameAdapterError('RESTORE_START_FAILED', 'The backup was restored, but the server could not be restarted.', { cause: error })
       }
     }
@@ -1046,6 +1109,10 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #recoverInterruptedSaveRestore(report: ReportStep): Promise<void> {
+    if (!await this.#saveRestore.hasPending()) return
+    if ((await this.#inspectForRestore()).process) {
+      throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '请先停止游戏，再恢复中断的事务。')
+    }
     const recovery = await this.#saveRestore.recoverInterrupted()
     if (recovery === 'none') return
     try {
@@ -1725,28 +1792,16 @@ export class WindowsGameAdapter implements GameAdapter {
     return { ...result, automaticBackupId, wasRunning, restarted, restartRequired: false }
   }
 
+  async #clientMods(): Promise<Mod[]> {
+    const [mods, runtime] = await Promise.all([this.mods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx')])
+    return withClientRuntime(mods, runtime)
+  }
+
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {
-    const mods = (await this.mods()).filter((mod) => !/^xiaoye97-BepInEx$/i.test(mod.name))
-    const bepinexVersion = await this.#updates.installedPackageVersion('xiaoye97-BepInEx')
-    if (!bepinexVersion) {
-      throw new GameAdapterError('PACKAGE_LOCK_INCOMPLETE', 'The installed BepInEx Thunderstore version is not recorded, so an exact client package cannot be generated.')
-    }
-    mods.unshift({ id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion, enabled: true, required: true, description: 'BepInEx runtime', side: 'both' })
     report('正在生成可导入的 r2modman 配置包')
-    const id = `client-${timestampId()}-${randomUUID()}`
-    const profileName = `Dyson-Control-${timestampId().slice(0, 8)}`
-    const bytes = createR2ModmanPackage(profileName, this.#settings.address, mods)
-    const archiveName = `${id}.r2z`
-    const archivePath = path.join(this.#packageDirectory, archiveName)
-    await fs.writeFile(archivePath, bytes, { flag: 'wx' })
-    const item: ClientPackage = {
-      id, name: `${profileName}.r2z`, createdAt: now(), bytes: bytes.length,
-      modCount: mods.filter((mod) => mod.enabled && mod.side !== 'server').length,
-      downloadUrl: `/api/client-packages/${id}/download`
-    }
-    const manifest: ClientManifest = { item, fileName: archiveName }
-    await fs.writeFile(path.join(this.#packageDirectory, `${id}.json`), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    const mods = await this.#clientMods()
+    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, mods)
     report(`客户端配置包已生成，共包含 ${item.modCount} 个模组`)
-    return { packageId: id, fileName: item.name, modCount: item.modCount }
+    return { packageId: item.id, fileName: item.name, modCount: item.modCount }
   }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { CloudDownload, RefreshCw } from 'lucide-react'
 import type { ControlUpdateApplyResult, ControlUpdateDiscovery, ControlUpdateOperation, ControlUpdatePrepareResult } from '../../shared/contracts'
-import { post } from './api'
+import { newRequestId, post } from './api'
 import { Button, ConfirmDialog, ErrorBlock, Panel } from './components'
 import { formatFullDate } from './format'
 import { useResource } from './hooks'
@@ -43,7 +43,7 @@ export function ControlUpdates({ refreshToken }: { refreshToken: number }) {
   }, [current?.id, history.reload])
   const requestId = (key: string) => {
     let value = requestIds.current.get(key)
-    if (!value) { value = crypto.randomUUID(); requestIds.current.set(key, value) }
+    if (!value) { value = newRequestId(); requestIds.current.set(key, value) }
     return value
   }
   const prepare = async () => {

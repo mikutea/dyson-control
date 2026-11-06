@@ -69,8 +69,8 @@ async function fixture(options: { freshStorage?: boolean } = {}) {
     for (const [name, file] of Object.entries(references)) await write(path.join(gameRoot, file), mismatch && name === 'NebulaModel' ? 'MISMATCH' : `FIXTURE-${name}`)
   })
   const fetcher = vi.fn(async () => new Response(new Uint8Array(buildStoredZip([{ name: 'steamcmd.exe', data: 'FIXTURE STEAMCMD' }])), { status: 200 }))
-  const manager = new ServerSetupManager(config, new SteamAuthManager(config), { releaseRoot, platform: 'win32', run, runScript: runScript as never, installMods, fetch: fetcher })
-  return { root, config, manifest, releaseRoot, host, run, runScript, installMods, fetcher, manager,
+  const reopen = () => new ServerSetupManager(config, new SteamAuthManager(config), { releaseRoot, platform: 'win32', run, runScript: runScript as never, installMods, fetch: fetcher })
+  return { root, config, manifest, releaseRoot, host, run, runScript, installMods, fetcher, manager: reopen(), reopen,
     mismatch: () => { mismatch = true }, configureFails: (retainedTask = false) => { configureFails = true; leaveTask = retainedTask }, addTaskDuringDownload: () => { addedTask = true } }
 }
 
@@ -83,7 +83,9 @@ it('installs only into an empty target after dependency validation, without star
   expect(await fs.readFile(path.join(f.config.game.backupDirectory, 'keep.txt'), 'utf8')).toBe('UNRELATED BACKUP')
   expect(f.run).toHaveBeenCalledOnce()
   expect(f.runScript.mock.calls.map(call => call[0])).not.toContain('invoke-scheduled-task.ps1')
-  expect((await f.manager.status('owner')).taskExists).toBe(true)
+  expect(await f.reopen().status('owner')).toMatchObject({ taskExists: true, lastInstallation: {
+    state: 'ready', stage: 'configuring', buildId: '12345', createdAt: expect.any(String), updatedAt: expect.any(String),
+  } })
 })
 
 it('prepares absent save and backup directories for a first installation', async () => {
@@ -136,6 +138,7 @@ it('keeps a Bridge-incompatible download out of the configured game directory', 
   expect(f.runScript.mock.calls.map(call => call[0])).not.toContain('configure-new-server.ps1')
   const stage = f.run.mock.calls[0]![0].args[1]!
   expect(await fs.readFile(path.join(stage, 'DSPGAME.exe'), 'utf8')).toBe('FIXTURE GAME')
+  expect((await f.reopen().status('owner')).lastInstallation).toMatchObject({ state: 'failed-files-retained', stage: 'checking-bridge', buildId: '12345' })
 })
 
 it('rechecks the task immediately before promoting downloaded files', async () => {
@@ -153,6 +156,7 @@ it.each([false, true])('preserves failed configuration files, leaving a survivin
   const records = await fs.readdir(path.join(f.config.dataDirectory, 'first-install'))
   const record = JSON.parse(await fs.readFile(path.join(f.config.dataDirectory, 'first-install', records[0]!, 'installation.json'), 'utf8'))
   expect(record.phase).toBe(survivingTask ? 'needs-review' : 'failed-files-retained')
+  expect((await f.reopen().status('owner')).lastInstallation).toEqual({ state: record.phase, stage: 'configuring', createdAt: record.createdAt, updatedAt: record.updatedAt, buildId: '12345' })
   expect(await fs.readFile(path.join(f.config.game.saveDirectory, 'existing.dsv'), 'utf8')).toBe('UNRELATED SAVE')
 })
 
@@ -171,7 +175,98 @@ it('does not require Steam login to inspect setup status', async () => {
   expect(status).toMatchObject({ steamReady: true, targetEmpty: true, bridgeAvailable: true, existingGame: false })
   expect(status.auth.state).toBe('idle')
   expect(status.firstWorld).toEqual({ state: 'unavailable', message: '' })
+  expect(status.lastInstallation).toBeNull()
+  await expect(fs.access(path.join(f.config.dataDirectory, 'first-install'))).rejects.toHaveProperty('code', 'ENOENT')
   expect(f.run).not.toHaveBeenCalled(); expect(f.fetcher).not.toHaveBeenCalled()
+})
+
+it('distinguishes the executing installation from a nonterminal record after restart', async () => {
+  const f = await fixture()
+  let paused!: () => void, resume!: () => void
+  const enteredMods = new Promise<void>(resolve => { paused = resolve })
+  const gate = new Promise<void>(resolve => { resume = resolve })
+  const mods = f.installMods.getMockImplementation()!
+  f.installMods.mockImplementationOnce(async gameRoot => { paused(); await gate; await mods(gameRoot) })
+  const installing = f.manager.install('FixtureUser', () => {}, new AbortController().signal)
+  try {
+    await enteredMods
+    const live = (await f.manager.status('owner')).lastInstallation
+    expect(live).toMatchObject({ state: 'running', stage: 'installing-mods', buildId: '12345' })
+    expect((await f.reopen().status('owner')).lastInstallation).toEqual({ ...live, state: 'incomplete' })
+    expect(f.run).toHaveBeenCalledOnce()
+  } finally { resume(); await installing }
+})
+
+it('reads the latest legacy record by start time without changing it or returning private fields', async () => {
+  const f = await fixture()
+  const directory = path.join(f.config.dataDirectory, 'first-install')
+  const newer = 'first-install-11111111-1111-1111-1111-111111111111', older = 'first-install-ffffffff-ffff-ffff-ffff-ffffffffffff'
+  const file = path.join(directory, newer, 'installation.json')
+  const record = { schema: 1, id: newer, phase: 'failed-files-retained', gameStarted: false, createdAt: '2026-01-02T10:00:00.000Z', buildId: '12345', gameRoot: f.config.game.root, stagedGame: f.root, diagnostic: 'private fixture details' }
+  const original = JSON.stringify(record)
+  await write(file, original)
+  await write(path.join(directory, older, 'installation.json'), JSON.stringify({ ...record, id: older, phase: 'ready', createdAt: '2026-01-01T10:00:00.000Z' }))
+  const expected = { state: 'failed-files-retained', stage: null, createdAt: record.createdAt, updatedAt: null, buildId: '12345' }
+  expect((await f.manager.status('owner')).lastInstallation).toEqual(expected)
+  expect((await f.reopen().status('owner')).lastInstallation).toEqual(expected)
+  expect(await fs.readFile(file, 'utf8')).toBe(original)
+  expect(f.run).not.toHaveBeenCalled()
+})
+
+it.each([
+  { phase: 'downloading', state: 'incomplete', stage: 'preparing-files', buildId: undefined },
+  { phase: 'configuring', state: 'incomplete', stage: 'configuring', buildId: '12345' },
+  { phase: 'ready', state: 'incomplete', stage: 'configuring', buildId: undefined },
+  { phase: 'ready', state: 'ready', stage: 'configuring', buildId: '12345' },
+])('interprets legacy $phase with build $buildId independently of existing files and tasks', async ({ phase, state, stage, buildId }) => {
+  const f = await fixture()
+  f.host.taskExists = true
+  await write(path.join(f.config.game.root, 'DSPGAME.exe'), 'EXISTING GAME')
+  const id = 'first-install-11111111-1111-1111-1111-111111111111', createdAt = '2026-01-02T10:00:00.000Z'
+  await write(path.join(f.config.dataDirectory, 'first-install', id, 'installation.json'), JSON.stringify({ schema: 1, id, phase, gameStarted: false, createdAt, buildId }))
+  expect((await f.manager.status('owner')).lastInstallation).toEqual({ state, stage, buildId: buildId ?? null, createdAt, updatedAt: null })
+})
+
+it('keeps a newer missing or damaged receipt visible instead of showing a previous success', async () => {
+  const f = await fixture()
+  const directory = path.join(f.config.dataDirectory, 'first-install')
+  const old = 'first-install-11111111-1111-1111-1111-111111111111', id = 'first-install-22222222-2222-2222-2222-222222222222'
+  const record = { schema: 1, id: old, phase: 'ready', gameStarted: false, createdAt: '2026-01-01T10:00:00.000Z', buildId: '12345' }
+  await write(path.join(directory, old, 'installation.json'), JSON.stringify(record))
+  expect((await f.manager.status('owner')).lastInstallation?.state).toBe('ready')
+  await fs.mkdir(path.join(directory, id))
+  const file = path.join(directory, id, 'installation.json')
+  const unreadable = { state: 'unreadable', stage: null, createdAt: null, updatedAt: null, buildId: null }
+  expect((await f.manager.status('owner')).lastInstallation).toEqual(unreadable)
+  await write(file, '{')
+  expect((await f.manager.status('owner')).lastInstallation).toEqual(unreadable)
+  await write(file, JSON.stringify({ ...record, id, phase: 'needs-review', createdAt: '2026-01-02T10:00:00.000Z' }))
+  expect((await f.manager.status('owner')).lastInstallation).toMatchObject({ state: 'needs-review', stage: 'configuring', updatedAt: null })
+})
+
+it('does not read installation history through a directory junction', async () => {
+  const f = await fixture()
+  const directory = path.join(f.config.dataDirectory, 'first-install'), outside = path.join(f.root, 'elsewhere')
+  const id = 'first-install-11111111-1111-1111-1111-111111111111'
+  await write(path.join(outside, id, 'installation.json'), JSON.stringify({ schema: 1, id, phase: 'ready', gameStarted: false, buildId: '12345', createdAt: '2026-01-01T10:00:00.000Z' }))
+  await fs.mkdir(f.config.dataDirectory)
+  await fs.symlink(outside, directory, process.platform === 'win32' ? 'junction' : 'dir')
+  expect((await f.manager.status('owner')).lastInstallation?.state).toBe('unreadable')
+})
+
+it('keeps the last whole checkpoint when publishing a failure receipt fails', async () => {
+  const f = await fixture(); f.mismatch()
+  const rename = fs.rename.bind(fs)
+  const replace = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+    if (String(to).endsWith('installation.json') && JSON.parse(await fs.readFile(from, 'utf8')).phase === 'failed-files-retained') throw new Error('synthetic publish failure')
+    return rename(from, to)
+  })
+  try {
+    const report = vi.fn()
+    await expect(f.manager.install('FixtureUser', report, new AbortController().signal)).rejects.toMatchObject({ code: 'SETUP_BRIDGE_INCOMPATIBLE' })
+    expect(report.mock.calls.flat()).toContain('未能保存最终安装结果，请保留现场并核对启动任务和游戏目录。')
+    expect((await f.reopen().status('owner')).lastInstallation).toMatchObject({ state: 'incomplete', stage: 'checking-bridge', buildId: '12345' })
+  } finally { replace.mockRestore() }
 })
 
 it.each([

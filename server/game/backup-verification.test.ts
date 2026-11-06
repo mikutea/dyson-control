@@ -3,7 +3,7 @@ import { writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { hashBackupMember, readBackupManifest, runBackupVerification, type BackupManifest } from './backup-verification.js'
 
 const directories: string[] = []
@@ -60,6 +60,27 @@ describe('backup integrity verification', () => {
     const f = await fixture(false)
     await fs.writeFile(path.join(f.root, `${f.manifest.saveName}.moddsv`), 'unrecorded')
     await expect(runBackupVerification(f.directory, { backupId: f.manifest.id }, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED', message: expect.stringContaining('清单之外') })
+  })
+
+  it('does not treat a permission failure as an absent unlisted optional member', async () => {
+    const f = await fixture(false)
+    const optional = path.join(f.root, f.manifest.saveName + '.moddsv')
+    const stat = fs.lstat.bind(fs)
+    const guard = vi.spyOn(fs, 'lstat').mockImplementation((file, options) =>
+      file === optional ? Promise.reject(Object.assign(new Error('private fixture path'), { code: 'EPERM' })) : stat(file, options))
+    try {
+      await expect(runBackupVerification(f.directory, { backupId: f.manifest.id }, () => {}, new AbortController().signal))
+        .rejects.toMatchObject({ code: 'BACKUP_STORAGE_UNAVAILABLE', message: expect.not.stringContaining('private fixture path') })
+    } finally { guard.mockRestore() }
+  })
+
+  it('rechecks an unlisted optional member after hashing the listed pair', async () => {
+    const f = await fixture(false)
+    const optional = path.join(f.root, f.manifest.saveName + '.moddsv')
+    await expect(runBackupVerification(f.directory, { backupId: f.manifest.id }, message => {
+      if (message.includes('.server')) writeFileSync(optional, 'arrived during verification', { flag: 'wx' })
+    }, new AbortController().signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED' })
+    expect(await fs.readFile(optional, 'utf8')).toBe('arrived during verification')
   })
 
   it('does not report success when the manifest changes during member verification', async () => {

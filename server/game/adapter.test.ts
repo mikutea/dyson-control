@@ -1,5 +1,6 @@
 import { createHash, createHmac, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
+import { writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -112,6 +113,191 @@ describe('backup verification actions', () => {
     await fs.appendFile(path.join(fixture.game.backupDirectory, String(backup.backupId), 'DemoGalaxy.server'), 'corruption')
     await expect(adapter.run('verify-backup', input, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED' })
     expect((await adapter.overview()).state).toBe('running')
+  })
+})
+
+describe('backup restore impact', () => {
+  async function fixture(optional = false) {
+    const settings = await config('windows')
+    const target = (ext: string) => path.join(settings.game.saveDirectory, 'World' + ext)
+    for (const ext of optional ? ['.dsv', '.server', '.moddsv'] : ['.dsv', '.server']) await fs.writeFile(target(ext), 'saved' + ext)
+    const host = { running: false, managed: true, unknown: false }
+    const runScript = vi.fn(async () => { throw new Error('Preview attempted a lifecycle operation') })
+    const adapter = new WindowsGameAdapter(settings, {
+      inspect: async () => {
+        if (host.unknown) throw new Error('Unavailable host with private details')
+        return { process: host.running ? { pid: 4112, startedAt: '2026-01-01T00:00:00Z', workingSetBytes: 123,
+          totalProcessorSeconds: 1, targetUps: 60, selectedSave: 'Other' } : null,
+          tasks: { start: true, startManaged: host.managed, configuredTargetUps: null }, versions: { game: null, nebula: null, bepinex: null } }
+      }, runScript, lifecycleTimeoutMs: 500, pollIntervalMs: 5
+    })
+    const signal = new AbortController().signal
+    const backup = await adapter.run('backup', {}, () => {}, signal)
+    const backupId = String(backup.backupId)
+    const startup = path.join(settings.dataDirectory, 'game-startup', 'settings.json')
+    const preview = () => adapter.restorePreview(backupId)
+    return { settings, target, host, adapter, runScript, signal, backupId, startup, preview }
+  }
+
+  it('describes each live member without saving, stopping or recovering, including an optional deletion', async () => {
+    const f = await fixture()
+    await fs.writeFile(f.target('.moddsv'), 'live optional')
+    const startupBefore = await fs.readFile(f.startup)
+    const originalBackups = await f.adapter.backups()
+    const preview = await f.preview()
+    expect(preview).toMatchObject({
+      backupId: f.backupId, saveName: 'World', serverRunning: false, previousStartupSaveName: null,
+      protectRunningSave: false, protectedSaveNames: ['World'], blockers: [], previewKey: expect.stringMatching(/^[a-f0-9]{64}$/),
+      members: [{ fileName: 'World.dsv', action: 'replace' }, { fileName: 'World.server', action: 'replace' }, { fileName: 'World.moddsv', action: 'remove' }]
+    })
+    expect(await f.preview()).toEqual(preview)
+    expect(await f.adapter.backups()).toEqual(originalBackups)
+    expect(await fs.readFile(f.startup)).toEqual(startupBefore)
+    expect(await fs.readFile(f.target('.moddsv'), 'utf8')).toBe('live optional')
+    await expect(fs.lstat(path.join(f.settings.dataDirectory, 'save-restore'))).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+    // Live target files are protected even when not byte-for-byte different from the source.
+    const result = await f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, () => {}, f.signal)
+    expect(result).toMatchObject({ startupSelectionApplied: true, restarted: false })
+    const [protection] = (await f.adapter.backups()).filter(item => item.reason === 'automatic-before-restore')
+    expect(await fs.readFile(path.join(f.settings.game.backupDirectory, protection.id, 'World.moddsv'), 'utf8')).toBe('live optional')
+    await expect(fs.lstat(f.target('.moddsv'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('reports absent, partial and unsuitable targets and preserves unfinished transactions', async () => {
+    const f = await fixture()
+    for (const ext of ['.dsv', '.server']) await fs.unlink(f.target(ext))
+    expect((await f.preview()).members.map(item => item.action)).toEqual(['create', 'create', 'untouched'])
+    expect((await f.preview()).protectedSaveNames).toEqual([])
+    await fs.writeFile(f.target('.server'), 'partial')
+    let preview = await f.preview()
+    expect(preview.blockers.join(' ')).toContain('缺少同名')
+    expect(preview.protectedSaveNames).toEqual([])
+    await expect(f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, () => {}, f.signal)).rejects.toMatchObject({ code: 'RESTORE_BLOCKED' })
+    await fs.writeFile(f.target('.dsv'), '')
+    expect((await f.preview()).blockers.join(' ')).toContain('World.dsv 是空文件')
+    await fs.unlink(f.target('.dsv'))
+    await fs.mkdir(f.target('.dsv'))
+    preview = await f.preview()
+    expect(preview.blockers.join(' ')).toContain('World.dsv 不是独立的普通文件')
+    const active = path.join(f.settings.dataDirectory, 'save-restore', 'active')
+    await fs.mkdir(active, { recursive: true })
+    await fs.writeFile(path.join(active, 'evidence'), 'keep')
+    preview = await f.preview()
+    expect(preview.blockers.join(' ')).toContain('上次存档恢复')
+    await expect(f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, () => {}, f.signal)).rejects.toMatchObject({ code: 'RESTORE_BLOCKED' })
+    expect(await fs.readFile(path.join(active, 'evidence'), 'utf8')).toBe('keep')
+    expect(await f.adapter.backups()).toHaveLength(1)
+  })
+
+  it('requires a new confirmation when file disposition, startup selection or the game state changes', async () => {
+    const f = await fixture(true)
+    await fs.unlink(f.target('.moddsv'))
+    const preview = await f.preview()
+    expect(preview.members[2].action).toBe('create')
+    const restore = () => f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, () => {}, f.signal)
+    await fs.writeFile(f.target('.moddsv'), 'recently added')
+    await expect(restore()).rejects.toMatchObject({ code: 'RESTORE_PREVIEW_CHANGED' })
+    expect(await fs.readFile(f.target('.moddsv'), 'utf8')).toBe('recently added')
+    await fs.unlink(f.target('.moddsv'))
+    const oldStartup = await fs.readFile(f.startup)
+    await fs.writeFile(f.startup, JSON.stringify({ schema: 1, targetUps: 60, saveName: 'Different' }))
+    await expect(restore()).rejects.toMatchObject({ code: 'RESTORE_PREVIEW_CHANGED' })
+    await fs.writeFile(f.startup, oldStartup)
+    f.host.running = true
+    await prepareBridge(f.settings, 4112)
+    const nowRunning = await f.preview()
+    expect(nowRunning).toMatchObject({ serverRunning: true, protectRunningSave: true, protectedSaveNames: ['World'], blockers: [] })
+    await expect(restore()).rejects.toMatchObject({ code: 'RESTORE_PREVIEW_CHANGED' })
+    expect(await fs.readdir(path.join(f.settings.game.bridgeDirectory, 'requests'))).toEqual([])
+    expect(await f.adapter.backups()).toHaveLength(1)
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('does not present a failed inspection, missing storage or a missing backup as a stopped game or empty target', async () => {
+    const f = await fixture()
+    f.host.unknown = true
+    await expect(f.preview()).rejects.toMatchObject({ code: 'RESTORE_STATE_UNKNOWN', message: expect.not.stringContaining('private details') })
+    f.host.unknown = false
+    f.host.managed = false
+    expect((await f.preview()).blockers.join(' ')).toContain('启动任务')
+    f.host.managed = true
+    f.host.running = true
+    expect((await f.preview()).blockers.join(' ')).toContain('Bridge')
+    await fs.rename(f.settings.game.saveDirectory, f.settings.game.saveDirectory + '-offline')
+    await expect(f.preview()).rejects.toMatchObject({ code: 'RESTORE_STORAGE_UNAVAILABLE' })
+    await expect(f.adapter.restorePreview('missing-backup')).rejects.toMatchObject({ code: 'BACKUP_NOT_FOUND' })
+    await expect(f.adapter.restorePreview('../escape')).rejects.toMatchObject({ code: 'INVALID_INPUT' })
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('rechecks impact after the signed save and before disconnecting players', async () => {
+    const f = await fixture()
+    f.host.running = true
+    const secret = await prepareBridge(f.settings, 4112)
+    const preview = await f.preview()
+    const worker = bridgeSaveWorker(f.settings, secret, 'World')
+    const reports: string[] = []
+    const operation = f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, message => {
+      reports.push(message)
+      if (message === '正在保存当前游戏进度') writeFileSync(f.target('.moddsv'), 'newly saved optional member', { flag: 'wx' })
+    }, f.signal)
+    await expect(operation).rejects.toMatchObject({ code: 'RESTORE_PREVIEW_CHANGED' })
+    await worker
+    expect(reports).not.toContain('正在停止服务器')
+    const receipts = path.join(f.settings.game.bridgeDirectory, 'receipts')
+    const files = await fs.readdir(receipts)
+    expect(files).toHaveLength(1)
+    expect(await fs.readFile(path.join(receipts, files[0]), 'utf8')).toContain('\naction=save\n')
+    expect(await fs.readFile(f.target('.moddsv'), 'utf8')).toBe('newly saved optional member')
+    expect(await f.adapter.backups()).toHaveLength(1)
+    expect(f.runScript).not.toHaveBeenCalled()
+  })
+
+  it('checks source metadata in preview and hashes the actual backup before executing a confirmed restore', async () => {
+    const f = await fixture()
+    const preview = await f.preview()
+    const source = path.join(f.settings.game.backupDirectory, f.backupId, 'World.dsv')
+    const bytes = await fs.readFile(source)
+    bytes[0] ^= 1
+    await fs.writeFile(source, bytes)
+    expect(await f.preview()).toEqual(preview)
+    await expect(f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, () => {}, f.signal)).rejects.toMatchObject({ code: 'BACKUP_VERIFICATION_FAILED' })
+    expect(await fs.readFile(f.target('.dsv'), 'utf8')).toBe('saved.dsv')
+    await fs.unlink(source)
+    expect((await f.preview()).blockers.join(' ')).toContain('备份成员 World.dsv')
+    expect(await f.adapter.backups()).toHaveLength(1)
+  })
+
+  it('refuses a new optional file created after protection even if both checks accepted its earlier absence', async () => {
+    const f = await fixture()
+    const preview = await f.preview()
+    const startupBefore = await fs.readFile(f.startup)
+    const operation = f.adapter.run('restore', { backupId: f.backupId, previewKey: preview.previewKey }, message => {
+      if (message === '正在恢复存档 World') writeFileSync(f.target('.moddsv'), 'new unprotected member', { flag: 'wx' })
+    }, f.signal)
+    await expect(operation).rejects.toMatchObject({ code: 'RESTORE_PROTECTION_CHANGED' })
+    expect(await fs.readFile(f.target('.moddsv'), 'utf8')).toBe('new unprotected member')
+    expect(await fs.readFile(f.startup)).toEqual(startupBefore)
+    expect((await f.adapter.backups()).filter(item => item.reason === 'automatic-before-restore')).toHaveLength(1)
+    await expect(fs.lstat(path.join(f.settings.dataDirectory, 'save-restore', 'active'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
+
+  it('matches demo protective copies to the preview for running and stopped cross-save restores', async () => {
+    const settings = await config('demo')
+    const adapter = createGameAdapter(settings)
+    const run = (action: 'backup' | 'restore' | 'stop', input = {}) => adapter.run(action, input, () => {}, new AbortController().signal)
+    const backupId = String((await run('backup', { saveId: 'sandbox' })).backupId)
+    const preview = await adapter.restorePreview(backupId)
+    expect(preview).toMatchObject({ previousStartupSaveName: 'DemoGalaxy', protectedSaveNames: ['Sandbox', 'DemoGalaxy'], protectRunningSave: true, blockers: [] })
+    expect((await run('restore', { backupId, previewKey: preview.previewKey })).automaticBackups).toHaveLength(2)
+    expect((await adapter.backups()).filter(item => item.reason === 'automatic-before-restore').map(item => item.saveName).sort()).toEqual(['DemoGalaxy', 'Sandbox'])
+    const restored = createGameAdapter(settings)
+    await restored.run('stop', {}, () => {}, new AbortController().signal)
+    const stopped = await restored.restorePreview(backupId)
+    expect(stopped).toMatchObject({ previousStartupSaveName: 'DemoGalaxy', protectedSaveNames: ['Sandbox'], protectRunningSave: false, blockers: [] })
+    expect(await restored.run('restore', { backupId, previewKey: stopped.previewKey }, () => {}, new AbortController().signal)).toMatchObject({ restarted: false, automaticBackups: [expect.any(String)] })
+    expect((await restored.backups()).map(item => item.saveName)).toEqual(['Sandbox'])
   })
 })
 
@@ -1840,6 +2026,9 @@ describe('Windows adapter fixture behavior', () => {
 
   it('exports exact package versions from BOM-prefixed installed manifests', async () => {
     const fixture = await config('windows')
+    let runtimeVersion = '5.4.17'
+    const installedPackageVersion = vi.fn(async (packageName: string) => packageName === 'xiaoye97-BepInEx' ? runtimeVersion : null)
+    const searchPackages = vi.fn(async () => { throw new Error('Client profiles do not query the live catalog') })
     const nebula = path.join(fixture.game.root, 'BepInEx', 'plugins', 'nebula-NebulaMultiplayerMod')
     await fs.mkdir(nebula, { recursive: true })
     await fs.writeFile(path.join(nebula, 'manifest.json'), '\uFEFF' + JSON.stringify({
@@ -1851,7 +2040,7 @@ describe('Windows adapter fixture behavior', () => {
         versions: { game: null, nebula: '0.9.24', bepinex: '5.4.21.0' },
         tasks: { start: true, startManaged: true, configuredTargetUps: null }
       }),
-      updates: updateFixture({ installedPackageVersion: async (packageName) => packageName === 'xiaoye97-BepInEx' ? '5.4.17' : null })
+      updates: updateFixture({ installedPackageVersion, searchPackages })
     })
     const result = await adapter.run('create-client-package', {}, () => undefined, new AbortController().signal)
     const download = await adapter.download('client', String(result.packageId))
@@ -1860,6 +2049,16 @@ describe('Windows adapter fixture behavior', () => {
     const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8')) as { mods: Array<{ name: string; version: { major: number; minor: number; patch: number } }> }
     expect(profile.mods).toContainEqual({ name: 'xiaoye97-BepInEx', version: { major: 5, minor: 4, patch: 17 }, enabled: true })
     expect(profile.mods).not.toContainEqual(expect.objectContaining({ name: 'xiaoye97-BepInEx', version: { major: 5, minor: 4, patch: 21 } }))
+    installedPackageVersion.mockClear()
+    const [item] = await adapter.clientPackages()
+    expect(installedPackageVersion).not.toHaveBeenCalled()
+    expect(await adapter.clientPackageDetails(item!.id)).toMatchObject({ status: 'current', profile: {
+      address: fixture.game.address, mods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.17' }])
+    } })
+    runtimeVersion = '5.4.23'
+    expect(await adapter.clientPackageDetails(item!.id)).toMatchObject({ status: 'outdated',
+      currentMods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.23' }]) })
+    expect(searchPackages).not.toHaveBeenCalled()
   })
 
   it('exports only administrator-confirmed mod sides and requires confirmation again after an upgrade', async () => {
@@ -1896,6 +2095,10 @@ describe('Windows adapter fixture behavior', () => {
     await writeManifest('1.1.0')
     const upgraded = (await adapter.mods()).find(mod => mod.id === initial.id)!
     expect(upgraded).toMatchObject({ version: '1.1.0', side: 'unknown', sideSource: 'unverified' })
+    expect(await adapter.clientPackageDetails(String(exported.packageId))).toMatchObject({
+      status: 'unknown', currentMods: null, reason: expect.stringContaining('owner-Feature'), downloadable: true,
+      profile: { mods: expect.arrayContaining([{ name: 'owner-Feature', version: '1.0.0' }]) }
+    })
     await expect(adapter.run('set-mod-side', {
       modId: initial.id, expectedVersion: '1.0.0', side: 'both'
     }, () => undefined, new AbortController().signal)).rejects.toMatchObject({ code: 'MOD_CHANGED' })
@@ -2567,6 +2770,7 @@ describe('Windows adapter fixture behavior', () => {
     const argumentsPath = path.join(fixture.dataDirectory, 'inspect-arguments.json')
     await fs.writeFile(argumentsPath, JSON.stringify({
       gameRoot: fixture.game.root,
+      requireProcessIdentity: true,
       saveDirectory: fixture.game.saveDirectory,
       logFile: fixture.game.logFile,
       managedStartScript: resolveWindowsScript('start-game.ps1'),
@@ -2582,6 +2786,8 @@ $startArguments = '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -F
 $startAction = [pscustomobject]@{ Execute = (Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'); Arguments = $startArguments; WorkingDirectory = [string]$inputObject.gameRoot }
 function Get-CimInstance {
   [CmdletBinding()]param([string]$ClassName, [string]$Filter)
+  if ($variant -ceq 'unidentified') { return [pscustomobject]@{ ExecutablePath = $null; ProcessId = 4103 } }
+  if ($variant -ceq 'separate') { return [pscustomobject]@{ ExecutablePath = (Join-Path (Join-Path ([string]$inputObject.gameRoot) 'other') 'DSPGAME.exe'); ProcessId = 4104 } }
   if (-not $DuplicateProcess) { return @() }
   $gameExe = Join-Path ([string]$inputObject.gameRoot) 'DSPGAME.exe'
   if ($UseSmbAlias) { $gameExe = '\\\\fixture-server\\fixture-share' + $gameExe.Substring(2) }
@@ -2613,7 +2819,7 @@ function Get-ScheduledTask {
   if ($TaskName -ceq [string]$inputObject.startTaskName) { return [pscustomobject]@{ TaskName = [string]$inputObject.startTaskName; Actions = @($startAction) } }
   return $null
 }
-$results = foreach ($variant in @('managed', 'unexpected', 'ambiguous')) {
+$results = foreach ($variant in @('managed', 'unexpected', 'ambiguous', 'unidentified', 'separate')) {
   $DuplicateProcess = $variant -ceq 'ambiguous'
   $UseSmbAlias = $DuplicateProcess
   $startAction.Arguments = $startArguments
@@ -2627,7 +2833,7 @@ $results = foreach ($variant in @('managed', 'unexpected', 'ambiguous')) {
 }
 $results | ConvertTo-Json -Depth 8 -Compress
 `)
-    // Exercise all contracts in one host rather than paying three PowerShell startups.
+    // Exercise all process and task variants in one isolated PowerShell host.
     const { stdout } = await execFileAsync('powershell.exe', [
       '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', harness,
       '-InspectScript', resolveWindowsScript('inspect-game.ps1'), '-ArgumentsPath', argumentsPath,
@@ -2636,12 +2842,13 @@ $results | ConvertTo-Json -Depth 8 -Compress
       variant: string
       error: string | null
       data: {
+        process: unknown
         tasks: { startManaged: boolean }
         versions: { game: null; nebula: null; bepinex: null }
         network: { sampledAtUnixMs: number; adapters: Array<{ id: string; receivedBytes: string; sentBytes: string }> }
       } | null
     }>
-    expect(results.map(result => result.variant)).toEqual(['managed', 'unexpected', 'ambiguous'])
+    expect(results.map(result => result.variant)).toEqual(['managed', 'unexpected', 'ambiguous', 'unidentified', 'separate'])
     expect(results[0].error).toBeNull()
     const managed = results[0].data!
     expect(managed.tasks.startManaged).toBe(true)
@@ -2655,6 +2862,10 @@ $results | ConvertTo-Json -Depth 8 -Compress
     expect(results[1].data!.tasks.startManaged).toBe(false)
     expect(results[2].data).toBeNull()
     expect(results[2].error).toContain('managed instance is ambiguous')
+    expect(results[3].data).toBeNull()
+    expect(results[3].error).toContain('Cannot identify a DSPGAME.exe process for restore')
+    expect(results[4].error).toBeNull()
+    expect(results[4].data!.process).toBeNull()
   })
 
   it.runIf(process.platform === 'win32')('binds DSP Configs/path.txt to the configured managed save directory before launch', async () => {

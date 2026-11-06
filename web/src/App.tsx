@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Action, Job, Overview, Page, Session } from '../../shared/contracts'
-import { get, post, remove, submitAction } from './api'
-import { ConfirmDialog, ErrorBlock, Toast } from './components'
+import { get, post, remove } from './api'
+import { findPendingReceipts, pendingReceiptActions, submitAction } from './action-receipts'
+import { actionLabels } from './format'
+import { Button, ConfirmDialog, ErrorBlock, Toast } from './components'
 import { Login } from './Login'
 import { Shell } from './Shell'
 import { Pages } from './Pages'
@@ -35,6 +37,7 @@ export default function App() {
   const [jobOpen, setJobOpen] = useState(false)
   const [pending, setPending] = useState<{ action: Action; input: Record<string, unknown>; confirmation: Confirmation } | null>(null)
   const [submitting, setSubmitting] = useState(false)
+  const [checkingReceipts, setCheckingReceipts] = useState(false)
   const submittingRef = useRef(false)
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'error' } | null>(null)
 
@@ -110,11 +113,11 @@ export default function App() {
     submittingRef.current = true
     setSubmitting(true)
     try {
-      const next = await submitAction(action, input)
+      const { job: next, recovered } = await submitAction(action, input)
       setJob((current) => current?.id === next.id && ['succeeded', 'failed', 'interrupted'].includes(current.state) ? current : next)
       setJobOpen(true)
       setPending(null)
-      setToast({ message: '操作已提交，可继续使用其他页面', tone: 'success' })
+      setToast({ message: recovered ? '已找到之前提交的任务，可在活动中查看结果。' : '操作已提交，可继续使用其他页面', tone: 'success' })
       setRefreshToken((value) => value + 1)
     } catch (reason) {
       setToast({ message: reason instanceof Error ? reason.message : '操作未能开始', tone: 'error' })
@@ -149,6 +152,20 @@ export default function App() {
     setRefreshToken((value) => value + 1)
   }, [])
   const operationActive = submitting || job?.state === 'queued' || job?.state === 'running'
+  const missingReceipts = pendingReceiptActions()
+  const checkReceipts = async () => {
+    setCheckingReceipts(true)
+    try {
+      const known = await findPendingReceipts()
+      if (known.length) {
+        receiveJob(known[0])
+        setToast({ message: `已核对 ${known.length} 项操作，可在活动中查看。`, tone: 'success' })
+      } else {
+        setToast({ message: '当前还没有这些请求的任务记录。可在原入口使用同一编号重试。', tone: 'success' })
+      }
+    } catch { setToast({ message: '暂时无法核对回执，请恢复连接后重试。', tone: 'error' }) }
+    finally { setCheckingReceipts(false) }
+  }
   const pagesProps = useMemo(() => ({ page, refreshToken, overview, onOverview: setOverview, runAction, onJob: receiveJob, operationActive }), [page, refreshToken, overview, runAction, receiveJob, operationActive])
 
   if (sessionLoading) return <><ControlUpdateReceipt /><div className="boot-screen"><span className="brand-mark"><i /><i /></span><span>Dyson Control</span></div></>
@@ -158,6 +175,7 @@ export default function App() {
   return (
     <><ControlUpdateReceipt /><Shell page={page} session={session} serverState={connectionError ? 'unknown' : overview?.state ?? 'unknown'} onNavigate={navigate} onLogout={() => void logout()} job={job} jobOpen={jobOpen} onJobOpen={setJobOpen}>
       {connectionError && <p className="connection-warning" role="status">暂时无法刷新服务器状态，正在重试。当前显示的是上次收到的数据。</p>}
+      {!submitting && missingReceipts.length > 0 && <div className="connection-warning receipt-notice" role="status"><span>等待核对操作回执 · {missingReceipts.map(action => actionLabels[action]).join('、')}</span><Button variant="quiet" busy={checkingReceipts} onClick={() => void checkReceipts()}>核对回执</Button></div>}
       <Pages {...pagesProps} />
       {pending && <ConfirmDialog {...pending.confirmation} confirmLabel={pending.confirmation.label} busy={submitting} onCancel={() => setPending(null)} onConfirm={() => void execute(pending.action, pending.input)} />}
       {toast && <Toast {...toast} onDismiss={() => setToast(null)} />}

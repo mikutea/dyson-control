@@ -37,6 +37,18 @@ export const jobStateLabels: Record<JobState, string> = {
   interrupted: '已中断',
 }
 
+const backupReasonLabels: Record<string, string> = {
+  manual: '手动备份', imported: '导入备份', 'automatic-scheduled': '定时备份',
+  'automatic-before-load-save': '切换存档前', 'automatic-before-restore': '恢复存档前',
+  'automatic-before-update': '安装更新前', 'automatic-before-update-rollback': '回滚更新前',
+  'automatic-before-mod-toggle': '更改模组状态前', 'automatic-before-mod-install': '安装模组前',
+  'automatic-before-mod-removal': '移除模组前', 'automatic-before-mod-restore': '恢复模组前',
+  'automatic-before-mod-config-write': '修改模组配置前', 'automatic-before-mod-config-rollback': '恢复模组配置前',
+}
+export function formatBackupReason(reason: string) {
+  return Object.hasOwn(backupReasonLabels, reason) ? backupReasonLabels[reason] : reason
+}
+
 export const serverStateLabels: Record<ServerState, string> = {
   running: '服务器运行中',
   stopped: '服务器已停止',

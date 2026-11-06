@@ -48,7 +48,7 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'load-save': z.object({ saveId: idSchema }).strict(),
   backup: z.object({ saveId: idSchema.optional() }).strict(),
   'verify-backup': z.object({ backupId: idSchema }).strict(),
-  restore: z.object({ backupId: idSchema }).strict(),
+  restore: z.object({ backupId: idSchema, previewKey: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'import-backup': z.object({ uploadId: z.string().uuid() }).strict(),
   'install-update': z.object({ component: z.enum(['game', 'nebula', 'bepinex']), version: z.string().trim().min(1).max(100).optional() }).strict(),
   'set-version-lock': z.object({ component: z.enum(['game', 'nebula', 'bepinex']).optional(), modId: idSchema.optional(), locked: z.boolean() }).strict().refine(value => Boolean(value.component) !== Boolean(value.modId), '指定一个组件或模组。'),
@@ -315,9 +315,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/update-history', async (request) => { assertNoQuery(request); return data(await adapter.updateHistory()) })
   app.get('/api/saves', async (request) => { assertNoQuery(request); return data(await adapter.saves()) })
   app.get('/api/backups', async (request) => { assertNoQuery(request); return data(await adapter.backups()) })
+  app.get('/api/backups/:id/restore-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.restorePreview(id))
+  })
   app.get('/api/settings', async (request) => { assertNoQuery(request); return data(await adapter.settings()) })
   app.get('/api/settings-history', async request => { assertNoQuery(request); return data(await adapter.settingsHistory()) })
   app.get('/api/client-packages', async (request) => { assertNoQuery(request); return data(await adapter.clientPackages()) })
+  app.get('/api/client-packages/:id', async (request) => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    if (adapter.clientPackageDetails) return data(await adapter.clientPackageDetails(id))
+    if (!(await adapter.clientPackages()).some(item => item.id === id)) throw new ApiError(404, 'download_not_found', '找不到这份客户端包。')
+    return data({ id, profile: null, currentAddress: (await adapter.settings()).address, currentMods: null,
+      status: 'unknown', reason: '当前适配器未提供客户端包版本记录。', downloadable: Boolean(adapter.download), sha256: null })
+  })
   app.get('/api/jobs', async request => {
     const query = z.object({
       action: actionSchema.optional(),
@@ -343,6 +356,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return data(runtime.restoreSettings(historyId))
   })
 
+  app.get('/api/jobs/by-request/:requestId', async request => {
+    assertNoQuery(request)
+    const { requestId } = z.object({ requestId: requestIdSchema }).strict().parse(request.params)
+    return data(store.findByRequestId(requestId))
+  })
   app.get('/api/jobs/:id', async (request) => {
     assertNoQuery(request)
     const { id } = z.object({ id: idSchema }).strict().parse(request.params)
@@ -561,6 +579,8 @@ function cookieOptions(request: FastifyRequest) {
 
 function gameErrorStatus(code: string): number {
   if (code === 'LOG_UNAVAILABLE') return 503
+  if (['RESTORE_STATE_UNKNOWN', 'RESTORE_STORAGE_UNAVAILABLE', 'BACKUP_STORAGE_UNAVAILABLE'].includes(code)) return 503
+  if (['BACKUP_MANIFEST_INVALID', 'RESTORE_STARTUP_INVALID'].includes(code)) return 409
   if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
@@ -587,12 +607,12 @@ async function sendDownload(
   assertNoQuery(request)
   if (!adapter.download) throw new ApiError(404, 'download_not_available', '当前下载不可用。')
   const download = await adapter.download(kind, id)
-  if (!existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
+  if (!download.verifiedBytes && !existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
   const name = basename(download.fileName)
   const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
   reply.type(download.contentType)
   reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
-  return reply.send(createReadStream(download.path))
+  return reply.send(download.verifiedBytes ?? createReadStream(download.path))
 }
 
 const MAX_LOG_DOWNLOAD_BYTES = 16 * 1024 * 1024

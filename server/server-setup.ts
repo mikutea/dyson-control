@@ -3,7 +3,7 @@ import { createReadStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { z } from 'zod'
-import type { ControlConfig, ReportStep, ServerSetupStatus } from '../shared/contracts.js'
+import type { ControlConfig, FirstInstallationAttempt, ReportStep, ServerSetupStatus } from '../shared/contracts.js'
 import { GameAdapterError } from './game/errors.js'
 import { readFirstWorldStatus } from './game/first-world.js'
 import { extractZipBuffer, GameUpdateManager } from './game/updates.js'
@@ -26,6 +26,14 @@ const bridgeManifestSchema = z.object({
   dll: z.object({ file: z.literal('DysonControlBridge.dll'), bytes: z.number().int().min(2).max(16 * 1024 * 1024), sha256: digestSchema }).strict(),
   references: z.array(z.object({ name: z.string(), file: z.string(), assemblyVersion: z.string(), bytes: z.number().int().positive().max(1024 * 1024 * 1024), sha256: digestSchema }).strict()).length(9),
 }).strict()
+const installationId = /^first-install-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/
+const receiptSchema = z.object({
+  schema: z.literal(1), id: z.string(), createdAt: z.string().datetime({ offset: true }), updatedAt: z.string().datetime({ offset: true }).optional(),
+  phase: z.enum(['downloading', 'configuring', 'ready', 'failed-files-retained', 'needs-review']),
+  stage: z.enum(['downloading', 'installing-mods', 'checking-bridge', 'configuring']).optional(),
+  buildId: z.string().regex(/^\d{1,20}$/).optional(), gameStarted: z.literal(false),
+})
+const unreadableAttempt: FirstInstallationAttempt = { state: 'unreadable', stage: null, buildId: null, createdAt: null, updatedAt: null }
 type HostStatus = { taskExists: boolean; running: boolean; gameUsers: ServerSetupStatus['gameUsers'] }
 type ScriptRunner = <T>(name: string, input: unknown, signal?: AbortSignal, timeoutMs?: number) => Promise<T>
 export interface ServerSetupOptions {
@@ -84,6 +92,8 @@ export class ServerSetupManager {
   readonly #config: ControlConfig
   readonly #options: ServerSetupOptions
   readonly #runScript: ScriptRunner
+  #activeInstallation: string | null = null
+  readonly #attemptStarts = new Map<string, number>()
   constructor(config: ControlConfig, auth: SteamAuthManager, options: ServerSetupOptions = {}) {
     this.#config = config; this.auth = auth; this.#options = options
     this.#runScript = options.runScript ?? runPowerShell
@@ -95,9 +105,10 @@ export class ServerSetupManager {
     const response: ServerSetupStatus = {
       supported, gameRoot: this.#config.game.root, steamExecutable: executable, accountName: this.#config.game.steam?.accountName ?? '',
       steamReady: false, existingGame: false, targetEmpty: false, bridgeAvailable: false, taskExists: false,
-      gameUsers: [], blockers: [], auth: this.auth.status(owner), firstWorld: { state: 'unavailable', message: '' },
+      gameUsers: [], blockers: [], auth: this.auth.status(owner), firstWorld: { state: 'unavailable', message: '' }, lastInstallation: null,
     }
     if (!supported) { response.blockers.push('首次安装与 Steam 授权需要 Windows 服务器。'); return response }
+    response.lastInstallation = await this.#lastInstallation()
     const steam = await stat(executable)
     response.steamReady = !!steam?.isFile() && !steam.isSymbolicLink()
     try {
@@ -146,6 +157,50 @@ export class ServerSetupManager {
     try { this.#assertSeparatedPaths() } catch { response.blockers.push('游戏目录必须与面板数据、存档、备份和 SteamCMD 目录分开。') }
     try { await this.#assertStoragePaths() } catch { response.blockers.push('存档或备份路径不是普通目录，请检查配置。') }
     return response
+  }
+
+  async #readAttempt(directory: string, id: string): Promise<FirstInstallationAttempt> {
+    try {
+      const file = path.join(directory, id, 'installation.json')
+      await noLinks(file)
+      const entry = await stat(file)
+      if (!entry?.isFile() || entry.size > 64 * 1024) return unreadableAttempt
+      const record = receiptSchema.parse(JSON.parse((await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, '')))
+      if (record.id !== id) return unreadableAttempt
+      const { phase, createdAt, updatedAt, buildId } = record
+      const stage = record.stage ?? (phase === 'downloading' ? 'preparing-files' : phase === 'failed-files-retained' ? null : 'configuring')
+      const state = phase === 'downloading' || phase === 'configuring' ? (this.#activeInstallation === id ? 'running' : 'incomplete')
+        : phase === 'ready' && (!buildId || stage !== 'configuring') ? 'incomplete' : phase
+      return { state, stage, createdAt, updatedAt: updatedAt ?? null, buildId: buildId ?? null }
+    } catch { return unreadableAttempt }
+  }
+
+  async #lastInstallation(): Promise<FirstInstallationAttempt | null> {
+    const directory = path.join(this.#config.dataDirectory, 'first-install')
+    try {
+      await noLinks(directory)
+      if (!await stat(directory)) return null
+      if (this.#activeInstallation) return await this.#readAttempt(directory, this.#activeInstallation)
+      let latest: { id: string; time: number; attempt: FirstInstallationAttempt | null } | null = null
+      for (const item of await fs.readdir(directory, { withFileTypes: true })) {
+        if (!installationId.test(item.name) || (!item.isDirectory() && !item.isSymbolicLink())) continue
+        // Start dates never change. Reopening reads new attempts and refreshes the selected record only.
+        let time = this.#attemptStarts.get(item.name)
+        let attempt: FirstInstallationAttempt | null = null
+        if (time === undefined) {
+          attempt = await this.#readAttempt(directory, item.name)
+          if (attempt.createdAt) {
+            time = Date.parse(attempt.createdAt)
+            this.#attemptStarts.set(item.name, time)
+          } else {
+            const folder = await fs.lstat(path.join(directory, item.name))
+            time = folder.birthtimeMs || folder.mtimeMs
+          }
+        }
+        if (!latest || time > latest.time || (time === latest.time && item.name > latest.id)) latest = { id: item.name, time, attempt }
+      }
+      return latest && (latest.attempt ?? await this.#readAttempt(directory, latest.id))
+    } catch { return unreadableAttempt }
   }
 
   async prepareSteam(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -215,16 +270,26 @@ export class ServerSetupManager {
     signal.throwIfAborted()
     const id = `first-install-${randomUUID()}`
     const operation = path.join(this.#config.dataDirectory, 'first-install', id)
+    await noLinks(operation)
     await fs.mkdir(operation, { recursive: true })
     await fs.mkdir(path.dirname(root), { recursive: true })
     const stagingParent = await fs.mkdtemp(path.join(path.dirname(root), '.dyson-install-'))
     const stagedGame = path.join(stagingParent, 'game')
     await fs.mkdir(stagedGame)
-    const record: Record<string, unknown> = { schema: 1, id, createdAt: new Date().toISOString(), gameRoot: root, stagedGame, phase: 'downloading', gameStarted: false }
-    const saveRecord = async () => fs.writeFile(path.join(operation, 'installation.json'), JSON.stringify(record, null, 2) + '\n')
-    await saveRecord()
+    const record: Record<string, unknown> = { schema: 1, id, createdAt: new Date().toISOString(), gameRoot: root, stagedGame, phase: 'downloading', stage: 'downloading', gameStarted: false }
+    const saveRecord = async (stage?: z.infer<typeof receiptSchema>['stage']) => {
+      if (stage) record.stage = stage
+      record.updatedAt = new Date().toISOString()
+      const temporary = path.join(operation, `installation-${randomUUID()}.partial`)
+      try {
+        await fs.writeFile(temporary, JSON.stringify(record, null, 2) + '\n', { flag: 'wx', mode: 0o600 })
+        await fs.rename(temporary, path.join(operation, 'installation.json'))
+      } finally { await fs.rm(temporary, { force: true }).catch(() => undefined) }
+    }
     let promoted = false
+    this.#activeInstallation = id
     try {
+      await saveRecord()
       report('正在下载戴森球计划官方文件，当前游戏目录保持原样。')
       const executable = steamExecutable(this.#config)
       const result = await (this.#options.run ?? runSteamCommand)({ executable, args: ['+force_install_dir', stagedGame, '+login', account, '+app_update', '1366540', 'validate', '+quit'], cwd: path.dirname(executable), signal, timeoutMs: 60 * 60_000 })
@@ -245,18 +310,21 @@ export class ServerSetupManager {
         if (!entry?.isFile() || entry.size > 64) fail('SETUP_GAME_INVALID', 'Steam App ID 文件无效。')
         if ((await fs.readFile(appIdFile, 'utf8')).trim() !== '1366540') fail('SETUP_GAME_INVALID', 'Steam App ID 文件与游戏不匹配。')
       } else await fs.writeFile(appIdFile, '1366540\n', { flag: 'wx' })
+      await saveRecord('installing-mods')
       report('正在安装 Nebula、BepInEx 及所需依赖。')
       if (this.#options.installMods) await this.#options.installMods(stagedGame, operation, report, signal)
       else {
         const manager = new GameUpdateManager({ gameRoot: stagedGame, workDirectory: path.join(operation, 'mods-work'), backupDirectory: path.join(operation, 'mods-backups'), isGameRunning: async () => false })
         await manager.installComponent('nebula', undefined, report, signal)
       }
+      await saveRecord('checking-bridge')
       for (const reference of bridge.manifest.references) {
         const target = path.join(stagedGame, ...reference.file.replaceAll('\\', '/').split('/'))
         await noLinks(target)
         const entry = await stat(target)
         if (!entry?.isFile() || entry.size !== reference.bytes || await hash(target) !== reference.sha256) fail('SETUP_BRIDGE_INCOMPATIBLE', '下载的游戏或模组与本安装包的 Bridge 编译依据不一致。文件已保留，请使用匹配的完整安装包。')
       }
+      await saveRecord('configuring')
       report('游戏与 Bridge 依赖校验通过，正在配置首次启动。')
       await fs.writeFile(path.join(stagedGame, '.dyson-first-world.json'), JSON.stringify({ schema: 1, mode: 'default', installationId: id }) + '\n', { flag: 'wx' })
       await this.#assertNewRoot(gameUser)
@@ -286,6 +354,7 @@ export class ServerSetupManager {
       if (!configured.configured || configured.taskStarted !== false || configured.taskName !== this.#config.game.startTaskName || configured.bridgeSha256 !== bridge.manifest.dll.sha256) fail('SETUP_CONFIGURATION_UNCONFIRMED', '服务器配置结果未能确认，请检查安装记录。')
       const host = await this.#host()
       if (!host.taskExists || host.running) fail('SETUP_CONFIGURATION_UNCONFIRMED', '首次启动任务状态未能确认。')
+      signal.throwIfAborted()
       record.phase = 'ready'; await saveRecord()
       report('服务器安装完成。可前往概览手动启动；首次运行和外部联机仍需验证。')
       return { installed: true, buildId: record.buildId, taskName: configured.taskName, gameStarted: false, operationId: id }
@@ -297,11 +366,11 @@ export class ServerSetupManager {
         }
       }
       record.phase = promoted ? 'needs-review' : 'failed-files-retained'
-      await saveRecord().catch(() => undefined)
-      report(`安装记录已保留：${operation}`)
+      try { await saveRecord(); report('安装结果已记录，可在“安装与授权”查看。') }
+      catch { report('未能保存最终安装结果，请保留现场并核对启动任务和游戏目录。') }
       if (error instanceof GameAdapterError) throw error
-      fail('SETUP_FAILED', '首次安装未完成。已保留下载文件和安装记录，请检查后重试。')
-    }
+      fail('SETUP_FAILED', '首次安装未完成，现有文件已保留。请在“安装与授权”核对安装记录和启动任务。')
+    } finally { this.#activeInstallation = null }
   }
 
   #assertWindows(): void {

@@ -18,6 +18,7 @@ export interface SaveRestoreInput {
   saveName: string
   members: SaveRestoreMemberInput[]
   startupSettings: unknown
+  protection?: { members: Array<{ fileName: string; sha256: string }>; startupSha256: string }
 }
 
 export interface SaveRestoreManagerOptions {
@@ -157,6 +158,10 @@ export class SaveRestoreManager {
         const fileName = `${input.saveName}${extension}`
         const target = path.join(this.#saveDirectory, fileName)
         const beforeSha256 = await this.#snapshotOptional(target, path.join(partial, 'before', this.#token(extension)), 'SAVE_MEMBER_INVALID')
+        if (input.protection) {
+          const protectedHash = input.protection.members.find(member => member.fileName === fileName)?.sha256 ?? null
+          if (beforeSha256 !== protectedHash) fail('RESTORE_PROTECTION_CHANGED', `目标成员 ${fileName} 已不同于保护备份。请检查存档并重新预览。`)
+        }
         const source = desired.get(extension)
         const afterSha256 = source
           ? await this.#snapshotRequired(source.sourcePath, path.join(partial, 'after', this.#token(extension)), source.sha256, 'BACKUP_VERIFICATION_FAILED')
@@ -164,6 +169,9 @@ export class SaveRestoreManager {
         members.push({ extension, fileName, beforeSha256, afterSha256 })
       }
       const startupBefore = await this.#snapshotRequired(this.#startupSettingsPath, path.join(partial, 'before', 'startup.json'), null, 'STARTUP_SETTINGS_INVALID')
+      if (input.protection && startupBefore !== input.protection.startupSha256) {
+        fail('RESTORE_PREVIEW_CHANGED', '启动配置已变化，请重新查看恢复预览。')
+      }
       const startupBytes = Buffer.from(`${JSON.stringify(input.startupSettings, null, 2)}\n`, 'utf8')
       const startupAfter = digest(startupBytes)
       await fs.writeFile(path.join(partial, 'after', 'startup.json'), startupBytes, { flag: 'wx', mode: 0o600 })

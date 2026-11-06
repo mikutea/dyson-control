@@ -1,0 +1,37 @@
+.client-picker { padding: 1rem; border-bottom: 1px solid var(--line); }
+.client-picker label { display: grid; gap: .45rem; color: var(--muted); font-size: .75rem; }
+.client-picker select { width: 100%; min-width: 0; padding: .65rem; border: 1px solid var(--line-strong); border-radius: .5rem; background: var(--bg); color: var(--text); color-scheme: dark; font: inherit; }
+.client-picker > span { display: block; margin-top: .5rem; color: var(--muted); font-size: .7rem; }
+
+.client-detail { padding: 1rem; }
+.client-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: .8rem; }
+.client-detail-head .button { flex-shrink: 0; }
+.client-status { margin: .3rem 0; font-size: .95rem; }
+.client-status-current { color: var(--green); }
+.client-status-outdated, .client-mod-changed small { color: var(--amber); }
+.client-status-unknown { color: var(--muted); }
+.client-detail-head p, .client-unknown-mods, .client-import-note { margin: .35rem 0; color: var(--muted); font-size: .76rem; line-height: 1.65; overflow-wrap: anywhere; }
+.client-import-note { margin: 1rem 0; }
+.client-import-note b { font-weight: 600; }
+
+.client-address { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; padding: .85rem 0; margin: .75rem 0; border-block: 1px solid var(--line); }
+.client-address dt { font-size: .7rem; color: var(--muted); }
+.client-address dd { margin: .3rem 0 0; font: 500 .85rem/1.5 ui-monospace, monospace; overflow-wrap: anywhere; }
+.client-changed-address dd { color: var(--amber); }
+.client-mods { width: 100%; border-collapse: collapse; table-layout: fixed; text-align: left; }
+.client-mods col:first-child { width: 52%; }
+.client-mods th, .client-mods td { padding: .65rem .4rem; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; vertical-align: middle; }
+.client-mods th:first-child { padding-left: 0; }
+.client-mods thead th { color: var(--muted); font-size: .7rem; font-weight: 500; }
+.client-mods tbody th { font-size: .78rem; font-weight: 550; }
+.client-mods td { font: .78rem/1.45 ui-monospace, monospace; }
+.client-mods small { display: block; margin-top: .2rem; font-size: .65rem; }
+.client-digest { padding-top: .85rem; color: var(--muted); font-size: .7rem; }
+.client-digest summary { cursor: pointer; }
+.client-digest code { display: block; margin-top: .45rem; overflow-wrap: anywhere; user-select: all; }
+
+@media (max-width: 480px) {
+  .client-detail-head { flex-wrap: wrap; }
+  .client-address { grid-template-columns: minmax(0, 1fr); gap: .6rem; }
+  .client-mods col:first-child { width: 48%; }
+}

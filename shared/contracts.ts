@@ -90,6 +90,12 @@ export interface ControlUpdatePrepareResult { statusCode: 202; operation: Contro
 export interface ControlUpdateApplyResult { statusCode: 202; operation: ControlUpdateOperation }
 export interface Save { id: string; name: string; bytes: number; modifiedAt: string; members: string[]; current: boolean }
 export interface Backup { id: string; saveName: string; createdAt: string; bytes: number; members: string[]; reason: string }
+export interface BackupRestorePreview {
+  backupId: string; saveName: string; previewKey: string
+  members: Array<{ fileName: string; action: 'create' | 'replace' | 'remove' | 'untouched' }>
+  serverRunning: boolean; protectedSaveNames: string[]; protectRunningSave: boolean
+  previousStartupSaveName: string | null; blockers: string[]
+}
 export type ReadOnlyGameSetting = 'maxPlayers' | 'targetUps' | 'autosaveMinutes'
 export interface GameSettings {
   serverName: string; maxPlayers: number | null; targetUps: number; autosaveMinutes: number | null; backupKeep: number; address: string
@@ -118,6 +124,12 @@ export interface RuntimeStatus {
   recovery: { wantedRunning: boolean; blockedReason: string | null; attempts: number; nextAttemptAt: string | null }
 }
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
+export interface GameDownload { path: string; fileName: string; contentType: string; verifiedBytes?: Uint8Array }
+export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
+export interface ClientPackageDetails {
+  id: string; profile: ClientProfile | null; currentAddress: string; currentMods: ClientProfile['mods'] | null
+  status: 'current' | 'outdated' | 'unknown'; reason: string | null; downloadable: boolean; sha256: string | null
+}
 export interface JobStep { time: string; message: string }
 export interface Job { id: string; requestId: string; action: Action; state: JobState; createdAt: string; startedAt: string | null; finishedAt: string | null; message: string; steps: JobStep[]; result: Record<string, unknown> | null }
 export interface JobHistoryQuery { action?: Action; state?: JobState; before?: string; limit?: number }
@@ -132,11 +144,16 @@ export interface SteamAuthStatus {
   expiresAt: string | null; verifiedAt: string | null; latestBuild: string | null
 }
 export interface FirstWorldStatus { state: 'unavailable' | 'ready' | 'retryable'; message: string }
+export interface FirstInstallationAttempt {
+  state: 'running' | 'ready' | 'failed-files-retained' | 'needs-review' | 'incomplete' | 'unreadable'
+  stage: 'preparing-files' | 'downloading' | 'installing-mods' | 'checking-bridge' | 'configuring' | null
+  createdAt: string | null; updatedAt: string | null; buildId: string | null
+}
 export interface ServerSetupStatus {
   supported: boolean; gameRoot: string; steamExecutable: string; steamReady: boolean; accountName: string
   existingGame: boolean; targetEmpty: boolean; bridgeAvailable: boolean; taskExists: boolean
   gameUsers: Array<{ name: string; activeSteam: boolean }>
-  blockers: string[]; auth: SteamAuthStatus; firstWorld: FirstWorldStatus
+  blockers: string[]; auth: SteamAuthStatus; firstWorld: FirstWorldStatus; lastInstallation: FirstInstallationAttempt | null
 }
 
 export interface GameAdapter {
@@ -155,11 +172,13 @@ export interface GameAdapter {
   updateHistory(): Promise<UpdateHistoryEntry[]>
   saves(): Promise<Save[]>
   backups(): Promise<Backup[]>
+  restorePreview(backupId: string): Promise<BackupRestorePreview>
   settings(): Promise<GameSettings>
   settingsHistory(): Promise<GameSettingsHistoryEntry[]>
   clientPackages(): Promise<ClientPackage[]>
+  clientPackageDetails?(id: string): Promise<ClientPackageDetails>
   run(action: Action, input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>>
-  download?(kind: 'backup' | 'client', id: string): Promise<{ path: string; fileName: string; contentType: string }>
+  download?(kind: 'backup' | 'client', id: string): Promise<GameDownload>
   close?(): Promise<void>
 }
 
@@ -176,9 +195,12 @@ export interface ControlConfig {
 // HTTP responses are { data: T }. GET /api/session is also available before login.
 // POST /api/session {password}; DELETE /api/session. One administrator session.
 // GET /api/{overview,players,logs,mods,versions,saves,backups,settings,client-packages,jobs}.
+// GET /api/client-packages/:id compares one generated profile with the current client requirements.
 // GET /api/jobs accepts JobHistoryQuery and returns Job[] newest first; before is an exclusive job ID.
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
+// GET /api/jobs/by-request/:requestId returns the recorded Job, or null if that request has no job yet.
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.
-// Input: load-save {saveId}; verify-backup {backupId}; restore {backupId}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
+// GET /api/backups/:id/restore-preview returns BackupRestorePreview without verifying member hashes or running a job.
+// Input: load-save {saveId}; verify-backup {backupId}; restore {backupId,previewKey?}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
 // backup {saveId?}; install-update {component,version?}; create-client-package {}.

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { Upload } from 'lucide-react'
 import type { Job } from '../../shared/contracts'
-import { uploadBackup } from './api'
+import { newRequestId, uploadBackup } from './api'
 import { Button, Panel } from './components'
 import { formatBytes } from './format'
 
@@ -45,7 +45,7 @@ export function BackupImport({ onJob }: { onJob: (job: Job) => void }) {
       <div className="backup-import-controls">
         <label className="backup-file"><span>备份文件</span><input ref={input} type="file" accept=".zip,application/zip" disabled={busy} onChange={(event) => {
           setFile(event.target.files?.[0] ?? null)
-          requestId.current = crypto.randomUUID()
+          requestId.current = newRequestId()
           setError(null)
           setMessage(null)
         }} /></label>

@@ -2,15 +2,16 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
 import type {
-  Action, Backup, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameSettings, GameSettingsHistoryEntry,
+  Action, Backup, BackupRestorePreview, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameDownload, GameSettings, GameSettingsHistoryEntry,
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { GameAdapterError, invalidInput } from './errors.js'
-import { createR2ModmanPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, listClientPackages, withClientRuntime, writeClientPackage } from './profile.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { importUploadedBackup } from '../backup-import.js'
-import { runBackupVerification } from './backup-verification.js'
+import { readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
+import { assertRestoreImpact, backupMemberBlockers, describeRestore } from './restore-preview.js'
 import { VersionLockStore } from './version-locks.js'
 
 const now = () => new Date().toISOString()
@@ -28,7 +29,7 @@ export class DemoGameAdapter implements GameAdapter {
   #mods: Mod[]
   #saves: Save[]
   #backups: Backup[] = []
-  #packages: ClientPackage[] = []
+  readonly #packageDirectory: string
   #logs: LogEntry[]
   #versions: ComponentVersion[]
   #history: UpdateHistoryEntry[] = []
@@ -42,6 +43,7 @@ export class DemoGameAdapter implements GameAdapter {
 
   constructor(config: ControlConfig) {
     this.#config = config
+    this.#packageDirectory = path.join(config.dataDirectory, 'demo-downloads')
     this.#versionLocks = new VersionLockStore(path.join(config.dataDirectory, 'demo-version-locks.json'))
     this.#settings = { serverName: config.game.serverName, maxPlayers: 16, targetUps: 60, autosaveMinutes: 10, backupKeep: 20, address: config.game.address }
     this.#players = [
@@ -116,7 +118,11 @@ export class DemoGameAdapter implements GameAdapter {
   async backups(): Promise<Backup[]> { return structuredClone(this.#backups).reverse() }
   async settings(): Promise<GameSettings> { return structuredClone(this.#settings) }
   async settingsHistory(): Promise<GameSettingsHistoryEntry[]> { return structuredClone(this.#settingsHistory).reverse() }
-  async clientPackages(): Promise<ClientPackage[]> { return structuredClone(this.#packages).reverse() }
+  async clientPackages(): Promise<ClientPackage[]> { return listClientPackages(this.#packageDirectory) }
+
+  async clientPackageDetails(id: string) {
+    return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
+  }
 
   async run(action: Action, input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     signal.throwIfAborted()
@@ -161,7 +167,7 @@ export class DemoGameAdapter implements GameAdapter {
         await this.run('stop', {}, report, signal); return this.run('start', {}, report, signal)
       case 'backup': return this.#backup(input.saveId, input.automatic === true ? 'automatic-scheduled' : 'manual', report)
       case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
-      case 'restore': return this.#restore(input.backupId, report)
+      case 'restore': return this.#restore(input, report, signal)
       case 'import-backup': return this.#importBackup(input, report, signal)
       case 'toggle-mod': return this.#toggleMod(input, report)
       case 'set-mod-side': {
@@ -219,7 +225,8 @@ export class DemoGameAdapter implements GameAdapter {
     }
   }
 
-  async download(kind: 'backup' | 'client', id: string): Promise<{ path: string; fileName: string; contentType: string }> {
+  async download(kind: 'backup' | 'client', id: string): Promise<GameDownload> {
+    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
     const key = `${kind}:${id}`
     const filePath = this.#downloads.get(key)
     if (!filePath) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested download does not exist.')
@@ -315,26 +322,51 @@ export class DemoGameAdapter implements GameAdapter {
     return result
   }
 
-  async #restore(backupId: unknown, report: ReportStep): Promise<Record<string, unknown>> {
-    if (typeof backupId !== 'string') invalidInput('backupId is required.')
-    const backup = this.#backups.find((item) => item.id === backupId)
-    if (!backup) invalidInput('The selected backup does not exist.')
-    const wasRunning = this.#state === 'running'
-    if (wasRunning) await this.#save(report)
-    const previous = this.#saves.find((item) => item.current)
-    if (previous) await this.#backup(previous.id, 'automatic-before-restore', report)
-    if (wasRunning) { report('正在停服并准备恢复存档'); this.#state = 'stopped' }
-    this.#saves.forEach((item) => { item.current = false })
-    let restored = this.#saves.find((item) => item.name === backup.saveName)
-    if (!restored) {
-      restored = { id: backup.saveName.toLowerCase().replace(/[^a-z0-9]+/g, '-'), name: backup.saveName, bytes: backup.bytes, modifiedAt: now(), members: [...backup.members], current: true }
-      this.#saves.push(restored)
-    } else {
-      Object.assign(restored, { bytes: backup.bytes, modifiedAt: now(), members: [...backup.members], current: true })
+  async #describeRestore(manifest: BackupManifest): Promise<BackupRestorePreview> {
+    const current = this.#saves.find(save => save.current)
+    const target = this.#saves.find(save => save.name === manifest.saveName)
+    return describeRestore(manifest, {
+      existing: target?.members ?? [], targetBlockers: [], previousStartupSaveName: current?.name ?? null,
+      runningIdentity: this.#state === 'running' ? String(this.#startedAt) : null,
+      knownRunningSave: this.#state === 'running' ? current?.name : undefined,
+      blockers: await backupMemberBlockers(this.#config.game.backupDirectory, manifest)
+    })
+  }
+
+  async restorePreview(backupId: string): Promise<BackupRestorePreview> {
+    return this.#describeRestore(await readBackupManifest(this.#config.game.backupDirectory, backupId))
+  }
+
+  async #restore(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (typeof input.backupId !== 'string') invalidInput('backupId is required.')
+    const manifest = await readBackupManifest(this.#config.game.backupDirectory, input.backupId)
+    await verifyBackupFiles(this.#config.game.backupDirectory, manifest, signal)
+    const preview = await this.#describeRestore(manifest)
+    assertRestoreImpact(preview, input.previewKey)
+    signal.throwIfAborted()
+    if (preview.serverRunning) {
+      await this.#save(report)
+      report('正在停服并准备恢复存档')
+      this.#state = 'stopped'
     }
-    if (wasRunning) { report('存档已恢复，正在重新启动服务器'); this.#state = 'running'; this.#startedAt = Date.now() }
-    this.#log('warning', `Restored backup ${backup.id}.`)
-    return { backupId: backup.id, saveName: backup.saveName, restarted: wasRunning }
+    const automaticBackups: string[] = []
+    try {
+      for (const name of preview.protectedSaveNames) {
+        const save = this.#saves.find(item => item.name === name)!
+        const protection = await this.#backup(save.id, 'automatic-before-restore', report)
+        automaticBackups.push(String(protection.backupId))
+      }
+      const restored = this.#saves.find(item => item.name === manifest.saveName)
+      const fields = { bytes: manifest.members.reduce((sum, member) => sum + member.bytes, 0), modifiedAt: now(),
+        members: manifest.members.map(member => member.fileName), current: true }
+      for (const save of this.#saves) save.current = false
+      if (restored) Object.assign(restored, fields)
+      else this.#saves.push({ id: randomUUID(), name: manifest.saveName, ...fields })
+    } finally {
+      if (preview.serverRunning) { report('正在重新启动演示服务器'); this.#state = 'running'; this.#startedAt = Date.now() }
+    }
+    this.#log('warning', `Restored backup ${manifest.id}.`)
+    return { backupId: manifest.id, saveName: manifest.saveName, automaticBackups, startupSelectionApplied: true, restarted: preview.serverRunning }
   }
 
   #toggleMod(input: Record<string, unknown>, report: ReportStep): Record<string, unknown> {
@@ -419,18 +451,13 @@ export class DemoGameAdapter implements GameAdapter {
     return { historyId: entry.id, rollbackBackupId: rollbackId, restarted: this.#state === 'running' }
   }
 
+  #clientMods(): Mod[] {
+    return withClientRuntime(this.#mods, this.#versions.find(component => component.id === 'bepinex')?.current ?? null)
+  }
+
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {
     report('正在生成可导入的 r2modman 配置包')
-    const createdAt = now()
-    const id = `client-${timestampId()}`
-    const profileName = `Dyson-Control-${timestampId().slice(0, 8)}`
-    const bytes = createR2ModmanPackage(profileName, this.#settings.address, this.#mods)
-    const directory = path.join(this.#config.dataDirectory, 'demo-downloads')
-    await fs.mkdir(directory, { recursive: true })
-    const filePath = path.join(directory, `${id}.r2z`)
-    await fs.writeFile(filePath, bytes, { flag: 'wx' })
-    const item: ClientPackage = { id, name: `${profileName}.r2z`, createdAt, bytes: bytes.length, modCount: this.#mods.filter((mod) => mod.enabled && mod.side !== 'server').length, downloadUrl: `/api/client-packages/${id}/download` }
-    this.#packages.push(item); this.#downloads.set(`client:${id}`, filePath)
-    return { packageId: id, fileName: item.name, modCount: item.modCount }
+    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, this.#clientMods())
+    return { packageId: item.id, fileName: item.name, modCount: item.modCount }
   }
 }

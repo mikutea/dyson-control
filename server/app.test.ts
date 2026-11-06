@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
@@ -15,6 +15,7 @@ import { LoginGuard } from './auth.js'
 import { buildApp } from './app.js'
 import { JobStore } from './jobs.js'
 import { readGameLogs } from './game/logs.js'
+import { DemoGameAdapter } from './game/demo.js'
 import { MAINTENANCE_MARKER } from './health.js'
 import { ControlUpdateError } from './control-updates.js'
 import { SteamAuthManager } from './steam-auth.js'
@@ -109,6 +110,32 @@ describe('Dyson Control API', () => {
       expect(repeat.json().data.id).toBe(first.json().data.id)
       expect((await waitForJobs(app, cookie, 1))[0]?.state).toBe('succeeded')
       expect(f.adapter.calls).toEqual([{ action: 'verify-backup', input: { backupId: 'fixture-backup' } }])
+    } finally { await app.close() }
+  })
+
+  it('reads restore impact only after login without enqueueing a job and validates the optional confirmation key', async () => {
+    const f = await createFixture()
+    const read = vi.spyOn(f.adapter, 'restorePreview')
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const url = '/api/backups/fixture-backup/restore-preview'
+      expect((await app.inject({ url })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      expect((await app.inject({ url: url + '?run=true', headers: { cookie } })).statusCode).toBe(400)
+      expect(read).not.toHaveBeenCalled()
+      const response = await app.inject({ url, headers: { cookie } })
+      expect(response.statusCode).toBe(200)
+      expect(response.headers['cache-control']).toBe('no-store')
+      const { data: preview } = response.json()
+      expect(preview.backupId).toBe('fixture-backup')
+      expect(read).toHaveBeenCalledWith('fixture-backup')
+      expect((await app.inject({ url: '/api/jobs', headers: { cookie } })).json().data).toEqual([])
+      const payload = { requestId: 'reviewed-restore', action: 'restore', input: { backupId: preview.backupId, previewKey: 'invalid' } }
+      expect((await app.inject({ url: '/api/actions', method: 'POST', headers: { cookie }, payload })).statusCode).toBe(400)
+      payload.input.previewKey = preview.previewKey
+      expect((await app.inject({ url: '/api/actions', method: 'POST', headers: { cookie }, payload })).statusCode).toBe(202)
+      await waitForJobs(app, cookie, 1)
+      expect(f.adapter.calls).toEqual([{ action: 'restore', input: payload.input }])
     } finally { await app.close() }
   })
 
@@ -510,6 +537,64 @@ describe('Dyson Control API', () => {
     await app.close()
   })
 
+  it('compares the selected client package through authenticated routes after a demo runtime update', async () => {
+    const fixture = await createFixture()
+    const app = await buildApp({ config: fixture.config, databasePath: ':memory:' })
+    await app.ready()
+    try {
+      expect((await app.inject({ method: 'GET', url: '/api/client-packages/unlisted' })).statusCode).toBe(401)
+      const cookie = await loginCookie(app)
+      const headers = { cookie }
+      const action = (name: Action, input = {}) => app.inject({ method: 'POST', url: '/api/actions', headers,
+        payload: { action: name, requestId: randomUUID(), input } })
+      expect((await action('create-client-package')).statusCode).toBe(202)
+      await waitForJobs(app, cookie, 1)
+      const [item] = (await app.inject({ method: 'GET', url: '/api/client-packages', headers })).json().data as ClientPackage[]
+      const url = `/api/client-packages/${item!.id}`
+      expect((await app.inject({ method: 'GET', url: url + '?extra=1', headers })).statusCode).toBe(400)
+      const original = (await app.inject({ method: 'GET', url, headers })).json().data
+      expect(original).toMatchObject({ status: 'current', downloadable: true, profile: {
+        address: fixture.config.game.address, mods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.17' }])
+      } })
+      expect(original.profile.mods).not.toContainEqual(expect.objectContaining({ name: 'mikutea-DysonControlBridge' }))
+      expect((await action('install-update', { component: 'bepinex', version: '5.4.23' })).statusCode).toBe(202)
+      await waitForJobs(app, cookie, 2)
+      const changed = (await app.inject({ method: 'GET', url, headers })).json().data
+      expect(changed).toMatchObject({ status: 'outdated', profile: original.profile,
+        currentMods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.23' }]) })
+      const download = await app.inject({ method: 'GET', url: item!.downloadUrl, headers })
+      expect(download.statusCode).toBe(200)
+      expect(createHash('sha256').update(download.rawPayload).digest('hex')).toBe(original.sha256)
+    } finally { await app.close() }
+  })
+
+  it('serves the verified client bytes when the archive path changes after verification', async () => {
+    const fixture = await createFixture()
+    const adapter = new DemoGameAdapter(fixture.config)
+    const item = await adapter.run('create-client-package', {}, () => {}, new AbortController().signal)
+    const id = String(item.packageId)
+    const expected = await adapter.clientPackageDetails(id)
+    expect(expected.status).toBe('current')
+    const readDownload = adapter.download.bind(adapter)
+    vi.spyOn(adapter, 'download').mockImplementationOnce(async (kind, selectedId) => {
+      const verified = await readDownload(kind, selectedId)
+      expect(verified.verifiedBytes).toBeDefined()
+      await writeFile(verified.path, Buffer.alloc(verified.verifiedBytes!.length, 0x41))
+      return verified
+    })
+    const app = await buildApp({ config: fixture.config, adapter, databasePath: ':memory:' })
+    try {
+      const headers = { cookie: await loginCookie(app) }
+      const url = `/api/client-packages/${id}/download`
+      const response = await app.inject({ method: 'GET', url, headers })
+      expect(response.statusCode).toBe(200)
+      expect(createHash('sha256').update(response.rawPayload).digest('hex')).toBe(expected.sha256)
+      const next = await app.inject({ method: 'GET', url, headers })
+      expect(next.statusCode).toBeGreaterThanOrEqual(400)
+      expect(next.json().error.code).toBe('PACKAGE_CHECKSUM_FAILED')
+    } finally { await app.close() }
+  })
+
   it('serves adapter downloads only to authenticated sessions', async () => {
     const fixture = await createFixture()
     const file = join(fixture.directory, 'bundle.zip')
@@ -614,6 +699,28 @@ describe('Dyson Control API', () => {
       expect(recovered.statusCode).toBe(200)
       expect(recovered.headers['x-log-truncated']).toBe('true')
       expect(recovered.rawPayload.equals(content.subarray(-limit))).toBe(true)
+    } finally { await app.close() }
+  })
+
+  it('lets an authenticated tab recover the receipt for a lost action response without replay', async () => {
+    const f = await createFixture()
+    const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:' })
+    try {
+      const requestId = randomUUID()
+      const url = `/api/jobs/by-request/${requestId}`
+      expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401)
+      const headers = { cookie: await loginCookie(app) }
+      expect((await app.inject({ method: 'GET', url, headers })).json().data).toBeNull()
+      const action = { requestId, action: 'backup', input: { saveId: 'save-1' } }
+      const first = await app.inject({ method: 'POST', url: '/api/actions', headers, payload: action })
+      expect(first.statusCode).toBe(202)
+      await waitForJobs(app, headers.cookie, 1)
+      const readback = (await app.inject({ method: 'GET', url, headers })).json().data
+      expect(readback).toMatchObject({ id: first.json().data.id, requestId, state: 'succeeded' })
+      expect(readback).not.toHaveProperty('input')
+      const repeated = await app.inject({ method: 'POST', url: '/api/actions', headers, payload: action })
+      expect(repeated.json().data.id).toBe(readback.id)
+      expect(f.adapter.calls).toHaveLength(1)
     } finally { await app.close() }
   })
 
@@ -781,6 +888,10 @@ async function createFixture(delayMs = 0): Promise<{ directory: string; config: 
     async updateHistory() { return [] },
     async saves(): Promise<Save[]> { return [] },
     async backups(): Promise<Backup[]> { return [] },
+    async restorePreview(backupId) {
+      return { backupId, saveName: 'Fixture', previewKey: 'a'.repeat(64), members: [], serverRunning: false,
+        protectedSaveNames: [], protectRunningSave: false, previousStartupSaveName: null, blockers: [] }
+    },
     async settings(): Promise<GameSettings> {
       return { serverName: 'Fixture server', maxPlayers: 16, targetUps: 60, autosaveMinutes: 10, backupKeep: 20, address: '127.0.0.1:8469' }
     },

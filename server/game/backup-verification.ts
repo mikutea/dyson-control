@@ -24,10 +24,17 @@ export async function hashBackupMember(filePath: string, signal?: AbortSignal): 
   return hash.digest('hex')
 }
 
+async function backupStat(file: string) {
+  return fs.lstat(file).catch((cause: NodeJS.ErrnoException) => {
+    if (cause.code === 'ENOENT') return null
+    throw new GameAdapterError('BACKUP_STORAGE_UNAVAILABLE', '无法读取备份目录或成员。请检查权限和存储连接后重试。', { cause })
+  })
+}
+
 async function backupRoot(directory: string, id: string): Promise<string> {
   safeId(id, 'backupId')
   const root = ensureInside(directory, path.join(directory, id))
-  const stat = await fs.lstat(root).catch(() => null)
+  const stat = await backupStat(root)
   if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', '备份目录不存在或不是普通目录。')
   return root
 }
@@ -52,17 +59,18 @@ export async function readBackupManifest(directory: string, id: string): Promise
 export async function verifyBackupFiles(directory: string, manifest: BackupManifest, signal?: AbortSignal, report?: ReportStep): Promise<string> {
   signal?.throwIfAborted()
   const root = await backupRoot(directory, manifest.id)
-  for (const extension of extensions) {
-    const name = `${manifest.saveName}${extension}`
-    if (!manifest.members.some(member => member.fileName === name) && await fs.lstat(path.join(root, name)).catch(() => null)) {
-      throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份含清单之外的存档成员：${name}。`)
+  const unlisted = extensions.map(extension => manifest.saveName + extension).filter(name => !manifest.members.some(member => member.fileName === name))
+  async function checkUnlistedMembers() {
+    for (const name of unlisted) {
+      if (await backupStat(path.join(root, name))) throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份含清单之外的存档成员：${name}。`)
     }
   }
+  await checkUnlistedMembers()
   for (const member of manifest.members) {
     signal?.throwIfAborted()
     report?.(`正在校验 ${member.fileName} 的大小与 SHA-256`)
     const file = ensureInside(root, path.join(root, member.fileName))
-    const before = await fs.lstat(file).catch(() => null)
+    const before = await backupStat(file)
     if (!before?.isFile() || before.isSymbolicLink() || before.size !== member.bytes) {
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份成员缺失、类型异常或大小不匹配：${member.fileName}。`)
     }
@@ -71,11 +79,12 @@ export async function verifyBackupFiles(directory: string, manifest: BackupManif
       signal?.throwIfAborted()
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `无法读取备份成员：${member.fileName}；请检查文件权限和存储是否可用。`, { cause: error })
     }
-    const after = await fs.lstat(file).catch(() => null)
+    const after = await backupStat(file)
     if (hash !== member.sha256 || !after?.isFile() || after.isSymbolicLink() || after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `备份成员内容不匹配或在校验期间变化：${member.fileName}。`)
     }
   }
+  await checkUnlistedMembers()
   if (JSON.stringify(await readBackupManifest(directory, manifest.id)) !== JSON.stringify(manifest)) {
     throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', '备份清单在校验期间发生变化，请检查后重新校验。')
   }
