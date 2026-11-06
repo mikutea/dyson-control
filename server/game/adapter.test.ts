@@ -290,14 +290,30 @@ describe('backup restore impact', () => {
     const backupId = String((await run('backup', { saveId: 'sandbox' })).backupId)
     const preview = await adapter.restorePreview(backupId)
     expect(preview).toMatchObject({ previousStartupSaveName: 'DemoGalaxy', protectedSaveNames: ['Sandbox', 'DemoGalaxy'], protectRunningSave: true, blockers: [] })
-    expect((await run('restore', { backupId, previewKey: preview.previewKey })).automaticBackups).toHaveLength(2)
-    expect((await adapter.backups()).filter(item => item.reason === 'automatic-before-restore').map(item => item.saveName).sort()).toEqual(['DemoGalaxy', 'Sandbox'])
+    const runningProtection = (await run('restore', { backupId, previewKey: preview.previewKey })).automaticBackups as string[]
+    expect(runningProtection).toHaveLength(2)
+    const original = await adapter.backups()
+    expect(original.map(item => item.id).sort()).toEqual([backupId, ...runningProtection].sort())
+    expect(original.filter(item => runningProtection.includes(item.id)).map(item => [item.saveName, item.reason]).sort()).toEqual([
+      ['DemoGalaxy', 'automatic-before-restore'], ['Sandbox', 'automatic-before-restore']
+    ])
+    const exports = new Map(await Promise.all(original.map(async item => [item.id, await fs.readFile((await adapter.download!('backup', item.id)).path)] as const)))
     const restored = createGameAdapter(settings)
     await restored.run('stop', {}, () => {}, new AbortController().signal)
+    expect(await restored.backups()).toEqual(original)
     const stopped = await restored.restorePreview(backupId)
     expect(stopped).toMatchObject({ previousStartupSaveName: 'DemoGalaxy', protectedSaveNames: ['Sandbox'], protectRunningSave: false, blockers: [] })
-    expect(await restored.run('restore', { backupId, previewKey: stopped.previewKey }, () => {}, new AbortController().signal)).toMatchObject({ restarted: false, automaticBackups: [expect.any(String)] })
-    expect((await restored.backups()).map(item => item.saveName)).toEqual(['Sandbox'])
+    const result = await restored.run('restore', { backupId, previewKey: stopped.previewKey }, () => {}, new AbortController().signal)
+    expect(result).toMatchObject({ restarted: false, automaticBackups: [expect.any(String)] })
+    const after = await restored.backups()
+    expect(after.filter(item => exports.has(item.id))).toEqual(original)
+    expect(after.filter(item => !exports.has(item.id))).toEqual([
+      expect.objectContaining({ id: (result.automaticBackups as string[])[0], saveName: 'Sandbox', reason: 'automatic-before-restore' })
+    ])
+    for (const [id, bytes] of exports) {
+      await expect(restored.run('verify-backup', { backupId: id }, () => {}, new AbortController().signal)).resolves.toMatchObject({ backupId: id })
+      expect(await fs.readFile((await restored.download!('backup', id)).path)).toEqual(bytes)
+    }
   })
 })
 
@@ -641,17 +657,17 @@ const playerSessionId = '00000000-0000-4000-8000-000000000001'
 const playerSessionPlayerId = 'player-000001'
 const currentPlayerId = `${playerSessionId}:${playerSessionPlayerId}`
 
-async function publishBridgePlayers(fixture: ControlConfig, secret: string, displayName = 'Nova'): Promise<void> {
+async function publishBridgePlayers(fixture: ControlConfig, secret: string, displayName: string | null = 'Nova'): Promise<void> {
   const writtenAt = Date.now()
-  const players = [{
+  const players = displayName === null ? [] : [{
     sessionPlayerId: playerSessionPlayerId, displayName, online: true,
     joinedAtUnixMs: writtenAt - 1_000, location: 'planet:101'
   }]
   const playersJsonB64 = Buffer.from(JSON.stringify(players), 'utf8').toString('base64url')
-  const parts = ['DYSON_CONTROL_PLAYERS_V1', playerSessionId, String(writtenAt), '1', 'active', 'false', '1', playersJsonB64]
+  const parts = ['DYSON_CONTROL_PLAYERS_V1', playerSessionId, String(writtenAt), '1', 'active', 'false', String(players.length), playersJsonB64]
   await fs.writeFile(path.join(fixture.game.bridgeDirectory, 'players'), [
     'protocol=DYSON_CONTROL_PLAYERS_V1', `sessionId=${playerSessionId}`, `writtenAtUnixMs=${writtenAt}`,
-    'sequence=1', 'state=active', 'truncated=false', 'playerCount=1', `playersJsonB64=${playersJsonB64}`,
+    'sequence=1', 'state=active', 'truncated=false', `playerCount=${players.length}`, `playersJsonB64=${playersJsonB64}`,
     `hmac=${sign(secret, parts)}`, ''
   ].join('\n'))
 }
@@ -873,9 +889,13 @@ describe('Windows adapter fixture behavior', () => {
     const secret = await prepareBridge(fixture, processId)
     await publishBridgeTelemetry(fixture, secret, processId)
 
-    expect((await adapter.overview()).metrics).toMatchObject({ ups: 59.875, tps: 60 })
+    expect(await adapter.overview()).toMatchObject({ playerCount: null, worldClock: null, metrics: { ups: 59.875, tps: 60 } })
+    await publishBridgePlayers(fixture, secret, null)
+    expect(await adapter.overview()).toMatchObject({ playerCount: 0, playerStatus: 'available',
+      worldClock: { gameTick: 123456, sessionId: '12345678-1234-1234-1234-123456789abc', rosterSessionId: playerSessionId,
+        writtenAt: expect.any(Number), rosterWrittenAt: expect.any(Number), rosterSequence: 1 } })
     await publishBridgeTelemetry(fixture, secret, processId, 'unavailable')
-    expect((await adapter.overview()).metrics).toMatchObject({ ups: null, tps: null })
+    expect(await adapter.overview()).toMatchObject({ worldClock: null, metrics: { ups: null, tps: null } })
   })
 
   it('reports runtime versions only from the current process signed Bridge snapshot', async () => {

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import {
   Activity, Archive, Box, CircleGauge, Clock3, Cpu, Database,
   Download, FileArchive, Gamepad2, HardDrive, MemoryStick, PackageCheck, Play, Power,
-  RefreshCw, RotateCcw, Save as SaveIcon, Server as ServerIcon, Settings2, ShieldCheck,
+  Pin, RefreshCw, RotateCcw, Save as SaveIcon, Server as ServerIcon, Settings2, ShieldCheck,
   Square, TimerReset, UserRound, Users, Wifi,
 } from 'lucide-react'
 import type {
@@ -161,7 +161,17 @@ function SavesPage({ refreshToken, runAction, onJob, overview, operationActive }
         <ResourceBody resource={backups} emptyTitle="还没有备份" emptyDescription="创建备份后可随时在这里恢复">
           {(items) => <div className="file-list">{items.map((backup) => <div key={backup.id}>
             <span className="file-icon"><ShieldCheck /></span>
-            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件</p><small>{formatFullDate(backup.createdAt)} · {formatBackupReason(backup.reason)}</small></div>
+            <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件{backup.retained ? ' · 已保留' : ''}</p>
+              <small>{formatFullDate(backup.createdAt)} · {formatBackupReason(backup.reason)}</small>
+              {backup.retained === null && <small>保留标记待核对，自动轮换已跳过</small>}
+              {typeof backup.retained === 'boolean' && <Button className="backup-retention-toggle" variant="quiet" icon={<Pin />} aria-pressed={backup.retained}
+                title={backup.retained ? '取消后，此备份将重新参与自动轮换' : '保留这份备份及其下载缓存，自动轮换会跳过它'}
+                aria-label={`${backup.retained ? '取消保留' : '保留此备份'} · ${backup.saveName} · ${formatFullDate(backup.createdAt)}`} disabled={operationActive || Boolean(backups.error)}
+                onClick={() => runAction('set-backup-retained', { backupId: backup.id, retained: !backup.retained }, backup.retained ? {
+                  title: `取消保留 ${backup.saveName} 的备份？`, label: '取消保留',
+                  description: `创建于 ${formatFullDate(backup.createdAt)} 的副本将重新参与自动轮换。本次只撤销标记，以后超出保留数量时可能清理这份备份及其下载缓存。`,
+                } : undefined)}>{backup.retained ? '取消保留' : '保留此备份'}</Button>}
+            </div>
             <a className="icon-link" href={`/api/backups/${encodeURIComponent(backup.id)}/download`} aria-label={`下载 ${backup.saveName}`}><Download /></a>
             <Button variant="quiet" icon={<ShieldCheck />} aria-label={`校验备份 ${backup.saveName}`} disabled={operationActive || Boolean(backups.error)} onClick={() => runAction('verify-backup', { backupId: backup.id })}>校验</Button>
             <Button variant="quiet" icon={<RotateCcw />} aria-label={`预览恢复 ${backup.saveName}`} onClick={() => setSelectedBackup(backup)}>恢复</Button>

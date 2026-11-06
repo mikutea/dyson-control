@@ -5,6 +5,7 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type {
   Action, Backup, ClientPackage, ComponentVersion, ControlConfig, ControlUpdateOperation, GameAdapter,
@@ -894,6 +895,50 @@ describe('Dyson Control API', () => {
   })
 })
 
+it('exports every retained raw sample in the requested window, including legacy nulls and real zeros', async () => {
+  const f = await createFixture()
+  const until = Date.UTC(2026, 0, 8, 12)
+  const since = until - 3_600_000
+  const db = new DatabaseSync(join(f.directory, 'runtime.sqlite'))
+  db.exec('CREATE TABLE runtime_samples (at INTEGER PRIMARY KEY, sample TEXT NOT NULL); BEGIN')
+  const insert = db.prepare('INSERT INTO runtime_samples VALUES (?, ?)')
+  const row = (at: number, value: number) => insert.run(at, JSON.stringify({
+    sampledAt: new Date(at).toISOString(), state: 'running', pid: 345, playerCount: 0, ups: value, tps: null,
+    cpuPercent: 0, memoryBytes: 1024, diskFreeBytes: null,
+  }))
+  row(since - 1, 7777)
+  for (let i = 0; i < 1200; i++) row(since + i * 2000, i)
+  row(until + 1, 8888)
+  db.exec('COMMIT'); db.close()
+  const app = await buildApp({ config: f.config, adapter: f.adapter, databasePath: ':memory:', runtimeOptions: { clock: () => until } })
+  try {
+    const csvUrl = '/api/runtime/history/download'
+    expect((await app.inject({ url: csvUrl })).statusCode).toBe(401)
+    const headers = { cookie: await loginCookie(app) }
+    for (const query of ['?hours=0', '?hours=169', '?hours=1&offset=2']) {
+      expect((await app.inject({ url: csvUrl + query, headers })).statusCode).toBe(400)
+    }
+    const csv = await app.inject({ url: csvUrl + '?hours=1', headers })
+    expect(csv.statusCode).toBe(200)
+    expect(csv.headers['content-type']).toContain('text/csv')
+    expect(csv.headers['content-disposition']).toContain('dyson-runtime-1h.csv')
+    expect(csv.headers['cache-control']).toBe('no-store')
+    const lines = csv.payload.trimEnd().split('\r\n')
+    expect(lines[0]).toContain('disk_free_bytes,network_receive_bytes_per_second,network_send_bytes_per_second,game_tick')
+    for (let i = 0; i < 1200; i++) {
+      expect(lines[i + 1]).toBe(`${new Date(since + i * 2000).toISOString()},running,345,0,${i},,0,1024,,,,`)
+    }
+    expect(csv.payload).not.toContain(',7777,')
+    expect(csv.payload).not.toContain(',8888,')
+    const trend = (await app.inject({ url: '/api/runtime/history/trend?hours=1', headers })).json().data
+    expect(trend).toMatchObject({ from: new Date(since).toISOString(), to: new Date(until).toISOString(), bucketMs: 15000 })
+    expect(trend.samples.length).toBeLessThanOrEqual(720)
+    expect(trend.samples[0]).toMatchObject({ ups: 7, networkReceiveBytesPerSecond: null })
+    expect(trend.samples.some((s: { ups: number }) => s.ups === 1199)).toBe(true)
+    expect(trend.samples).toEqual((await app.inject({ url: '/api/runtime/history?hours=1', headers })).json().data)
+  } finally { await app.close() }
+})
+
 async function loginCookie(app: Awaited<ReturnType<typeof buildApp>>): Promise<string> {
   const response = await app.inject({ method: 'POST', url: '/api/session', payload: { password: 'correct horse battery staple' } })
   return firstSetCookie(response.headers['set-cookie'])
@@ -935,6 +980,7 @@ async function createFixture(delayMs = 0): Promise<{ directory: string; config: 
   let active = 0
   const adapter: TestAdapter = {
     source: 'demo', calls: [], maxActive: 0, abortObserved: false, closed: false,
+    async recoveryStartReadiness() { return 'ready' },
     async overview(): Promise<Overview> {
       return {
         name: 'Fixture server', source: 'demo', state: 'stopped', sampledAt: new Date().toISOString(), address: '127.0.0.1:8469',

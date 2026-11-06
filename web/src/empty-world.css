@@ -1,0 +1,15 @@
+.world-observation { border-top: 1px solid var(--line); margin: 18px clamp(14px, 2vw, 22px) 14px; padding-top: 16px; }
+.world-observation h3 { margin: 0 0 10px; font-size: 1rem; }
+.world-observation p, .world-clock-points small { margin: 6px 0 0; font-size: .83rem; }
+.world-interval-title { display: flex; align-items: center; gap: 8px 12px; font-size: .88rem; flex-wrap: wrap; }
+.world-interval-title span { color: var(--muted); font-size: .78rem; }
+.world-interval[data-state="advancing"] .world-interval-title span { color: var(--green); }
+.world-interval[data-state="stalled"] .world-interval-title span { color: var(--amber); }
+.world-clock-points { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); max-width: 660px; gap: 8px 20px; margin: 10px 0; }
+.world-clock-points div { border-inline-start: 2px solid var(--line-strong); padding-inline-start: 10px; }
+.world-clock-points dt, .world-clock-points small, .world-observation-note { color: var(--muted); }
+.world-clock-points dt { font-size: .75rem; }
+.world-clock-points dd { margin: 3px 0; font-size: 1.05rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.world-clock-points small { display: block; }
+.world-previous { margin: 10px 0; }
+.world-previous summary { cursor: pointer; font-size: .85rem; margin-bottom: 8px; }

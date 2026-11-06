@@ -10,6 +10,7 @@ import { clientPackageDownload, compareClientPackage, listClientPackages, withCl
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { demoImportArchiveName, importUploadedBackup } from '../backup-import.js'
+import { BackupRetention } from './backup-retention.js'
 import { readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import { assertRestoreImpact, backupMemberBlockers, describeRestore } from './restore-preview.js'
 import { VersionLockStore } from './version-locks.js'
@@ -17,6 +18,7 @@ import { VersionLockStore } from './version-locks.js'
 const now = () => new Date().toISOString()
 
 export class DemoGameAdapter implements GameAdapter {
+  async recoveryStartReadiness() { return 'ready' as const }
   readonly source = 'demo' as const
   readonly #config: ControlConfig
   #state: 'running' | 'stopped' = 'running'
@@ -28,13 +30,12 @@ export class DemoGameAdapter implements GameAdapter {
   #playerEvents: PlayerEventBatch['events'] = []
   #mods: Mod[]
   #saves: Save[]
-  #backups: Backup[] = []
+  readonly #retention: BackupRetention
   readonly #packageDirectory: string
   #logs: LogEntry[]
   #versions: ComponentVersion[]
   #history: UpdateHistoryEntry[] = []
   #rollbackSnapshots = new Map<string, { mods: Mod[]; versions: ComponentVersion[] }>()
-  #downloads = new Map<string, string>()
   #modConfigContent = '[General]\nEnabled = true\nShowTips = true\n'
   #modConfigChangedAt = now()
   #modConfigHistory: Array<ModConfigHistoryEntry & { content: string }> = []
@@ -44,6 +45,7 @@ export class DemoGameAdapter implements GameAdapter {
   constructor(config: ControlConfig) {
     this.#config = config
     this.#packageDirectory = path.join(config.dataDirectory, 'demo-downloads')
+    this.#retention = new BackupRetention(config.game.backupDirectory, config.dataDirectory, this.#packageDirectory)
     this.#versionLocks = new VersionLockStore(path.join(config.dataDirectory, 'demo-version-locks.json'))
     this.#settings = { serverName: config.game.serverName, maxPlayers: 16, targetUps: 60, autosaveMinutes: 10, backupKeep: 20, address: config.game.address }
     this.#players = [
@@ -115,7 +117,7 @@ export class DemoGameAdapter implements GameAdapter {
   }
   async modRemovalHistory(): Promise<ModRemovalHistoryEntry[]> { return this.#removedMods.map(({ mod: _mod, ...entry }) => ({ ...entry })).reverse() }
   async saves(): Promise<Save[]> { return structuredClone(this.#saves) }
-  async backups(): Promise<Backup[]> { return structuredClone(this.#backups).reverse() }
+  async backups(): Promise<Backup[]> { return this.#retention.list() }
   async settings(): Promise<GameSettings> { return structuredClone(this.#settings) }
   async settingsHistory(): Promise<GameSettingsHistoryEntry[]> { return structuredClone(this.#settingsHistory).reverse() }
   async clientPackages(): Promise<ClientPackage[]> { return listClientPackages(this.#packageDirectory) }
@@ -155,6 +157,7 @@ export class DemoGameAdapter implements GameAdapter {
         this.#state = 'running'; this.#startedAt = Date.now(); this.#players = []
         report(`已从存档 ${selected.name} 启动服务器`)
         this.#log('info', `Loaded save ${selected.name}.`)
+        await this.#retention.prune(this.#settings.backupKeep, new Set(automaticBackups), report)
         return { saveName: selected.name, automaticBackups, wasRunning, state: 'running', bridgeReady: true }
       }
       case 'save': return this.#save(report)
@@ -165,7 +168,12 @@ export class DemoGameAdapter implements GameAdapter {
         return { state: 'stopped', saved: true }
       case 'restart':
         await this.run('stop', {}, report, signal); return this.run('start', {}, report, signal)
-      case 'backup': return this.#backup(input.saveId, input.automatic === true ? 'automatic-scheduled' : 'manual', report)
+      case 'backup': {
+        const result = await this.#backup(input.saveId, input.automatic === true ? 'automatic-scheduled' : 'manual', report)
+        if (input.automatic === true) await this.#retention.prune(this.#settings.backupKeep, new Set([String(result.backupId)]), report)
+        return result
+      }
+      case 'set-backup-retained': return this.#retention.set(input, report)
       case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'restore': return this.#restore(input, report, signal)
       case 'import-backup': return this.#importBackup(input, report, signal)
@@ -229,10 +237,12 @@ export class DemoGameAdapter implements GameAdapter {
 
   async download(kind: 'backup' | 'client', id: string): Promise<GameDownload> {
     if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
-    const key = `${kind}:${id}`
-    const filePath = this.#downloads.get(key)
-    if (!filePath) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested download does not exist.')
-    await fs.access(filePath)
+    const manifest = await readBackupManifest(this.#config.game.backupDirectory, id)
+    const original = path.join(this.#config.game.backupDirectory, id, demoImportArchiveName)
+    const cache = path.join(this.#packageDirectory, id + '.zip')
+    const filePath = manifest.reason === 'imported' && await fs.lstat(original).then(stat => stat.isFile(), () => false) ? original : cache
+    const file = await fs.lstat(filePath).catch(() => null)
+    if (!file?.isFile() || file.isSymbolicLink()) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '找不到这份备份下载。')
     return { path: filePath, fileName: `${id}.zip`, contentType: 'application/zip' }
   }
 
@@ -277,40 +287,23 @@ export class DemoGameAdapter implements GameAdapter {
         sha256: createHash('sha256').update(file.data).digest('hex'),
       })),
     }
-    const backup: Backup = { id, saveName: save.name, createdAt: manifest.createdAt, bytes: files.reduce((total, file) => total + file.data.length, 0), members: [...save.members], reason }
     const backupRoot = path.join(this.#config.game.backupDirectory, id)
     await fs.mkdir(this.#config.game.backupDirectory, { recursive: true })
     await fs.mkdir(backupRoot)
     for (const file of files) await fs.writeFile(path.join(backupRoot, file.name), file.data, { flag: 'wx' })
     await fs.writeFile(path.join(backupRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { flag: 'wx' })
-    const existing = this.#backups.findIndex((item) => item.id === backup.id)
-    if (existing >= 0) this.#backups[existing] = backup
-    else this.#backups.push(backup)
-    await fs.mkdir(path.join(this.#config.dataDirectory, 'demo-downloads'), { recursive: true })
+    await fs.mkdir(this.#packageDirectory, { recursive: true })
     const filePath = path.join(this.#config.dataDirectory, 'demo-downloads', `${id}.zip`)
     await writeStoredZip(filePath, [
       { name: 'manifest.json', data: `${JSON.stringify(manifest, null, 2)}\n` },
       ...files.map((file) => ({ name: file.name, data: file.data }))
     ])
-    this.#downloads.set(`backup:${id}`, filePath)
     return { backupId: id, saveName: save.name, members: save.members }
   }
 
   async #importBackup(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     const result = await importUploadedBackup(this.#config, input, report, signal)
-    const backup: Backup = {
-      id: String(result.backupId),
-      saveName: String(result.saveName),
-      createdAt: String(result.createdAt),
-      bytes: Number(result.bytes),
-      members: Array.isArray(result.members) ? result.members.map(String) : [],
-      reason: String(result.reason),
-    }
-    const existing = this.#backups.findIndex((item) => item.id === backup.id)
-    if (existing >= 0) this.#backups[existing] = backup
-    else this.#backups.push(backup)
-    this.#downloads.set(`backup:${backup.id}`, path.join(this.#config.game.backupDirectory, backup.id, demoImportArchiveName))
-    this.#log('info', `Imported backup ${backup.id}.`)
+    this.#log('info', `Imported backup ${result.backupId}.`)
     return result
   }
 
@@ -357,6 +350,7 @@ export class DemoGameAdapter implements GameAdapter {
     } finally {
       if (preview.serverRunning) { report('正在重新启动演示服务器'); this.#state = 'running'; this.#startedAt = Date.now() }
     }
+    await this.#retention.prune(this.#settings.backupKeep, new Set(automaticBackups), report)
     this.#log('warning', `Restored backup ${manifest.id}.`)
     return { backupId: manifest.id, saveName: manifest.saveName, automaticBackups, startupSelectionApplied: true, restarted: preview.serverRunning }
   }
@@ -371,7 +365,7 @@ export class DemoGameAdapter implements GameAdapter {
     return { modId: mod.id, enabled: mod.enabled, restartRequired: this.#state === 'running' }
   }
 
-  #writeSettings(input: Record<string, unknown>, report: ReportStep, operation: 'write' | 'rollback' = 'write'): Record<string, unknown> {
+  async #writeSettings(input: Record<string, unknown>, report: ReportStep, operation: 'write' | 'rollback' = 'write'): Promise<Record<string, unknown>> {
     const settings = input.settings
     if (!settings || typeof settings !== 'object') invalidInput('settings is required.')
     const value = settings as Partial<GameSettings>
@@ -385,6 +379,7 @@ export class DemoGameAdapter implements GameAdapter {
     this.#settingsHistory.push({ id: randomUUID(), createdAt: now(), operation, settings: structuredClone(this.#settings) })
     this.#settingsHistory = this.#settingsHistory.slice(-100)
     this.#settings = structuredClone(value as GameSettings)
+    await this.#retention.prune(this.#settings.backupKeep, new Set(), report)
     return { settings: this.#settings }
   }
 

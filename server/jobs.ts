@@ -196,6 +196,7 @@ export class JobQueue extends EventEmitter {
   #activeAbort: AbortController | null = null
   #activePromise: Promise<void> | null = null
   #accepting = true
+  #acceptanceVersion = 0
   #shuttingDown = false
   readonly #maxOutstandingJobs: number
   readonly #jobTimeoutMs: number
@@ -241,12 +242,15 @@ export class JobQueue extends EventEmitter {
     return this.#accepting
   }
 
+  get acceptanceVersion(): number { return this.#acceptanceVersion }
+
   pauseAccepting(): void {
+    if (this.#accepting) this.#acceptanceVersion++
     this.#accepting = false
   }
 
   resumeAccepting(): void {
-    if (!this.#shuttingDown) this.#accepting = true
+    if (!this.#shuttingDown && !this.#accepting) { this.#acceptanceVersion++; this.#accepting = true }
   }
 
   async shutdown(): Promise<void> {
@@ -255,7 +259,7 @@ export class JobQueue extends EventEmitter {
       return
     }
     this.#shuttingDown = true
-    this.#accepting = false
+    this.pauseAccepting()
     const message = '服务关闭时中断'
     for (const id of this.#pending.splice(0)) {
       const job = this.store.interruptQueued(id, message)

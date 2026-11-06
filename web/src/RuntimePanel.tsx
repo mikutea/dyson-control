@@ -1,10 +1,12 @@
 import { useEffect, useState } from 'react'
 import { Activity, Archive, RotateCcw, Save, ShieldCheck } from 'lucide-react'
-import type { RuntimeSample, RuntimeSettings, RuntimeSettingsHistoryEntry, RuntimeStatus } from '../../shared/contracts'
+import type { RuntimeSettings, RuntimeSettingsHistoryEntry, RuntimeStatus } from '../../shared/contracts'
 import { api } from './api'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, Panel, StatusDot } from './components'
-import { formatBytes, formatFullDate, serverStateLabels } from './format'
+import { formatFullDate } from './format'
 import { useResource } from './hooks'
+import { EmptyWorldObservation } from './EmptyWorldObservation'
+import { RuntimeHistory } from './RuntimeHistory'
 
 export function RuntimeStatusPanel({ refreshToken }: { refreshToken: number }) {
   const runtime = useResource<RuntimeStatus>('/runtime', refreshToken)
@@ -21,26 +23,25 @@ export function RuntimeStatusPanel({ refreshToken }: { refreshToken: number }) {
         <div><span>最近采样</span><strong>{data.sampledAt ? formatFullDate(data.sampledAt) : '等待首次采样'}</strong></div>
         <div><span>下次自动备份</span><strong>{data.nextBackupAt ? Date.parse(data.nextBackupAt) <= Date.now() ? '已到期，等待游戏空闲就绪' : formatFullDate(data.nextBackupAt) : '未启用'}</strong></div>
         <div><span>最近成功备份</span><strong>{data.lastBackupAt ? formatFullDate(data.lastBackupAt) : '暂无记录'}</strong></div>
-        <div><span>崩溃恢复</span><strong>{data.recovery.blockedReason ? '已暂停，等待检查' : data.settings.autoRestart ? data.recovery.wantedRunning ? '已启用' : '等待手动启动游戏' : '未启用'}</strong></div>
+        <div><span>崩溃恢复</span><strong>{recoveryLabel(data)}</strong></div>
       </div>
       {data.recovery.blockedReason && <p className="runtime-notice" role="status">{data.recovery.blockedReason}</p>}
+      {data.recovery.waitingReason && <p className="runtime-notice" role="status">{data.recovery.waitingReason} 后台约每分钟复查，已使用 {data.recovery.attempts}/3 次启动尝试。</p>}
       {alerts.length ? <ul className="runtime-alerts" aria-label="运行告警">{alerts.map(alert => <li key={alert.code}><StatusDot state={alert.severity === 'error' ? 'bad' : 'warning'} /><div><strong>{alert.message}</strong><small>首次发现 {formatFullDate(alert.firstSeenAt)}</small></div></li>)}</ul> : <EmptyBlock title={data.sampledAt ? '当前没有运行告警' : '监控正在启动'} description="监控每 15 秒采样，关闭浏览器后仍会继续。" />}
       {runtime.error && <p className="runtime-notice" role="status">状态刷新失败；以上为上次成功读取的记录。</p>}
+      <EmptyWorldObservation data={data.emptyWorld} stale={Boolean(runtime.error)} />
       <details className="runtime-history" onToggle={event => setHistoryOpen(event.currentTarget.open)}><summary>查看运行历史</summary>{historyOpen && <RuntimeHistory refreshToken={refreshToken} />}</details>
     </>}
   </Panel>
 }
 
-function RuntimeHistory({ refreshToken }: { refreshToken: number }) {
-  const [hours, setHours] = useState(24)
-  const history = useResource<RuntimeSample[]>(`/runtime/history?hours=${hours}`, refreshToken)
-  return <>
-    <label className="runtime-period">时间范围<select value={hours} onChange={event => setHours(Number(event.target.value))}><option value={1}>最近一小时</option><option value={24}>最近一天</option><option value={168}>最近一周</option></select></label>
-    {history.loading && !history.data ? <LoadingBlock /> : history.error ? <ErrorBlock message={history.error} retry={history.reload} /> : !history.data?.length ? <EmptyBlock title="还没有历史采样" description="首次采样后会在这里显示真实运行指标。" /> : <div className="runtime-history-scroll"><table><caption>最近 20 个采样点；较长范围按时间分组，缺失值显示为 —。网络为主机活动物理网卡合计。</caption><thead><tr><th>时间</th><th>状态</th><th>UPS</th><th>TPS</th><th>CPU</th><th>内存</th><th>可用磁盘</th><th>网络接收</th><th>网络发送</th></tr></thead><tbody>{history.data.slice(-20).reverse().map(row => <tr key={row.sampledAt}><td>{formatFullDate(row.sampledAt)}</td><td>{serverStateLabels[row.state]}</td><td>{row.ups === null ? '—' : row.ups.toFixed(1)}</td><td>{row.tps === null ? '—' : row.tps.toFixed(1)}</td><td>{row.cpuPercent === null ? '—' : `${row.cpuPercent.toFixed(0)}%`}</td><td>{formatBytes(row.memoryBytes)}</td><td>{formatBytes(row.diskFreeBytes)}</td><td>{rate(row.networkReceiveBytesPerSecond)}</td><td>{rate(row.networkSendBytesPerSecond)}</td></tr>)}</tbody></table></div>}
-  </>
+function recoveryLabel(data: RuntimeStatus): string {
+  if (!data.settings.autoRestart) return '未启用'
+  if (data.recovery.blockedReason) return '已暂停，等待检查'
+  if (data.recovery.waitingReason) return '等待 Windows 启动条件'
+  return data.recovery.wantedRunning ? '已启用' : '等待手动启动游戏'
 }
 
-function rate(value: number | null) { return value == null ? '—' : `${formatBytes(value)}/s` }
 
 export function RuntimeSettingsPanel({ refreshToken }: { refreshToken: number }) {
   const runtime = useResource<RuntimeStatus>('/runtime', refreshToken)
@@ -82,7 +83,7 @@ export function RuntimeSettingsPanel({ refreshToken }: { refreshToken: number })
         <label className="field"><span>自动备份间隔（分钟）</span><input type="number" min={0} max={10_080} step={1} value={form.backupEveryMinutes} onChange={event => update('backupEveryMinutes', Number(event.target.value))} required /><small>0 表示关闭。游戏运行且就绪时，先保存再备份。</small></label>
         <label className="field"><span>磁盘空间提醒（GiB）</span><input type="number" min={0} max={10_240} step="any" value={form.minimumFreeDiskGiB} onChange={event => update('minimumFreeDiskGiB', Number(event.target.value))} required /><small>低于此值时显示告警。</small></label>
         <label className="field"><span>UPS 提醒阈值</span><input type="number" min={0} max={240} step="any" value={form.minimumUps} onChange={event => update('minimumUps', Number(event.target.value))} required /><small>实测 UPS 连续一分钟低于此值时提醒。</small></label>
-        <label className="runtime-checkbox"><input type="checkbox" checked={form.autoRestart} onChange={event => update('autoRestart', event.target.checked)} /><span>游戏崩溃后自动启动<small>手动停止后不会自动启动；30 分钟内最多尝试 3 次。变更失败后暂停，检查并手动启动成功后恢复。</small></span></label>
+        <label className="runtime-checkbox"><input type="checkbox" checked={form.autoRestart} onChange={event => update('autoRestart', event.target.checked)} /><span>游戏崩溃后自动启动<small>手动停服会取消恢复意图。Windows 会等待游戏用户打开桌面 Steam，30 分钟内最多尝试启动 3 次。</small></span></label>
       </div></fieldset>
       {dirty && runtime.data && <details className="runtime-preview"><summary>查看后台设置更改</summary><dl>{([
         ['backupEveryMinutes', '自动备份间隔'], ['minimumFreeDiskGiB', '磁盘空间提醒'], ['minimumUps', 'UPS 提醒阈值'], ['autoRestart', '崩溃恢复'],

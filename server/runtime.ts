@@ -1,10 +1,12 @@
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
+import type { RecoveryStartReadiness, RuntimeHistoryWindow } from '../shared/contracts.js'
 import { z } from 'zod'
-import type { GameAdapter, Job, RuntimeAlert, RuntimeSample, RuntimeSettings, RuntimeSettingsHistoryEntry, RuntimeStatus } from '../shared/contracts.js'
+import type { EmptyWorldInterval, GameAdapter, Job, RuntimeAlert, RuntimeSample, RuntimeSettings, RuntimeSettingsHistoryEntry, RuntimeStatus } from '../shared/contracts.js'
 import type { JobQueue, JobStore } from './jobs.js'
 import { ApiError } from './errors.js'
+import { EmptyWorldTracker } from './empty-world.js'
 
 export const runtimeSettingsSchema = z.object({
   backupEveryMinutes: z.number().int().min(0).max(10_080),
@@ -15,9 +17,18 @@ export const runtimeSettingsSchema = z.object({
 
 const defaults: RuntimeSettings = { backupEveryMinutes: 60, autoRestart: false, minimumFreeDiskGiB: 5, minimumUps: 30 }
 const minute = 60_000
+const recoveryWaitReasons: Record<Exclude<RecoveryStartReadiness, 'ready'>, string> = {
+  'game-present': '检查时发现受管游戏进程，正在等待下一次运行采样。',
+  'task-unavailable': '受管启动任务未就绪，请检查任务是否启用、运行身份及启动配置。',
+  'steam-missing': '等待游戏用户登录 Windows，并在交互会话中打开桌面 Steam。',
+  'steam-other-user': '检测到其他 Windows 用户的 Steam，请在运行游戏的用户会话中打开桌面 Steam。',
+  'session-ambiguous': '游戏用户在多个 Windows 会话中运行 Steam，暂时无法确定启动任务会使用哪个会话。',
+  unknown: '未能确认 Windows 任务或桌面 Steam 会话，请检查面板服务的读取权限。',
+}
 interface State {
   nextBackupAt: number | null; lastBackupAt: number | null; wantedRunning: boolean
   blockedReason: string | null; recoveryAttempts: number[]; nextRecoveryAt: number | null
+  lastEmptyWorld?: EmptyWorldInterval | null
 }
 interface AlertRow { code: string; severity: RuntimeAlert['severity']; message: string; active: number; first_at: number; last_at: number; resolved_at: number | null }
 const asDate = (value: number | null): string | null => value === null ? null : new Date(value).toISOString()
@@ -29,6 +40,8 @@ export class RuntimeMonitor {
   readonly #intervalMs: number
   readonly #startedAt: number
   readonly #recoveryGraceMs: number
+  readonly #emptyWorld: EmptyWorldTracker
+  #emptyWorldAcceptanceVersion: number
   #settings: RuntimeSettings
   #state: State
   #lastSample: RuntimeSample | null = null
@@ -39,6 +52,7 @@ export class RuntimeMonitor {
   #storageFailed = false
   #jobGeneration = 0
   #stoppedSince: number | null = null
+  #recoveryWait: { reason: string; recheckAt: number } | null = null
   #healthySince: number | null = null
   #lowUpsSince: number | null = null
   #stalledSince: number | null = null
@@ -71,6 +85,10 @@ export class RuntimeMonitor {
     }
     const latest = this.#db.prepare('SELECT sample FROM runtime_samples ORDER BY at DESC LIMIT 1').get() as { sample: string } | undefined
     if (latest) this.#lastSample = JSON.parse(latest.sample) as RuntimeSample
+    // Never continue an interval across controller downtime. Old sample records have no signed clock.
+    const previous = this.#lastSample && 'worldClock' in this.#lastSample ? this.#state.lastEmptyWorld ?? null : null
+    this.#emptyWorld = new EmptyWorldTracker(adapter.source, this.#intervalMs, previous)
+    this.#emptyWorldAcceptanceVersion = queue.acceptanceVersion
     this.#persist()
     queue.on('job', this.#onJob)
     for (const job of options.recoveredJobs ?? []) this.#onJob(job)
@@ -124,6 +142,7 @@ export class RuntimeMonitor {
     } catch (error) { this.#db.exec('ROLLBACK'); throw error }
     this.#settings = next
     this.#state = state
+    this.#recoveryWait = null
     return this.status()
   }
 
@@ -147,18 +166,46 @@ export class RuntimeMonitor {
         ...alerts.map(row => ({ code: row.code, severity: row.severity, message: row.message, active: row.active === 1, firstSeenAt: asDate(row.first_at)!, lastSeenAt: asDate(row.last_at)!, resolvedAt: asDate(row.resolved_at) })),
       ],
       nextBackupAt: asDate(this.#state.nextBackupAt), lastBackupAt: asDate(this.#state.lastBackupAt),
-      recovery: { wantedRunning: this.#state.wantedRunning, blockedReason: this.#state.blockedReason, attempts: this.#state.recoveryAttempts.length, nextAttemptAt: asDate(this.#state.nextRecoveryAt) },
+      emptyWorld: this.#emptyWorld.snapshot(this.#clock(), !this.queue.accepting || this.queue.acceptanceVersion !== this.#emptyWorldAcceptanceVersion),
+      recovery: { wantedRunning: this.#state.wantedRunning, blockedReason: this.#state.blockedReason, waitingReason: this.#recoveryWait?.reason ?? null, attempts: this.#state.recoveryAttempts.length, nextAttemptAt: asDate(this.#state.nextRecoveryAt) },
     }
   }
 
   history(hours = 24): RuntimeSample[] {
-    const since = this.#clock() - Math.max(1, Math.min(hours, 168)) * 60 * minute
-    const bucket = Math.max(this.#intervalMs, Math.ceil((this.#clock() - since) / 719))
-    const rows = this.#db.prepare('SELECT sample, MAX(at) AS at FROM runtime_samples WHERE at >= ? GROUP BY CAST(at / ? AS INTEGER) ORDER BY at ASC LIMIT 720').all(since, bucket) as Array<{ sample: string }>
-    return rows.map(row => {
+    return this.historyWindow(hours).samples
+  }
+
+  historyWindow(hours = 24): RuntimeHistoryWindow {
+    const until = this.#clock()
+    const since = until - Math.max(1, Math.min(hours, 168)) * 60 * minute
+    const bucketMs = Math.max(this.#intervalMs, Math.ceil((until - since) / 719))
+    // SQLite returns the sample belonging to MAX(at); at is unique.
+    const rows = this.#db.prepare(`
+      SELECT sample, MAX(at) AS last_at FROM runtime_samples
+      WHERE at BETWEEN ? AND ? GROUP BY CAST((at - ?) / ? AS INTEGER) ORDER BY last_at
+    `).all(since, until, since, bucketMs) as Array<{ sample: string }>
+    const samples = rows.map(row => {
       const sample = JSON.parse(row.sample) as RuntimeSample
       return { ...sample, networkReceiveBytesPerSecond: sample.networkReceiveBytesPerSecond ?? null, networkSendBytesPerSecond: sample.networkSendBytesPerSecond ?? null }
     })
+    return { from: new Date(since).toISOString(), to: new Date(until).toISOString(), bucketMs, samples }
+  }
+
+  *historyCsv(hours: number): Generator<string> {
+    const until = this.#clock()
+    let cursor = until - hours * 60 * minute - 1
+    const page = this.#db.prepare('SELECT at, sample FROM runtime_samples WHERE at > ? AND at <= ? ORDER BY at LIMIT 512')
+    yield 'sampled_at_utc,state,pid,player_count,ups,tps,cpu_percent,memory_bytes,disk_free_bytes,network_receive_bytes_per_second,network_send_bytes_per_second,game_tick\r\n'
+    while (true) {
+      const rows = page.all(cursor, until) as Array<{ at: number; sample: string }>
+      if (!rows.length) return
+      yield rows.map(row => {
+        const s = JSON.parse(row.sample) as RuntimeSample
+        return [new Date(row.at).toISOString(), s.state, s.pid, s.playerCount, s.ups, s.tps, s.cpuPercent,
+          s.memoryBytes, s.diskFreeBytes, s.networkReceiveBytesPerSecond, s.networkSendBytesPerSecond, s.worldClock?.gameTick].join(',') + '\r\n'
+      }).join('')
+      cursor = rows[rows.length - 1].at
+    }
   }
 
   sample(): Promise<void> {
@@ -171,6 +218,8 @@ export class RuntimeMonitor {
   async #sample(): Promise<void> {
     const now = this.#clock()
     const generation = this.#jobGeneration
+    const settings = this.#settings
+    const acceptanceVersion = this.queue.acceptanceVersion
     try {
       const overview = await this.adapter.overview()
       if (this.#closed || this.#stopping) return
@@ -179,9 +228,14 @@ export class RuntimeMonitor {
         cpuPercent: overview.metrics.cpuPercent, memoryBytes: overview.metrics.memoryBytes,
         diskFreeBytes: overview.metrics.diskFreeBytes, ups: overview.metrics.ups, tps: overview.metrics.tps,
         networkReceiveBytesPerSecond: overview.metrics.networkReceiveBytesPerSecond, networkSendBytesPerSecond: overview.metrics.networkSendBytesPerSecond,
+        worldClock: overview.source === 'windows' && overview.capabilities.save ? overview.worldClock ?? null : null,
       }
       this.#lastSample = sample
       this.#db.prepare('INSERT OR REPLACE INTO runtime_samples (at, sample) VALUES (?, ?)').run(now, JSON.stringify(sample))
+      const idleObservation = this.queue.isIdle && this.queue.accepting && this.queue.acceptanceVersion === this.#emptyWorldAcceptanceVersion &&
+        generation === this.#jobGeneration && !this.#storageFailed
+      this.#emptyWorldAcceptanceVersion = this.queue.acceptanceVersion
+      this.#emptyWorld.sample(sample, overview.playerStatus, idleObservation, this.#clock())
       this.#db.prepare('DELETE FROM runtime_samples WHERE at < ?').run(now - 7 * 24 * 60 * minute)
       this.#alert('monitor-unavailable', false, 'error', '暂时无法读取服务器运行状态。', now)
       this.#alert('disk-low', sample.diskFreeBytes !== null && sample.diskFreeBytes < this.#settings.minimumFreeDiskGiB * 1024 ** 3, 'error', `存档磁盘可用空间低于 ${this.#settings.minimumFreeDiskGiB} GiB。`, now)
@@ -201,8 +255,9 @@ export class RuntimeMonitor {
         '游戏世界已连续一分钟没有推进（TPS 为 0）。请检查暂停状态、联机模组和游戏日志。', now)
 
       if (!this.queue.isIdle || !this.queue.accepting || generation !== this.#jobGeneration || this.#storageFailed) {
-        this.#stoppedSince = null; this.#persist(); this.#storageFailed = false; return
+        this.#recoveryWait = null; this.#stoppedSince = null; this.#persist(); this.#storageFailed = false; return
       }
+      if (sample.state !== 'stopped' || !this.#state.wantedRunning) this.#recoveryWait = null
       if (sample.state === 'running' && overview.capabilities.save) {
         this.#stoppedSince = null
         this.#healthySince ??= now
@@ -219,26 +274,42 @@ export class RuntimeMonitor {
           this.#stoppedSince ??= now
           if (now - this.#stoppedSince >= 30_000) {
             this.#alert('game-crashed', true, 'error', '受管游戏意外停止。', now)
-            this.#recover(now)
+            await this.#recover(now, generation, settings, acceptanceVersion)
           }
         } else this.#stoppedSince = null
       }
       this.#persist()
     } catch (error) {
       this.#stalledSince = null; this.#stalledPid = null
+      this.#emptyWorld.interrupt('monitor-unavailable', this.#clock())
+      this.#stoppedSince = null; this.#recoveryWait = null
       if (!this.#closed) this.#alert('monitor-unavailable', true, 'error', '暂时无法读取服务器运行状态。', now)
       // A failed sample never becomes a stopped game, an empty player list or a restart request.
       throw error
     }
   }
 
-  #recover(now: number): void {
+  async #recover(now: number, generation: number, settings: RuntimeSettings, acceptanceVersion: number): Promise<void> {
     if (!this.#settings.autoRestart || this.#state.blockedReason || now - this.#startedAt < this.#recoveryGraceMs || (this.#state.nextRecoveryAt !== null && now < this.#state.nextRecoveryAt)) return
+    const current = () => !this.#stopping && !this.#storageFailed && this.#settings === settings && this.#state.wantedRunning &&
+      generation === this.#jobGeneration && acceptanceVersion === this.queue.acceptanceVersion && this.queue.isIdle && this.queue.accepting
+    if (!current()) return
     this.#state.recoveryAttempts = this.#state.recoveryAttempts.filter(at => now - at < 30 * minute)
     if (this.#state.recoveryAttempts.length >= 3) {
       this.#state.blockedReason = '30 分钟内已尝试恢复 3 次，请检查游戏日志后手动启动。'
       this.#alert('recovery-blocked', true, 'error', this.#state.blockedReason, now)
       return
+    }
+    if (this.adapter.source === 'windows') {
+      if (this.#recoveryWait && now < this.#recoveryWait.recheckAt) return
+      const readiness = await this.adapter.recoveryStartReadiness().catch((): RecoveryStartReadiness => 'unknown')
+      if (!current()) { this.#recoveryWait = null; this.#stoppedSince = null; return }
+      now = this.#clock()
+      if (readiness !== 'ready') {
+        this.#recoveryWait = { reason: recoveryWaitReasons[readiness], recheckAt: now + minute }
+        return
+      }
+      this.#recoveryWait = null
     }
     // Reserve the attempt durably before starting the process, including across a controller crash.
     this.#state.recoveryAttempts.push(now)
@@ -255,6 +326,8 @@ export class RuntimeMonitor {
   #recordJob(job: Job): void {
     if (this.#closed) return
     this.#jobGeneration++
+    this.#recoveryWait = null
+    this.#emptyWorld.interrupt('operation', this.#clock())
     this.#stalledSince = null; this.#stalledPid = null
     const automatic = this.jobs.input(job.id).automatic === true
     const now = this.#clock()
@@ -305,5 +378,11 @@ export class RuntimeMonitor {
     return row ? JSON.parse(row.value) : null
   }
   #put(key: string, value: unknown): void { this.#db.prepare('INSERT OR REPLACE INTO runtime_state (key, value) VALUES (?, ?)').run(key, JSON.stringify(value)) }
-  #persist(): void { this.#put('state', this.#state) }
+  #persist(): void {
+    if (this.adapter.source === 'windows') {
+      const observation = this.#emptyWorld.snapshot(this.#clock())
+      this.#state.lastEmptyWorld = observation.current ?? observation.previous
+    }
+    this.#put('state', this.#state)
+  }
 }

@@ -1,9 +1,11 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { afterEach, describe, expect, it } from 'vitest'
 import type { Action, GameAdapter, Job, Overview } from '../shared/contracts.js'
 import { JobQueue, JobStore } from './jobs.js'
+import type { RecoveryStartReadiness } from '../shared/contracts.js'
 import { RuntimeMonitor } from './runtime.js'
 
 const cleanups: Array<() => Promise<void>> = []
@@ -14,6 +16,8 @@ async function fixture() {
   let time = Date.UTC(2026, 9, 17, 12)
   let sampleFails = false
   let failAction: Action | null = null
+  let readinessChecks = 0
+  let readinessProbe: () => Promise<RecoveryStartReadiness> = async () => 'ready'
   const calls: Array<{ action: Action; input: Record<string, unknown> }> = []
   const current: Overview = {
     name: 'Fixture', source: 'windows', state: 'running', sampledAt: new Date(time).toISOString(), address: 'fixture.invalid',
@@ -24,6 +28,7 @@ async function fixture() {
   }
   const adapter = {
     source: 'windows',
+    async recoveryStartReadiness() { readinessChecks++; return readinessProbe() },
     overview: async () => { if (sampleFails) throw new Error('Fixture sample unavailable'); return structuredClone(current) },
     run: async (action: Action, input: Record<string, unknown>) => {
       calls.push({ action, input })
@@ -36,8 +41,8 @@ async function fixture() {
   const jobs = new JobStore(path.join(root, 'jobs.sqlite'))
   const queue = new JobQueue(jobs, adapter)
   const monitors: RuntimeMonitor[] = []
-  const open = (recoveredJobs: Job[] = []) => {
-    const value = new RuntimeMonitor(path.join(root, 'runtime.sqlite'), adapter, queue, jobs, { clock: () => time, recoveryGraceMs: 0, recoveredJobs })
+  const open = (recoveredJobs: Job[] = [], recoveryGraceMs = 0) => {
+    const value = new RuntimeMonitor(path.join(root, 'runtime.sqlite'), adapter, queue, jobs, { clock: () => time, recoveryGraceMs, recoveredJobs })
     monitors.push(value); return value
   }
   const monitor = open()
@@ -52,12 +57,80 @@ async function fixture() {
     jobs.close()
     await fs.rm(root, { recursive: true, force: true })
   })
-  return { monitor, queue, jobs, current, calls, open, idle,
+  return { monitor, queue, jobs, current, calls, open, idle, runtimeFile: path.join(root, 'runtime.sqlite'),
     advance: (ms: number) => { time += ms },
     setSampleFails: (value: boolean) => { sampleFails = value },
     setFailAction: (value: Action | null) => { failAction = value },
+    checks: () => readinessChecks,
+    probe: (probe: () => Promise<RecoveryStartReadiness>) => { readinessProbe = probe },
   }
 }
+
+describe('persisted empty-world observation', () => {
+  it('treats old runtime rows without signed clocks as pending even when UPS and TPS were nonzero', async () => {
+    const f = await fixture()
+    const at = Date.parse(f.current.sampledAt)
+    f.current.worldClock = { sessionId: 'fc111111-1111-4111-8111-111111111111', rosterSessionId: 'fc222222-2222-4222-8222-222222222222',
+      writtenAt: at, rosterWrittenAt: at, rosterSequence: 1, gameTick: 951 }
+    await f.monitor.sample()
+    expect(f.monitor.status().emptyWorld.current?.firstTick).toBe(951)
+    await f.monitor.close()
+    const db = new DatabaseSync(f.runtimeFile)
+    try { db.exec("UPDATE runtime_samples SET sample = json_remove(sample, '$.worldClock')") } finally { db.close() }
+    const reopened = f.open()
+    expect(reopened.history(1)[0].worldClock).toBeUndefined()
+    expect(reopened.status().emptyWorld).toEqual({ source: 'windows', reason: 'waiting', current: null, previous: null })
+  })
+
+  it('does not bridge over a maintenance window that opened and closed between samples', async () => {
+    const f = await fixture()
+    const at = Date.parse(f.current.sampledAt)
+    f.current.worldClock = { sessionId: 'fc111111-1111-4111-8111-111111111111', rosterSessionId: 'fc222222-2222-4222-8222-222222222222',
+      writtenAt: at, rosterWrittenAt: at, rosterSequence: 1, gameTick: 951 }
+    await f.monitor.sample()
+    f.queue.pauseAccepting()
+    expect(f.monitor.status().emptyWorld).toMatchObject({ reason: 'operation', current: null, previous: { firstTick: 951 } })
+    f.queue.resumeAccepting()
+    f.advance(15_000)
+    Object.assign(f.current.worldClock, { writtenAt: at + 15_000, rosterWrittenAt: at + 15_000, rosterSequence: 2, gameTick: 955 })
+    await f.monitor.sample()
+    expect(f.monitor.status().emptyWorld).toMatchObject({ current: null, previous: { samples: 1 } })
+    f.advance(15_000)
+    Object.assign(f.current.worldClock, { writtenAt: at + 30_000, rosterWrittenAt: at + 30_000, rosterSequence: 3, gameTick: 972 })
+    await f.monitor.sample()
+    expect(f.monitor.status().emptyWorld.current).toMatchObject({ samples: 1, firstTick: 972, tickDelta: 0 })
+  })
+
+  it('uses signed tick deltas, ends at intervening jobs and failures, and retains only ended evidence after a restart', async () => {
+    const f = await fixture()
+    const baseline = Date.parse(f.current.sampledAt)
+    const setClock = (elapsed: number, tick: number) => {
+      f.current.worldClock = { sessionId: 'fc111111-1111-4111-8111-111111111111', rosterSessionId: 'fc222222-2222-4222-8222-222222222222',
+        writtenAt: baseline + elapsed, rosterWrittenAt: baseline + elapsed, rosterSequence: elapsed + 1, gameTick: tick }
+    }
+    expect(f.monitor.status().emptyWorld).toMatchObject({ source: 'windows', current: null, previous: null })
+    setClock(0, 900)
+    await f.monitor.sample()
+    f.advance(15_000)
+    setClock(15_000, 914)
+    await f.monitor.sample()
+    expect(f.monitor.status().emptyWorld.current).toMatchObject({ samples: 2, tickDelta: 14, durationMs: 15_000 })
+    expect(f.monitor.history(1).at(-1)?.worldClock).toMatchObject({ writtenAt: baseline + 15_000, gameTick: 914 })
+    f.queue.enqueue({ requestId: 'between-ticks', action: 'backup', input: {} })
+    await f.idle()
+    expect(f.monitor.status().emptyWorld).toMatchObject({ reason: 'operation', current: null, previous: { tickDelta: 14 } })
+    f.advance(15_000)
+    setClock(30_000, 930)
+    await f.monitor.sample()
+    expect(f.monitor.status().emptyWorld.current).toMatchObject({ samples: 1, tickDelta: 0 })
+    f.setSampleFails(true)
+    await expect(f.monitor.sample()).rejects.toThrow()
+    expect(f.monitor.status().emptyWorld).toMatchObject({ reason: 'monitor-unavailable', current: null, previous: { lastTick: 930 } })
+    await f.monitor.close()
+    const reopened = f.open()
+    expect(reopened.status().emptyWorld).toMatchObject({ reason: 'waiting', current: null, previous: { firstTick: 930, lastTick: 930 } })
+  })
+})
 
 describe('background runtime monitoring', () => {
   it('does not pause game recovery after a read-only backup verification failure', async () => {
@@ -256,6 +329,76 @@ describe('background runtime monitoring', () => {
     expect(f.monitor.status().recovery.blockedReason).toMatch(/3 次/)
     await f.monitor.close()
     expect(f.open().status().recovery.blockedReason).toMatch(/3 次/)
+  })
+
+  it('waits through a controller reboot and absent or wrong-user Steam without creating a start job', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), backupEveryMinutes: 0, autoRestart: true })
+    await f.monitor.close()
+    f.current.state = 'stopped'; f.current.pid = null
+    let readiness: RecoveryStartReadiness = 'steam-missing'
+    f.probe(async () => readiness)
+    const restarted = f.open([], 60_000)
+    await restarted.sample()
+    f.advance(31_000); await restarted.sample()
+    expect(f.checks()).toBe(0)
+    f.advance(30_000); await restarted.sample()
+    expect(restarted.status().recovery).toMatchObject({ waitingReason: expect.stringContaining('打开桌面 Steam'), blockedReason: null, attempts: 0, nextAttemptAt: null })
+    for (let tick = 0; tick < 3; tick++) { f.advance(15_000); await restarted.sample(); restarted.status() }
+    expect(f.checks()).toBe(1)
+    readiness = 'steam-other-user'
+    f.advance(15_000); await restarted.sample()
+    expect(restarted.status().recovery.waitingReason).toContain('其他 Windows 用户')
+    expect(f.calls).toEqual([])
+    readiness = 'ready'
+    f.advance(60_000); await restarted.sample(); await f.idle()
+    expect(f.calls).toEqual([{ action: 'start', input: { automatic: true } }])
+    expect(restarted.status().recovery).toMatchObject({ waitingReason: null, attempts: 1 })
+    await restarted.sample(); f.advance(120_000); await restarted.sample()
+    expect(f.checks()).toBe(3)
+  })
+
+  it('reports an unreadable Windows probe and preserves the budget when its result remains unknown', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), autoRestart: true })
+    f.current.state = 'stopped'; f.current.pid = null
+    f.probe(async () => { throw new Error('private Windows diagnostics') })
+    await f.monitor.sample()
+    for (const delay of [31_000, 60_000, 60_000, 60_000]) { f.advance(delay); await f.monitor.sample() }
+    expect(f.monitor.status().recovery).toMatchObject({ waitingReason: expect.stringContaining('读取权限'), blockedReason: null, attempts: 0 })
+    expect(f.calls).toEqual([])
+  })
+
+  it.each(['manual-stop', 'settings', 'maintenance-cycle', 'other-job', 'shutdown'] as const)('discards a readiness result after %s during the probe', async change => {
+    const f = await fixture()
+    await f.monitor.sample()
+    f.monitor.updateSettings({ ...f.monitor.settings(), autoRestart: true })
+    f.current.state = 'stopped'; f.current.pid = null
+    let notify!: () => void, release!: () => void
+    const entered = new Promise<void>(resolve => { notify = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    f.probe(async () => { notify(); await gate; return 'ready' })
+    await f.monitor.sample(); f.advance(31_000)
+    const checking = f.monitor.sample()
+    try {
+      await entered
+      if (change === 'manual-stop' || change === 'other-job') {
+        f.queue.enqueue({ requestId: change, action: change === 'manual-stop' ? 'stop' : 'verify-backup', input: {} })
+        await f.idle()
+      }
+      if (change === 'settings') f.monitor.updateSettings({ ...f.monitor.settings(), minimumUps: 37 })
+      if (change === 'maintenance-cycle') { f.queue.pauseAccepting(); f.queue.resumeAccepting() }
+      if (change === 'shutdown') f.monitor.stop()
+    } finally { release(); await checking }
+    expect(f.calls.some(call => call.action === 'start')).toBe(false)
+    expect(f.monitor.status().recovery).toMatchObject({ waitingReason: null, attempts: 0 })
+    if (change === 'manual-stop') {
+      f.advance(120_000); await f.monitor.sample()
+      expect(f.checks()).toBe(1)
+      expect(f.monitor.status().recovery.wantedRunning).toBe(false)
+    }
   })
 
   it.each([

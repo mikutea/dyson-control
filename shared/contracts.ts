@@ -1,7 +1,13 @@
 export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
-export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world' | 'prepare-existing-server' | 'adopt-existing-server'
+export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'set-backup-retained' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world' | 'prepare-existing-server' | 'adopt-existing-server'
 export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
+
+/** Independently signed clock and player roster from the same Bridge process. */
+export interface WorldClockReading {
+  gameTick: number; sessionId: string; writtenAt: number
+  rosterSessionId: string; rosterWrittenAt: number; rosterSequence: number
+}
 
 export interface Overview {
   name: string; source: 'demo' | 'windows'; state: ServerState; sampledAt: string
@@ -10,6 +16,7 @@ export interface Overview {
   versions: { game: string; nebula: string; bepinex: string }
   metrics: { cpuPercent: number | null; memoryBytes: number | null; totalMemoryBytes: number | null; diskFreeBytes: number | null; ups: number | null; tps: number | null; networkReceiveBytesPerSecond: number | null; networkSendBytesPerSecond: number | null }
   currentSave: string | null; lastSavedAt: string | null
+  worldClock?: WorldClockReading | null
   capabilities: { lifecycle: boolean; save: boolean; restore: boolean; playerActions: boolean }
 }
 export interface Player { id: string; name: string; connectedAt: string; planet: string | null; pingMs: number | null }
@@ -89,7 +96,7 @@ export interface ControlUpdateOperation {
 export interface ControlUpdatePrepareResult { statusCode: 202; operation: ControlUpdateOperation; receiptToken: string | null }
 export interface ControlUpdateApplyResult { statusCode: 202; operation: ControlUpdateOperation }
 export interface Save { id: string; name: string; bytes: number; modifiedAt: string; members: string[]; current: boolean }
-export interface Backup { id: string; saveName: string; createdAt: string; bytes: number; members: string[]; reason: string }
+export interface Backup { id: string; saveName: string; createdAt: string; bytes: number; members: string[]; reason: string; retained?: boolean | null }
 export interface BackupRestorePreview {
   backupId: string; saveName: string; previewKey: string
   members: Array<{ fileName: string; action: 'create' | 'replace' | 'remove' | 'untouched' }>
@@ -117,12 +124,29 @@ export interface RuntimeSample {
   sampledAt: string; state: ServerState; pid: number | null; playerCount: number | null
   cpuPercent: number | null; memoryBytes: number | null; diskFreeBytes: number | null; ups: number | null; tps: number | null
   networkReceiveBytesPerSecond: number | null; networkSendBytesPerSecond: number | null
+  worldClock?: WorldClockReading | null
+}
+export interface EmptyWorldInterval {
+  startedAt: string; lastObservedAt: string; durationMs: number; samples: number
+  firstTick: number; lastTick: number; tickDelta: number; lastAdvanceAt: string | null
+  status: 'sampling' | 'advancing' | 'stalled'
+}
+export interface RuntimeHistoryWindow {
+  from: string; to: string; bucketMs: number; samples: RuntimeSample[]
+}
+export interface EmptyWorldObservation {
+  source: 'windows' | 'demo'
+  reason: 'observing' | 'waiting' | 'players-online' | 'roster-unavailable' | 'clock-unavailable' | 'server-not-running'
+    | 'operation' | 'gap' | 'monitor-unavailable' | 'demo'
+  current: EmptyWorldInterval | null; previous: EmptyWorldInterval | null
 }
 export interface RuntimeStatus {
   settings: RuntimeSettings; sampledAt: string | null; alerts: RuntimeAlert[]
   nextBackupAt: string | null; lastBackupAt: string | null
-  recovery: { wantedRunning: boolean; blockedReason: string | null; attempts: number; nextAttemptAt: string | null }
+  emptyWorld: EmptyWorldObservation
+  recovery: { wantedRunning: boolean; blockedReason: string | null; waitingReason: string | null; attempts: number; nextAttemptAt: string | null }
 }
+export type RecoveryStartReadiness = 'ready' | 'game-present' | 'task-unavailable' | 'steam-missing' | 'steam-other-user' | 'session-ambiguous' | 'unknown'
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
 export interface GameDownload { path: string; fileName: string; contentType: string; verifiedBytes?: Uint8Array }
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
@@ -167,6 +191,7 @@ export interface ServerSetupStatus {
 export interface GameAdapter {
   source: 'demo' | 'windows'
   overview(): Promise<Overview>
+  recoveryStartReadiness(): Promise<RecoveryStartReadiness>
   players(): Promise<Player[]>
   playerEvents(): Promise<PlayerEventBatch>
   logs(): Promise<LogEntry[]>
@@ -211,5 +236,5 @@ export interface ControlConfig {
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.
 // GET /api/backups/:id/restore-preview returns BackupRestorePreview without verifying member hashes or running a job.
-// Input: load-save {saveId}; verify-backup {backupId}; restore {backupId,previewKey?}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
+// Input: load-save {saveId}; verify-backup {backupId}; set-backup-retained {backupId,retained}; restore {backupId,previewKey?}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
 // backup {saveId?}; install-update {component,version?}; create-client-package {}.

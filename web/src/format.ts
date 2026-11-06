@@ -13,6 +13,7 @@ export const actionLabels: Record<Action, string> = {
   'load-save': '加载存档',
   backup: '创建备份',
   'verify-backup': '校验备份',
+  'set-backup-retained': '更改备份保留状态',
   restore: '恢复备份',
   'import-backup': '导入备份',
   'install-update': '安装更新',
@@ -120,6 +121,7 @@ export function formatJobResult(job: Job): string | null {
     case 'kick-player': return '玩家已离线，游戏已完成连接清理'
     case 'save': return text('saveName') ? `存档 ${text('saveName')} 已保存` : '游戏已保存'
     case 'backup': return text('saveName') ? `${text('saveName')} 已完整备份` : '备份已创建'
+    case 'set-backup-retained': return job.result.retained === true ? '备份已保留，自动轮换会跳过此副本' : '已取消保留，此备份以后可能随轮换清理'
     case 'verify-backup': return text('saveName') ? `${text('saveName')} 备份完整性校验通过` : '备份完整性校验通过'
     case 'restore': return text('saveName') ? `${text('saveName')} 已恢复` : '备份已恢复'
     case 'import-backup': return text('saveName') ? `${text('saveName')} 已导入，可在存档页面恢复` : '备份已导入，可在存档页面恢复'

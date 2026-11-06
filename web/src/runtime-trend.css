@@ -1,0 +1,20 @@
+.runtime-history-controls, .runtime-pager { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 16px; margin: 16px 0; }
+.runtime-history-controls .runtime-period { margin: 0; gap: 7px; }
+.runtime-history-controls .button { text-decoration: none; }
+.runtime-trend { margin: 18px 0; color: #9aafbf; }
+.runtime-trend figcaption, .runtime-axis { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.runtime-trend figcaption { font-size: 12px; flex-wrap: wrap; }
+.runtime-trend figcaption strong { color: #d5e8f6; }
+.runtime-plot { display: grid; grid-template-columns: 4.75em minmax(0, 1fr); align-items: stretch; margin-top: 12px; font-size: 11px; }
+.runtime-scale { display: flex; flex-direction: column; justify-content: space-between; font-variant-numeric: tabular-nums; }
+.runtime-plot svg { width: 100%; height: 125px; overflow: visible; }
+.runtime-grid { stroke: #33434f; stroke-width: 1; }
+.runtime-trace { fill: none; stroke: #84d7c0; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.runtime-point { fill: #84d7c0; }
+.runtime-axis { margin: 6px 0 0 4.75em; font-size: 11px; font-variant-numeric: tabular-nums; }
+.runtime-pager { justify-content: flex-end; font-size: 12px; color: #9aafbf; }
+@media (max-width: 600px) {
+  .runtime-history-controls { gap: 8px 12px; }
+  .runtime-history-controls select { min-height: 40px; }
+  .runtime-pager { justify-content: space-between; }
+}

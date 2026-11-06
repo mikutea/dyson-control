@@ -121,6 +121,10 @@ jobs:
         shell: powershell
         run: .\scripts\tests\existing-server.fixture.ps1
 
+      - name: Exercise desktop Steam crash recovery readiness
+        shell: powershell
+        run: .\scripts\tests\recovery-readiness.fixture.ps1
+
       - name: Exercise first-install task collision handling
         shell: powershell
         run: .\scripts\tests\first-install-task.fixture.ps1

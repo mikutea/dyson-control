@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import type { RecoveryStartReadiness } from '../../shared/contracts.js'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -7,9 +8,10 @@ import type {
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { BackupRetention } from './backup-retention.js'
 import { hashBackupMember as sha256, readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import {
-  assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeTelemetry,
+  assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeRoster, readBridgeTelemetry,
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
 } from './bridge.js'
 import { GameAdapterError, invalidInput, unsupported } from './errors.js'
@@ -121,6 +123,7 @@ export class WindowsGameAdapter implements GameAdapter {
   readonly #startupSettingsPath: string
   readonly #packageDirectory: string
   readonly #downloadDirectory: string
+  readonly #retention: BackupRetention
   readonly #inspectOverride: WindowsAdapterOptions['inspect']
   readonly #updates: Pick<GameUpdateManager,
     'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
@@ -168,6 +171,7 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#startupSettingsPath = path.join(config.dataDirectory, 'game-startup', 'settings.json')
     this.#packageDirectory = path.join(config.dataDirectory, 'client-packages')
     this.#downloadDirectory = path.join(config.dataDirectory, 'downloads')
+    this.#retention = new BackupRetention(config.game.backupDirectory, config.dataDirectory, this.#downloadDirectory)
     this.#modConfig = new ModConfigManager({
       gameRoot: config.game.root,
       historyDirectory: path.join(config.dataDirectory, 'mod-config-history')
@@ -245,43 +249,32 @@ export class WindowsGameAdapter implements GameAdapter {
     }
   }
 
-  async #enforceAutomaticBackupRetention(report?: ReportStep, pinned = new Set<string>()): Promise<number> {
-    const entries = await fs.readdir(this.#config.game.backupDirectory, { withFileTypes: true })
-    const automatic: BackupManifest[] = []
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(entry.name)) continue
-      const manifest = await this.#readBackupManifest(entry.name).catch(() => null)
-      if (manifest?.reason.startsWith('automatic-')) automatic.push(manifest)
-    }
-    automatic.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
-    const retained = new Set(automatic.slice(0, this.#settings.backupKeep).map(manifest => manifest.id))
-    for (const id of pinned) retained.add(id)
-    const expired = automatic.filter(manifest => !retained.has(manifest.id))
-    for (const manifest of expired) {
-      const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, manifest.id))
-      const stat = await fs.lstat(root).catch(() => null)
-      if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new GameAdapterError('BACKUP_RETENTION_INVALID', `Refusing to remove abnormal backup path: ${manifest.id}`)
-      await fs.rm(root, { recursive: true, force: false })
-      await fs.rm(path.join(this.#downloadDirectory, `${manifest.id}.zip`), { force: true })
-    }
-    if (expired.length > 0) report?.(`已按保留策略清理 ${expired.length} 个旧自动备份`)
-    return expired.length
+  async #enforceAutomaticBackupRetention(report?: ReportStep, protectedIds = new Set<string>()): Promise<number> {
+    return this.#retention.prune(this.#settings.backupKeep, protectedIds, report)
   }
 
+  #inspectionInput() {
+    return {
+      gameRoot: this.#config.game.root, saveDirectory: this.#config.game.saveDirectory, logFile: this.#config.game.logFile,
+      managedStartScript: resolveWindowsScript('start-game.ps1'), startupSettingsPath: this.#startupSettingsPath,
+      startTaskName: this.#config.game.startTaskName,
+    }
+  }
+  async recoveryStartReadiness(): Promise<RecoveryStartReadiness> {
+    const result = await this.#runScript<{ state?: unknown }>('inspect-game.ps1', {
+      ...this.#inspectionInput(), checkRecoveryStart: true, requireProcessIdentity: true,
+    }).catch(() => null)
+    switch (result?.state) {
+      case 'ready': case 'game-present': case 'task-unavailable': case 'steam-missing': case 'steam-other-user': case 'session-ambiguous': return result.state
+      default: return 'unknown'
+    }
+  }
   async #inspect(fresh = false, requireProcessIdentity = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
     await this.#initialization
     if (!fresh && this.#inspectCache && this.#clock() - this.#inspectCache.at < 2_000) return this.#inspectCache.value
     const value = this.#inspectOverride
       ? await this.#inspectOverride()
-      : await this.#runScript<InspectResult>('inspect-game.ps1', {
-          gameRoot: this.#config.game.root,
-          requireProcessIdentity,
-          saveDirectory: this.#config.game.saveDirectory,
-          logFile: this.#config.game.logFile,
-          managedStartScript: resolveWindowsScript('start-game.ps1'),
-          startupSettingsPath: this.#startupSettingsPath,
-          startTaskName: this.#config.game.startTaskName
-        })
+      : await this.#runScript<InspectResult>('inspect-game.ps1', { ...this.#inspectionInput(), requireProcessIdentity })
     const snapshot = { ...value, sampledAtUnixMs: value.sampledAtUnixMs ?? this.#clock() }
     this.#inspectCache = { at: this.#clock(), value: snapshot }
     return snapshot
@@ -293,7 +286,7 @@ export class WindowsGameAdapter implements GameAdapter {
       this.saves(), fs.statfs(this.#config.game.saveDirectory).catch(() => null)
     ])
     const process = inspection.process
-    let players: Player[] = []
+    let roster: Awaited<ReturnType<typeof readBridgeRoster>> | null = null
     let playerStatus: Overview['playerStatus'] = 'available'
     let bridgeReady = false
     let playerActions = false
@@ -301,7 +294,7 @@ export class WindowsGameAdapter implements GameAdapter {
     let runtimeVersions: BridgeVersions | null = null
     if (process) {
       try {
-        players = await readBridgePlayers(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, process.pid)
+        roster = await readBridgeRoster(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, process.pid)
         bridgeReady = true
       } catch {
         playerStatus = 'unavailable'
@@ -351,7 +344,11 @@ export class WindowsGameAdapter implements GameAdapter {
       name: this.#settings.serverName, source: 'windows', state: process ? 'running' : 'stopped', sampledAt: now(),
       address: this.#settings.address, pid: process?.pid ?? null,
       uptimeSeconds: process ? Math.max(0, Math.floor((this.#clock() - Date.parse(process.startedAt)) / 1000)) : 0,
-      playerCount: playerStatus === 'available' ? players.length : null, playerStatus, maxPlayers: null,
+      playerCount: playerStatus === 'available' ? roster?.players.length ?? 0 : null, playerStatus, maxPlayers: null,
+      worldClock: process && telemetry && roster && Date.parse(process.startedAt) <= telemetry.bridgeStartedAt && telemetry.bridgeStartedAt === roster.bridgeStartedAt ? {
+        gameTick: telemetry.gameTick, sessionId: telemetry.sessionId, writtenAt: Date.parse(telemetry.sampledAt),
+        rosterSessionId: roster.sessionId, rosterWrittenAt: roster.writtenAt, rosterSequence: roster.sequence
+      } : null,
       versions: {
         game: runtimeVersions?.game ?? 'unknown',
         nebula: runtimeVersions?.nebula ?? 'unknown',
@@ -470,15 +467,7 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async backups(): Promise<Backup[]> {
     await this.#initialization
-    const entries = await fs.readdir(this.#config.game.backupDirectory, { withFileTypes: true })
-    const results: Backup[] = []
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(entry.name)) continue
-      const manifest = await this.#readBackupManifest(entry.name).catch(() => null)
-      if (!manifest) continue
-      results.push({ id: manifest.id, saveName: manifest.saveName, createdAt: manifest.createdAt, bytes: manifest.members.reduce((sum, member) => sum + member.bytes, 0), members: manifest.members.map((member) => member.fileName), reason: manifest.reason })
-    }
-    return results.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    return this.#retention.list()
   }
 
   async settings(): Promise<GameSettings> {
@@ -548,6 +537,7 @@ export class WindowsGameAdapter implements GameAdapter {
       case 'start': return this.#start(report, signal)
       case 'prepare-first-world': return this.#prepareFirstWorld(report, signal)
       case 'load-save': return this.#loadSave(input, report, signal)
+      case 'set-backup-retained': return this.#retention.set(input, report)
       case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'save': return this.#save(report, signal)
       case 'stop': return this.#stop(report, signal, true)
@@ -1421,7 +1411,7 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!receipt) throw new GameAdapterError('UPDATE_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1621,7 +1611,7 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!receipt) throw new GameAdapterError('MOD_REMOVAL_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1724,7 +1714,7 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!receipt) throw new GameAdapterError('MOD_CONFIG_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true

@@ -26,7 +26,7 @@ const emptyObjectSchema = z.object({}).strict()
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
-const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world', 'prepare-existing-server', 'adopt-existing-server'])
+const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'set-backup-retained', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world', 'prepare-existing-server', 'adopt-existing-server'])
 const settingsSchema = z.object({
   serverName: z.string().trim().min(1).max(80).regex(/^[^\r\n\0]+$/u),
   maxPlayers: z.number().int().min(1).max(256).nullable(),
@@ -51,6 +51,7 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'load-save': z.object({ saveId: idSchema }).strict(),
   backup: z.object({ saveId: idSchema.optional() }).strict(),
   'verify-backup': z.object({ backupId: idSchema }).strict(),
+  'set-backup-retained': z.object({ backupId: idSchema, retained: z.boolean() }).strict(),
   restore: z.object({ backupId: idSchema, previewKey: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'import-backup': z.object({ uploadId: z.string().uuid() }).strict(),
   'install-update': z.object({ component: z.enum(['game', 'nebula', 'bepinex']), version: z.string().trim().min(1).max(100).optional() }).strict(),
@@ -350,9 +351,19 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return data(store.list(query))
   })
   app.get('/api/runtime', async (request) => { assertNoQuery(request); return data(runtime.status()) })
+  const historyQuery = z.object({ hours: z.coerce.number().int().min(1).max(168).default(24) }).strict()
   app.get('/api/runtime/history', async (request) => {
-    const { hours } = z.object({ hours: z.coerce.number().int().min(1).max(168).default(24) }).strict().parse(request.query)
+    const { hours } = historyQuery.parse(request.query)
     return data(runtime.history(hours))
+  })
+  app.get('/api/runtime/history/trend', async request => {
+    const { hours } = historyQuery.parse(request.query)
+    return data(runtime.historyWindow(hours))
+  })
+  app.get('/api/runtime/history/download', async (request, reply) => {
+    const { hours } = historyQuery.parse(request.query)
+    reply.type('text/csv; charset=utf-8').header('content-disposition', `attachment; filename="dyson-runtime-${hours}h.csv"`)
+    return reply.send(Readable.from(runtime.historyCsv(hours)))
   })
   app.put('/api/runtime/settings', async (request) => {
     assertNoQuery(request)

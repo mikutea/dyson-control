@@ -2,6 +2,7 @@ param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'path-policy.ps1')
 $argsObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$checkRecovery = $argsObject.checkRecoveryStart -eq $true
 if ($null -eq $argsObject.gameRoot -or [string]::IsNullOrWhiteSpace([string]$argsObject.gameRoot)) { throw 'gameRoot is required.' }
 $gameRoot = [IO.Path]::GetFullPath([string]$argsObject.gameRoot)
 $gameExe = [IO.Path]::GetFullPath((Join-Path $gameRoot 'DSPGAME.exe'))
@@ -34,6 +35,7 @@ if ($matchingProcesses.Count -gt 1) {
   throw "Multiple DSPGAME.exe processes match the configured game root; the managed instance is ambiguous."
 }
 $process = $matchingProcesses | Select-Object -First 1
+if ($checkRecovery -and $null -ne $process) { [ordered]@{ state = 'game-present' } | ConvertTo-Json -Compress; return }
 
 $processResult = $null
 if ($null -ne $process) {
@@ -57,30 +59,32 @@ $processSampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 # Host-wide traffic counters. Restricting the set to active physical adapters avoids
 # double-counting Hyper-V/tunnel interfaces; these counters are not process-specific.
 $networkResult = $null
-try {
-  $networkAdapters = @(
-    Get-NetAdapter -Name '*' -Physical -ErrorAction Stop |
-      Where-Object { [string]$_.Status -eq 'Up' } |
-      Sort-Object @{ Expression = { [string]$_.InterfaceGuid } }
-  )
-  $networkCounters = @()
-  foreach ($adapter in $networkAdapters) {
-    $adapterId = ([Guid]$adapter.InterfaceGuid).ToString('D').ToLowerInvariant()
-    $statistics = Get-NetAdapterStatistics -Name ([string]$adapter.Name) -ErrorAction Stop
-    $networkCounters += [ordered]@{
-      id = $adapterId
-      receivedBytes = ([UInt64]$statistics.ReceivedBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
-      sentBytes = ([UInt64]$statistics.SentBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+if (-not $checkRecovery) {
+  try {
+    $networkAdapters = @(
+      Get-NetAdapter -Name '*' -Physical -ErrorAction Stop |
+        Where-Object { [string]$_.Status -eq 'Up' } |
+        Sort-Object @{ Expression = { [string]$_.InterfaceGuid } }
+    )
+    $networkCounters = @()
+    foreach ($adapter in $networkAdapters) {
+      $adapterId = ([Guid]$adapter.InterfaceGuid).ToString('D').ToLowerInvariant()
+      $statistics = Get-NetAdapterStatistics -Name ([string]$adapter.Name) -ErrorAction Stop
+      $networkCounters += [ordered]@{
+        id = $adapterId
+        receivedBytes = ([UInt64]$statistics.ReceivedBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+        sentBytes = ([UInt64]$statistics.SentBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+      }
     }
+    $networkResult = [ordered]@{
+      sampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      adapters = @($networkCounters)
+    }
+  } catch {
+    # Network telemetry is optional. Process and lifecycle inspection must remain available
+    # on hosts without the NetAdapter module or when a physical adapter disappears mid-read.
+    $networkResult = $null
   }
-  $networkResult = [ordered]@{
-    sampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    adapters = @($networkCounters)
-  }
-} catch {
-  # Network telemetry is optional. Process and lifecycle inspection must remain available
-  # on hosts without the NetAdapter module or when a physical adapter disappears mid-read.
-  $networkResult = $null
 }
 
 function Get-ExactTask([object]$NameValue) {
@@ -164,7 +168,39 @@ function Test-ManagedStartArguments([object]$Action) {
   )
 }
 
-$startTask = Get-ExactTask $argsObject.startTaskName
+function Get-RecoveryStartState([object]$Task, [bool]$Managed) {
+  if (-not $Managed -or $Task.Description -cne 'DYSON_CONTROL_MANAGED_GAME_START_V1' -or
+      $Task.State -ne 'Ready' -or $Task.Settings.Enabled -ne $true -or @($Task.Triggers | Where-Object { $null -ne $_ }).Count -ne 0 -or
+      $Task.Principal.LogonType -ne 'Interactive' -or $Task.Principal.RunLevel -ne 'Limited') { return 'task-unavailable' }
+  try {
+    $principal = [string]$Task.Principal.UserId
+    if ([string]::IsNullOrWhiteSpace($principal)) { return 'task-unavailable' }
+    $sid = if ($principal -match '^S-1-') { [Security.Principal.SecurityIdentifier]::new($principal) }
+           else { [Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]) }
+    $account = @(Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount = TRUE AND SID = '$($sid.Value)'" -ErrorAction Stop)
+    if ($account.Count -ne 1 -or $account[0].SID -cne $sid.Value -or $account[0].LocalAccount -ne $true -or $account[0].Disabled -ne $false) { return 'task-unavailable' }
+    $sessions = @{}; $otherUser = $false; $unknownOwner = $false
+    foreach ($steam in @(Get-CimInstance Win32_Process -Filter "Name = 'steam.exe'" -ErrorAction Stop)) {
+      if ($null -eq $steam.SessionId) { $unknownOwner = $true; continue }
+      if ([int]$steam.SessionId -le 0) { continue }
+      $owner = Invoke-CimMethod -InputObject $steam -MethodName GetOwnerSid -ErrorAction Stop
+      if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$owner.Sid)) { $unknownOwner = $true; continue }
+      if ([Security.Principal.SecurityIdentifier]::new([string]$owner.Sid).Value -ceq $sid.Value) { $sessions[[int]$steam.SessionId] = $true }
+      else { $otherUser = $true }
+    }
+    if ($sessions.Count -gt 1) { return 'session-ambiguous' }
+    if ($unknownOwner) { return 'unknown' }
+    if ($sessions.Count -eq 1) { return 'ready' }
+    if ($otherUser) { return 'steam-other-user' }
+    return 'steam-missing'
+  } catch { return 'unknown' }
+}
+
+if ($checkRecovery) {
+  $namedTasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ieq $argsObject.startTaskName })
+  if ($namedTasks.Count -ne 1 -or $namedTasks[0].TaskPath -cne '\') { [ordered]@{ state = 'task-unavailable' } | ConvertTo-Json -Compress; return }
+  $startTask = $namedTasks[0]
+} else { $startTask = Get-ExactTask $argsObject.startTaskName }
 $startManaged = $false
 $configuredTargetUps = $null
 if ($null -ne $startTask -and @($startTask.Actions).Count -eq 1) {
@@ -181,6 +217,8 @@ if ($null -ne $startTask -and @($startTask.Actions).Count -eq 1 -and $null -ne $
     (Test-ManagedStartArguments $action)
   )
 }
+
+if ($checkRecovery) { [ordered]@{ state = Get-RecoveryStartState $startTask $startManaged } | ConvertTo-Json -Compress; return }
 
 $result = [ordered]@{
   process = $processResult

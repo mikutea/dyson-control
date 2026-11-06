@@ -56,8 +56,7 @@ async function bridgeWorker(root: string, secret: string, tamper = false): Promi
   throw new Error('request was not observed')
 }
 
-async function writePlayers(root: string, secret: string, state: 'active' | 'inactive' | 'unavailable' = 'active'): Promise<void> {
-  const writtenAt = Date.now()
+async function writePlayers(root: string, secret: string, state: 'active' | 'inactive' | 'unavailable' = 'active', writtenAt = Date.now()): Promise<void> {
   const players = state === 'active'
     ? [{ sessionPlayerId: 'player-000001', displayName: 'Fixture Player', online: true, joinedAtUnixMs: writtenAt - 1_000, location: 'planet:101' }]
     : []
@@ -159,6 +158,12 @@ describe('signed Bridge player snapshots', () => {
     const { root, secretFile, secret } = await fixture()
     await writePlayers(root, secret)
     await expect(readBridgePlayers(root, secretFile, 9999)).rejects.toMatchObject({ code: 'BRIDGE_PROCESS_MISMATCH' })
+  })
+
+  it('rejects a signed roster written before the current heartbeat session started even within the freshness window', async () => {
+    const { root, secretFile, secret } = await fixture()
+    await writePlayers(root, secret, 'active', Date.now() - 3_000)
+    await expect(readBridgePlayers(root, secretFile, 1234)).rejects.toMatchObject({ code: 'PLAYER_SNAPSHOT_STALE' })
   })
 })
 
