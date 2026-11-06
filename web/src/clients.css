@@ -6,6 +6,11 @@
 .client-detail { padding: 1rem; }
 .client-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: .8rem; }
 .client-detail-head .button { flex-shrink: 0; }
+.client-share-actions { display: flex; flex-wrap: wrap; align-items: flex-start; gap: .45rem; }
+.client-guide { max-width: 20rem; }
+.client-check-file { display: grid; gap: .45rem; margin-top: .75rem; }
+.client-check-file input { max-width: 100%; }
+.client-digest p { margin: .5rem 0 0; }
 .client-status { margin: .3rem 0; font-size: .95rem; }
 .client-status-current { color: var(--green); }
 .client-status-outdated, .client-mod-changed small { color: var(--amber); }

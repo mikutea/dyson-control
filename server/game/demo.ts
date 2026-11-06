@@ -261,7 +261,7 @@ export class DemoGameAdapter implements GameAdapter {
   }
 
   async download(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload> {
-    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
+    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id, signal)
     return exportBackup(this.#config.game.backupDirectory, id, signal)
   }
 

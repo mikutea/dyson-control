@@ -5,6 +5,7 @@ import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, PageHeader, Panel } from './components'
 import { formatBytes, formatFullDate } from './format'
 import { useResource } from './hooks'
+import { ClientFileCheck, ClientJoinGuide } from './ClientDistribution'
 import './clients.css'
 
 export function ClientsPage({ refreshToken, runAction, operationActive }: { refreshToken: number; runAction: RunAction; operationActive: boolean }) {
@@ -83,14 +84,17 @@ function PackageDetails({ item }: { item: ClientPackage }) {
         {details.status === 'outdated' && <p>要分发当前配置，请创建新包。</p>}
         {details.reason && <p>{details.reason}</p>}
       </div>
-      {details.downloadable && <a className="button button-primary" download href={item.downloadUrl}><Download /><span>下载所选包</span></a>}
+      {details.downloadable && <div className="client-share-actions">
+        <a className="button button-primary" download href={item.downloadUrl}><Download /><span>下载所选包</span></a>
+        {details.status === 'current' && details.sha256 && <ClientJoinGuide item={item} digest={details.sha256} />}
+      </div>}
     </header>
     <dl className={`client-address${addressChanged ? ' client-changed-address' : ''}`}>
       <div><dt>包内连接地址</dt><dd>{details.profile?.address ?? '未知'}</dd></div>
       <div><dt>当前连接地址</dt><dd>{details.currentAddress}</dd></div>
     </dl>
     {details.profile ? <ModComparison details={details} /> : <p className="client-unknown-mods">包内模组版本未知。</p>}
-    {details.sha256 && <details className="client-digest"><summary>文件 SHA-256</summary><code>{details.sha256}</code></details>}
+    {details.sha256 && <ClientFileCheck digest={details.sha256} bytes={item.bytes} />}
   </section>
 }
 

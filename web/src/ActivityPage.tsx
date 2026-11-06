@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Download, Pause, Play, RefreshCw } from 'lucide-react'
 import type { LogEntry } from '../../shared/contracts'
 import { api } from './api'
+import { downloadText } from './download-text'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, PageHeader, Panel } from './components'
 import { formatFullDate } from './format'
 import { OperationHistory } from './OperationHistory'
@@ -69,14 +70,7 @@ export function ActivityPage({ refreshToken }: { refreshToken: number }) {
       ...filteredLogs.map(entry => `${entry.time ? formatFullDate(entry.time) : '时间未记录'} [${logLevelLabels[entry.level]}] ${entry.message}`),
       '',
     ].join('\r\n')
-    const url = URL.createObjectURL(new Blob(['\uFEFF', contents], { type: 'text/plain;charset=utf-8' }))
-    const link = document.createElement('a')
-    link.href = url
-    link.download = `dyson-log-snapshot-${downloadedAt.replace(/[:.]/g, '-')}.txt`
-    document.body.append(link)
-    link.click()
-    link.remove()
-    window.setTimeout(() => URL.revokeObjectURL(url), 0)
+    downloadText(`dyson-log-snapshot-${downloadedAt.replace(/[:.]/g, '-')}.txt`, contents)
   }
 
   return <>

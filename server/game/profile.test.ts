@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import type { Mod } from '../../shared/contracts.js'
 import { clientPackageDownload, compareClientPackage, createR2ModmanPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { extractZipBuffer } from './updates.js'
@@ -90,7 +91,7 @@ describe('client package creation plan', () => {
       const item = await writeClientPackage(root, address, read)
       const download = await clientPackageDownload(root, item.id)
       const extracted = path.join(root, 'readback')
-      await extractZipBuffer(download.verifiedBytes!, extracted)
+      await extractZipBuffer(Buffer.from(download.verifiedBytes!), extracted)
       const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8'))
       expect(profile.mods).toEqual([{ name: 'Owner-Beta', version: { major: 1, minor: 3, patch: 2 }, enabled: true }])
       expect(await fs.readFile(path.join(extracted, 'config/nebula.cfg'), 'utf8')).toContain('LastIP = ' + address + '\n')
@@ -121,7 +122,7 @@ describe('client package details', () => {
       { name: 'Owner-Tools', version: '1.2.3' }, { name: 'Team-Plugin', version: '0.5.2' }
     ] } })
     const archive = await clientPackageDownload(root, first.id)
-    const bytes = await fs.readFile(archive.path)
+    const bytes = Buffer.from(archive.verifiedBytes!)
     expect(original.sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
     const extracted = path.join(root, 'extracted')
     await extractZipBuffer(bytes, extracted)
@@ -158,7 +159,9 @@ describe('client package details', () => {
     expect(await listClientPackages(root)).toEqual([item])
     expect(await compareClientPackage(root, item.id, address, read)).toMatchObject({ profile: null, status: 'unknown', downloadable: true, sha256: null, reason: expect.stringContaining('旧包') })
     expect(read).not.toHaveBeenCalled()
-    expect(await clientPackageDownload(root, item.id)).toMatchObject({ fileName: item.name })
+    const download = await clientPackageDownload(root, item.id)
+    expect(download).toMatchObject({ fileName: item.name, length: item.bytes })
+    expect((await buffer(download.stream!)).length).toBe(item.bytes)
     await fs.writeFile(file, JSON.stringify({ schema: 1, fileName, item }))
     expect(await compareClientPackage(root, item.id, address, read)).toMatchObject({ status: 'unknown', downloadable: false })
     await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_MANIFEST_INVALID' })
@@ -197,7 +200,32 @@ describe('client package details', () => {
     await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_SIZE_LIMIT' })
     expect(await compareClientPackage(root, item.id, address, () => mods)).toMatchObject({ status: 'unknown', downloadable: false })
     await fs.writeFile(file, JSON.stringify({ item: manifest.item, fileName: manifest.fileName }))
-    expect((await clientPackageDownload(root, item.id)).verifiedBytes).toBeUndefined()
+    const legacy = await clientPackageDownload(root, item.id)
+    expect(legacy.verifiedBytes).toBeUndefined()
+    legacy.stream!.destroy()
+  })
+
+  it('streams only the original ordinary archive selected by a legacy receipt', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const receipt = path.join(root, `${item.id}.json`)
+    const { fileName } = JSON.parse(await fs.readFile(receipt, 'utf8'))
+    await fs.writeFile(receipt, JSON.stringify({ item, fileName }))
+    const archive = path.join(root, fileName)
+    const original = await fs.readFile(archive)
+    const unrelated = path.join(root, 'unrelated.bin')
+    const otherBytes = Buffer.alloc(item.bytes, 71)
+    await fs.writeFile(unrelated, otherBytes)
+
+    const selected = await clientPackageDownload(root, item.id)
+    await fs.rename(archive, archive + '.original')
+    await fs.link(unrelated, archive)
+    expect(await buffer(selected.stream!)).toEqual(original)
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'DOWNLOAD_NOT_FOUND' })
+    expect(await compareClientPackage(root, item.id, address, () => mods)).toMatchObject({ status: 'unknown', downloadable: false })
+    expect(await fs.readFile(unrelated)).toEqual(otherBytes)
+
+    await fs.writeFile(receipt, JSON.stringify({ item, fileName: 'different.r2z' }))
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_MANIFEST_INVALID' })
   })
 
   it('does not publish a package when the generation record cannot be committed', async () => {

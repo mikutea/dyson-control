@@ -597,7 +597,7 @@ export class WindowsGameAdapter implements GameAdapter {
   async download(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload> {
     await this.#initialization
     safeId(id, `${kind} id`)
-    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id)
+    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id, signal)
 
     return exportBackup(this.#config.game.backupDirectory, id, signal)
   }

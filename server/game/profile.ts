@@ -1,10 +1,10 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import { constants } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { buffer as readStreamBuffer } from 'node:stream/consumers'
 import { z } from 'zod'
-import type { ClientPackage, ClientPackageBlocker, ClientPackageDetails, ClientPackagePlan, ClientProfile, Mod } from '../../shared/contracts.js'
+import type { ClientPackage, ClientPackageBlocker, ClientPackageDetails, ClientPackagePlan, ClientProfile, GameDownload, Mod } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 import { safeId, timestampId } from './system.js'
 import { buildStoredZip } from './zip.js'
@@ -116,18 +116,36 @@ function recordChecksum(profile: ClientProfile, archiveSha256: string): string {
   return createHash('sha256').update(JSON.stringify([profile.address, profile.mods.map(mod => [mod.name, mod.version]), archiveSha256])).digest('hex')
 }
 
+async function openPackageFile(file: string, expectedBytes?: number) {
+  const directory = await fs.lstat(path.dirname(file)).catch(() => null)
+  const before = directory?.isDirectory() && !directory.isSymbolicLink() ? await fs.lstat(file).catch(() => null) : null
+  if (!before?.isFile() || before.nlink !== 1 || (expectedBytes !== undefined && before.size !== expectedBytes)) {
+    throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '客户端包文件缺失、不是独立普通文件或大小已改变，请重新创建。')
+  }
+  const handle = await fs.open(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+  try {
+    const opened = await handle.stat()
+    if (!opened.isFile() || opened.nlink !== 1 || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '客户端包文件已变化，请刷新后重试。')
+    }
+    return handle
+  } catch (error) {
+    await handle.close()
+    throw error
+  }
+}
+
 async function readManifest(directory: string, id: string): Promise<Manifest> {
   safeId(id, 'client package id')
   const file = path.join(directory, `${id}.json`)
-  const stat = await fs.lstat(file).catch(() => null)
-  if (!stat?.isFile() || stat.isSymbolicLink()) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '找不到这份客户端包的记录。')
+  const handle = await openPackageFile(file)
   try {
-    const manifest = manifestSchema.parse(JSON.parse(await fs.readFile(file, 'utf8')))
-    if (manifest.item.id !== id) throw new Error('Package ID mismatch')
+    const manifest = manifestSchema.parse(JSON.parse(await handle.readFile('utf8')))
+    if (manifest.item.id !== id || manifest.fileName !== `${id}.r2z`) throw new Error('Package ID mismatch')
     return manifest
   } catch (cause) {
     throw new GameAdapterError('PACKAGE_MANIFEST_INVALID', '客户端包记录损坏，请重新创建。', { cause })
-  }
+  } finally { await handle.close() }
 }
 
 function publicItem(item: Manifest['item']): ClientPackage {
@@ -177,34 +195,38 @@ export async function writeClientPackage(directory: string, address: string, mod
   return item
 }
 
-async function checkArchive(directory: string, manifest: Manifest) {
+async function checkArchive(directory: string, manifest: Manifest, transfer?: { signal?: AbortSignal }) {
   const archive = path.join(directory, manifest.fileName)
-  const stat = await fs.lstat(archive).catch(() => null)
-  if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== manifest.item.bytes) {
-    throw new GameAdapterError('DOWNLOAD_NOT_FOUND', '客户端包文件缺失或大小已改变，请重新创建。')
-  }
-  if (manifest.schema === undefined && manifest.profile === undefined && manifest.checksum === undefined) {
-    return { path: archive, profile: null, sha256: null }
-  }
-  const record = recordSchema.safeParse(manifest)
-  if (!record.success || record.data.profile.mods.length !== manifest.item.modCount) {
-    throw new GameAdapterError('PACKAGE_MANIFEST_INVALID', '客户端包的地址与版本记录不完整，请重新创建。')
-  }
-  const { profile, checksum } = record.data
-  checkSize(manifest.item.bytes)
-  // Reading one byte past the expected size detects growth while bounding the returned buffer.
-  const verifiedBytes = await readStreamBuffer(createReadStream(archive, { end: manifest.item.bytes }))
-  const sha256 = createHash('sha256').update(verifiedBytes).digest('hex')
-  if (verifiedBytes.length !== manifest.item.bytes || recordChecksum(profile, sha256) !== checksum) {
-    throw new GameAdapterError('PACKAGE_CHECKSUM_FAILED', '客户端包与生成记录不符，请重新创建。')
-  }
-  return { path: archive, profile, sha256, verifiedBytes }
+  const handle = await openPackageFile(archive, manifest.item.bytes)
+  let stream: ReturnType<typeof handle.createReadStream> | undefined
+  try {
+    transfer?.signal?.throwIfAborted()
+    if (manifest.schema === undefined && manifest.profile === undefined && manifest.checksum === undefined) {
+      // Keep the inspected file open until the response ends. Older receipts have no generation digest.
+      if (transfer) stream = handle.createReadStream({ end: manifest.item.bytes - 1, signal: transfer.signal })
+      return { path: archive, profile: null, sha256: null, stream }
+    }
+    const record = recordSchema.safeParse(manifest)
+    if (!record.success || record.data.profile.mods.length !== manifest.item.modCount) {
+      throw new GameAdapterError('PACKAGE_MANIFEST_INVALID', '客户端包的地址与版本记录不完整，请重新创建。')
+    }
+    const { profile, checksum } = record.data
+    checkSize(manifest.item.bytes)
+    const verifiedBytes = await readStreamBuffer(handle.createReadStream({ end: manifest.item.bytes, signal: transfer?.signal }))
+    const sha256 = createHash('sha256').update(verifiedBytes).digest('hex')
+    if (verifiedBytes.length !== manifest.item.bytes || recordChecksum(profile, sha256) !== checksum) {
+      throw new GameAdapterError('PACKAGE_CHECKSUM_FAILED', '客户端包与生成记录不符，请重新创建。')
+    }
+    return { path: archive, profile, sha256, verifiedBytes }
+  } finally { if (!stream) await handle.close() }
 }
 
-export async function clientPackageDownload(directory: string, id: string) {
+export async function clientPackageDownload(directory: string, id: string, signal?: AbortSignal): Promise<GameDownload> {
   const manifest = await readManifest(directory, id)
-  const archive = await checkArchive(directory, manifest)
-  return { path: archive.path, fileName: manifest.item.name, contentType: 'application/zip', verifiedBytes: archive.verifiedBytes }
+  const archive = await checkArchive(directory, manifest, { signal })
+  const response = { fileName: manifest.item.name, contentType: 'application/zip' }
+  if (archive.stream) return { ...response, stream: archive.stream, length: manifest.item.bytes }
+  return { ...response, path: archive.path, verifiedBytes: archive.verifiedBytes }
 }
 
 export async function compareClientPackage(directory: string, id: string, currentAddress: string, readMods: () => Mod[] | Promise<Mod[]>): Promise<ClientPackageDetails> {
