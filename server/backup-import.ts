@@ -4,7 +4,7 @@ import fs, { type FileHandle } from 'node:fs/promises'
 import path from 'node:path'
 import { Readable, Transform, Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
-import { createInflateRaw } from 'node:zlib'
+import { crc32, createInflateRaw } from 'node:zlib'
 import type { ControlConfig, ReportStep } from '../shared/contracts.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 
@@ -301,9 +301,7 @@ function decodeEntryName(bytes: Buffer, flags: number, extra: Buffer): string {
     if (direct === null) throw importError('BACKUP_ARCHIVE_UNSUPPORTED', 'ZIP 未标明中文等非 ASCII 文件名的编码，请使用 UTF-8 文件名重新压缩。')
     return direct
   }
-  let crc = 0xffffffff
-  for (const byte of bytes) crc = crcTable[(crc ^ byte) & 0xff]! ^ (crc >>> 8)
-  if (unicode.length < 6 || unicode[0] !== 1 || unicode.readUInt32LE(1) !== ((crc ^ 0xffffffff) >>> 0)) {
+  if (unicode.length < 6 || unicode[0] !== 1 || unicode.readUInt32LE(1) !== crc32(bytes)) {
     throw importError('BACKUP_ARCHIVE_INVALID', 'ZIP 的 Unicode 文件名记录校验失败。')
   }
   const name = utf8Name(unicode.subarray(5))
@@ -393,21 +391,20 @@ async function readEntryBuffer(archivePath: string, entry: ZipEntry, centralOffs
 async function consumeEntry(source: Readable, entry: ZipEntry, sink: Writable, signal: AbortSignal) {
   const hash = createHash('sha256')
   let bytes = 0
-  let crc = 0xffffffff
+  let crc = 0
   const meter = new Transform({
     transform(chunk: Buffer | string, encoding, callback) {
       const value = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
       bytes += value.length
       if (bytes > entry.uncompressedSize) return callback(importError('BACKUP_ARCHIVE_INVALID', `ZIP 解压大小超出清单：${entry.name}`))
       hash.update(value)
-      for (const byte of value) crc = crcTable[(crc ^ byte) & 0xff]! ^ (crc >>> 8)
+      crc = crc32(value, crc)
       callback(null, value)
     },
   })
   if (entry.method === 8) await pipeline(source, createInflateRaw(), meter, sink, { signal })
   else await pipeline(source, meter, sink, { signal })
-  const actualCrc = (crc ^ 0xffffffff) >>> 0
-  if (bytes !== entry.uncompressedSize || actualCrc !== entry.crc32) {
+  if (bytes !== entry.uncompressedSize || crc !== entry.crc32) {
     throw importError('BACKUP_ARCHIVE_INVALID', `ZIP 条目长度或 CRC 校验失败：${entry.name}`)
   }
   return { bytes, sha256: hash.digest('hex') }
@@ -494,11 +491,4 @@ function safeNumber(value: bigint, label: string): number {
 
 function importError(code: string, message: string, cause?: unknown): BackupImportError {
   return new BackupImportError(code, message, cause === undefined ? undefined : { cause })
-}
-
-const crcTable = new Uint32Array(256)
-for (let index = 0; index < 256; index += 1) {
-  let value = index
-  for (let bit = 0; bit < 8; bit += 1) value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1
-  crcTable[index] = value >>> 0
 }
