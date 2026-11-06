@@ -1,4 +1,7 @@
 import { pathToFileURL } from 'node:url'
+import { lstat, mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import type { ControlConfig } from '../shared/contracts.js'
 import { buildApp } from './app.js'
 import { loadConfig } from './config.js'
@@ -12,16 +15,38 @@ export { BackupImportError, importUploadedBackup } from './backup-import.js'
 export type { BuildAppOptions } from './app.js'
 export type { JobQueueOptions } from './jobs.js'
 
-export async function startServer(config?: ControlConfig) {
-  const resolvedConfig = config ?? await loadConfig()
-  const app = await buildApp({ config: resolvedConfig, logger: true })
+async function ownDataDirectory(directory: string): Promise<() => void> {
+  await mkdir(directory, { recursive: true })
+  const file = join(directory, 'panel-owner.sqlite')
+  const stat = await lstat(file).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
+  if (stat && (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1)) throw new Error('面板启动锁必须是数据目录中的独立普通文件。')
+  const owner = new DatabaseSync(file, { timeout: 0 })
   try {
-    await app.listen({ host: resolvedConfig.host, port: resolvedConfig.port })
+    // A separate database leaves the job store available to the owner. SQLite releases this lock on process exit.
+    owner.exec('BEGIN EXCLUSIVE')
   } catch (error) {
-    await app.close()
+    owner.close()
+    const code = (error as { errcode?: number }).errcode
+    if (code !== undefined && [5, 6].includes(code & 0xff)) {
+      throw new Error('此数据目录的面板启动锁正被使用。请先关闭使用同一数据目录的面板。', { cause: error })
+    }
     throw error
   }
-  return app
+  return () => { if (owner.isOpen) owner.close() }
+}
+
+export async function startServer(config?: ControlConfig) {
+  const resolvedConfig = config ?? await loadConfig()
+  const releaseDataDirectory = await ownDataDirectory(resolvedConfig.dataDirectory)
+  let app: Awaited<ReturnType<typeof buildApp>> | undefined
+  try {
+    app = await buildApp({ config: resolvedConfig, logger: true, releaseDataDirectory })
+    await app.listen({ host: resolvedConfig.host, port: resolvedConfig.port })
+    return app
+  } catch (error) {
+    try { await app?.close() } finally { releaseDataDirectory() }
+    throw error
+  }
 }
 
 async function main(): Promise<void> {

@@ -14,6 +14,10 @@ C:\ProgramData\Dyson Control\
 
 计划任务以 `SYSTEM` 身份在 Windows 启动时运行编译后的 `dist/server/index.js`。配置文件路径由安装程序写进该版本的固定启动器，不放进版本目录或公开发布包。游戏、存档和备份仍保留在配置指定的持久化目录。
 
+每个运行中的面板独占其配置的 `dataDirectory`。同一数据目录中的第二个面板即使使用其他端口，也会在恢复任务前退出。运行多个面板时，请分别指定数据目录和端口。面板关闭或进程意外退出时，系统会释放 `panel-owner.sqlite` 的文件锁。请将这个文件保留在数据目录中。
+
+从尚未使用此锁的旧版本升级时，请先停止旧面板进程，再启动新版本。安装程序和 `npm start` 均通过 `startServer` 取得所有权。直接调用底层 `buildApp` 的程序需自行隔离数据目录。
+
 ## 要求与边界
 
 - Windows 10、Windows Server 2019 或更新版本，Windows PowerShell 5.1。

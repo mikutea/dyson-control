@@ -74,6 +74,7 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
 
 export interface BuildAppOptions {
   config: ControlConfig
+  releaseDataDirectory?: () => void
   adapter?: GameAdapter
   databasePath?: string
   webRoot?: string
@@ -98,6 +99,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     requestTimeout: REQUEST_TIMEOUT_MS,
     trustProxy: (address, hop) => hop === 0 && isLoopbackAddress(address),
   })
+  // Fastify runs onClose in reverse order. Release the CLI's lock after the queue and stores close.
+  const { releaseDataDirectory } = options
+  if (releaseDataDirectory) app.addHook('onClose', async () => releaseDataDirectory())
   const steamAuth = options.steamAuth ?? new SteamAuthManager(options.config)
   await steamAuth.initialize()
   const setup = options.serverSetup ?? new ServerSetupManager(options.config, steamAuth)
