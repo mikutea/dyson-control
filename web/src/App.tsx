@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Action, Job, Overview, Page, Session } from '../../shared/contracts'
 import { api, get, post, remove } from './api'
-import { findPendingReceipts, pendingReceiptActions, submitAction } from './action-receipts'
+import { findPendingReceipts, submitAction, usePendingReceiptActions } from './action-receipts'
 import { actionLabels } from './format'
 import { Button, ConfirmDialog, ErrorBlock, Toast } from './components'
 import { Login } from './Login'
@@ -213,7 +213,7 @@ export default function App() {
   }
 
   const operationActive = submitting || jobsAvailable !== true || unfinished(job)
-  const missingReceipts = pendingReceiptActions()
+  const missingReceipts = usePendingReceiptActions()
   const checkReceipts = async () => {
     setCheckingReceipts(true)
     try {
@@ -222,7 +222,8 @@ export default function App() {
         receiveJob()
         setToast({ message: `已核对 ${known.length} 项操作，可在活动中查看。`, tone: 'success' })
       } else {
-        setToast({ message: '当前还没有这些请求的任务记录。可在原入口使用同一编号重试。', tone: 'success' })
+        setToast({ message: missingReceipts.includes('import-backup') ? '当前还没有这些请求的任务记录。可返回原入口重试。' :
+          '当前还没有这些请求的任务记录。可在原入口使用同一编号重试。', tone: 'success' })
       }
     } catch { setToast({ message: '暂时无法核对回执，请恢复连接后重试。', tone: 'error' }) }
     finally { setCheckingReceipts(false) }
