@@ -125,6 +125,20 @@ jobs:
         shell: powershell
         run: .\scripts\tests\game-task-selection.fixture.ps1
 
+      - name: Verify task identity on the hosted Windows Task Scheduler
+        shell: powershell
+        timeout-minutes: 4
+        run: .\scripts\tests\game-task-scheduler.fixture.ps1
+
+      - name: Retain hosted Scheduler verification
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dyson-game-task-scheduler-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/dyson-game-task-scheduler-*.json
+          if-no-files-found: ignore
+          retention-days: 7
+
       - name: Exercise desktop Steam crash recovery readiness
         shell: powershell
         run: .\scripts\tests\recovery-readiness.fixture.ps1
