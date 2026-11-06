@@ -177,7 +177,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const status = error.code === 'RECEIPT_INVALID' || error.code === 'RECEIPT_EXPIRED' ? 401
         : error.code === 'UPDATE_NOT_FOUND' ? 404
         : error.code === 'INVALID_INPUT' ? 400
-        : error.code === 'UPDATE_SCHEDULE_FAILED' ? 503 : 409
+        : error.code === 'UPDATE_SCHEDULE_FAILED' || error.code === 'UPDATE_RECEIPT_UNAVAILABLE' ? 503 : 409
       void reply.code(status).send({ error: { code: error.code, message: error.message } })
       return
     }

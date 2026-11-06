@@ -104,6 +104,7 @@ export class ControlUpdateManager {
   readonly #preparations = new Map<string, { controller: AbortController; promise: Promise<void> }>()
   readonly #pendingControllers = new Set<AbortController>()
   readonly #writeTails = new Map<string, Promise<void>>()
+  readonly #unrecordedFailures = new Set<string>()
   #serial: Promise<unknown> = Promise.resolve()
   #closed = false
 
@@ -216,6 +217,7 @@ export class ControlUpdateManager {
       }
       await this.#write(record)
       const promise = this.#runPreparation(record, candidate, controller.signal)
+        .catch(() => { this.#unrecordedFailures.add(id) })
         .finally(() => this.#preparations.delete(id))
       this.#preparations.set(id, { controller, promise })
       return { statusCode: 202 as const, operation: publicOperation(record), receiptToken }
@@ -487,12 +489,23 @@ export class ControlUpdateManager {
   }
 
   async #require(id: string): Promise<StoredOperation> {
-    try { return validateStored(JSON.parse(await fs.readFile(path.join(this.#operationsRoot, id, 'operation.json'), 'utf8')), path.join(this.#operationsRoot, id)) }
+    // A polling reader can wait for our own pending replacement. A failed write leaves the previous file intact.
+    await this.#writeTails.get(id)?.catch(() => undefined)
+    let record: StoredOperation
+    try { record = validateStored(JSON.parse(await fs.readFile(path.join(this.#operationsRoot, id, 'operation.json'), 'utf8')), path.join(this.#operationsRoot, id)) }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new ControlUpdateError('UPDATE_NOT_FOUND', '找不到该面板更新操作。')
       if (error instanceof ControlUpdateError) throw error
       throw new ControlUpdateError('UPDATE_HISTORY_INVALID', '面板更新历史无法读取。')
     }
+    if (this.#unrecordedFailures.has(id)) {
+      if (record.state === 'preparing') {
+        try { await this.#finish(record, 'failed', 'complete', '更新准备失败，先前无法写入操作记录。请检查存储权限和文件占用后重新准备。') }
+        catch { throw new ControlUpdateError('UPDATE_RECEIPT_UNAVAILABLE', '更新准备已停止，暂时无法写入操作记录。请检查存储权限和文件占用后刷新。') }
+      }
+      this.#unrecordedFailures.delete(id)
+    }
+    return record
   }
 
   async #loadAll(): Promise<StoredOperation[]> {
@@ -739,12 +752,14 @@ async function atomicJson(filePath: string, value: unknown): Promise<void> {
   const temporary = `${filePath}.partial-${randomUUID()}`
   try {
     await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    // Windows can temporarily hold a sharing lock on the destination. Retry only the rename, never the update.
+    const delays = [25, 50, 100, 200, 400, 800]
     for (let attempt = 0; ; attempt += 1) {
       try { await fs.rename(temporary, filePath); break }
       catch (error) {
         const code = (error as NodeJS.ErrnoException).code
-        if (attempt >= 4 || (code !== 'EPERM' && code !== 'EBUSY')) throw error
-        await new Promise(resolve => setTimeout(resolve, 10 * (attempt + 1)))
+        if (attempt === delays.length || (code !== 'EPERM' && code !== 'EBUSY')) throw error
+        await new Promise(resolve => setTimeout(resolve, delays[attempt]))
       }
     }
   } finally { await fs.rm(temporary, { force: true }).catch(() => undefined) }

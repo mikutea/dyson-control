@@ -219,6 +219,71 @@ describe('control update discovery and preparation', () => {
 })
 
 describe('control update application evidence', () => {
+  it('keeps the last receipt readable until a temporarily occupied update receipt can be replaced', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    const rename = fs.rename.bind(fs)
+    const held: string[] = []
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (String(to).endsWith('operation.json') && held.length < 5 &&
+        JSON.parse(await fs.readFile(from, 'utf8')).step === 'verifying') {
+        expect(JSON.parse(await fs.readFile(to, 'utf8')).step).toBe('downloading')
+        held.push(String(from))
+        throw Object.assign(new Error('fixture sharing violation'), { code: 'EPERM', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'transient-receipt-lock', expectedVersion: '0.2.0' })
+      const ready = await waitForReady(manager, prepared.operation.id)
+      expect(ready.sha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(held).toHaveLength(5)
+      expect(new Set(held).size).toBe(1)
+      expect(await fs.readdir(path.dirname(held[0]))).not.toContain(path.basename(held[0]))
+    } finally {
+      spy.mockRestore()
+      await manager.close()
+    }
+  })
+
+  it('reports a failed preparation when even its failure receipt cannot yet be written', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    let deny = true
+    let attemptedFailure!: () => void
+    const failureWrite = new Promise<void>(resolve => { attemptedFailure = resolve })
+    const rename = fs.rename.bind(fs)
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (deny && String(to).endsWith('operation.json')) {
+        const record = JSON.parse(await fs.readFile(from, 'utf8'))
+        if (record.state === 'failed') attemptedFailure()
+        if (record.step !== 'downloading') throw Object.assign(new Error('fixture denied write'), { code: 'EACCES', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'held-failure-receipt', expectedVersion: '0.2.0' })
+      await failureWrite
+      // Closing drains the preparation, including cleanup, before we inspect the receipt.
+      await manager.close()
+      await expect(manager.read(prepared.operation.id)).rejects.toMatchObject({ code: 'UPDATE_RECEIPT_UNAVAILABLE' })
+      deny = false
+      expect(await manager.read(prepared.operation.id)).toMatchObject({ state: 'failed', step: 'complete' })
+      const reopened = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0' })
+      await reopened.initialize()
+      expect(await reopened.read(prepared.operation.id)).toMatchObject({ state: 'failed' })
+      await reopened.close()
+    } finally {
+      deny = false
+      spy.mockRestore()
+      diagnostic.mockRestore()
+      await manager.close()
+    }
+  })
+
   it('rejects apply in source/demo mode after allowing preparation', async () => {
     const root = await fixtureRoot()
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
