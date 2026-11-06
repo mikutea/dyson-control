@@ -54,4 +54,6 @@ Windows 交互登录使用 Microsoft `node-pty` 的 ConPTY 支持，依赖固定
 
 安装完成后，在自己的主机上实际启动，确认 Bridge 联通、保存和匹配客户端加入。需要外网联机时，再按[连接自己的服务器](networking.md)配置自己的地址。防火墙、端口转发、外网地址和图形版 Steam 登录不会在安装时自动修改。
 
+服务器停止时，在“服务器”页点击“检查启动条件”可以查询受管 Windows 启动任务、相应游戏用户的桌面 Steam 会话及匹配的游戏进程。结果附检查时间；打开 Steam 或调整任务后可以再检查一次。这个操作仅读取当前状态，启动游戏仍由“启动服务器”执行。
+
 参考：[Valve SteamCMD](https://developer.valvesoftware.com/wiki/SteamCMD)、[Valve 账号授权说明](https://partner.steamgames.com/doc/sdk/uploading)、[Nebula 无界面服务器说明](https://github.com/NebulaModTeam/nebula/wiki/Setup-Headless-Server)。

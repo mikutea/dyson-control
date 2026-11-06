@@ -1760,13 +1760,35 @@ describe('Windows adapter fixture behavior', () => {
     expect(reports.indexOf('正在停止服务器')).toBeLessThan(reports.indexOf('正在执行模组配置保存'))
     expect((await adapter.backups()).some((backup) => backup.reason === 'automatic-before-mod-config-write')).toBe(true)
 
-    const changed = (await adapter.modConfigs())[0]!
+    const historyId = String(written.historyId)
+    const preview = await adapter.modConfigRollbackPreview(historyId)
+    const savedBackups = await adapter.backups()
+    const staleSteps: string[] = []
+    await expect(adapter.run('rollback-mod-config', { historyId, expectedRevision: initial.revision },
+      message => staleSteps.push(message), new AbortController().signal)).rejects.toMatchObject({ code: 'MOD_CONFIG_CHANGED' })
+    expect(staleSteps).toEqual([])
+    expect(await adapter.backups()).toEqual(savedBackups)
+
+    // An external editor can also change the file after the first check but before player disconnection.
+    const externalRaw = (await fs.readFile(configPath, 'utf8')).replace('Value = two', 'Value = three')
+    const saveWorker = bridgeSaveWorker(fixture, secret, 'World')
+    await expect(adapter.run('rollback-mod-config', { historyId, expectedRevision: preview.expectedRevision }, message => {
+      staleSteps.push(message)
+      if (message === '正在保存当前游戏进度') writeFileSync(configPath, externalRaw)
+    }, new AbortController().signal)).rejects.toMatchObject({ code: 'MOD_CONFIG_CHANGED' })
+    await saveWorker
+    expect(running).toBe(true)
+    expect(staleSteps).not.toContain('正在停止服务器')
+    expect(await fs.readFile(configPath, 'utf8')).toBe(externalRaw)
+    expect(await adapter.modConfigHistory(initial.id)).toHaveLength(1)
+
+    const freshPreview = await adapter.modConfigRollbackPreview(historyId)
     workers = Promise.all([
       bridgeSaveWorker(fixture, secret, 'World'),
       bridgeStopWorker(fixture, secret, () => { running = false })
     ])
     const rolledBack = await adapter.run('rollback-mod-config', {
-      historyId: String(written.historyId), expectedRevision: changed.revision
+      historyId, expectedRevision: freshPreview.expectedRevision
     }, () => undefined, new AbortController().signal)
     await workers
 

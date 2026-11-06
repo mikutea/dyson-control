@@ -17,7 +17,8 @@ function Definition([object]$Tree, [string]$Name) {
 }
 
 $source = ScriptAst (Join-Path $implementation 'configure-game.ps1')
-foreach ($name in @('Get-FullPath','Get-PlainFile','Assert-StartupSettings','Get-OptionalFileHash','Get-ExistingServerReview','Assert-ExistingHost','Assert-ReviewedReferences','Register-GameStartTask','Restore-GameTaskOnFailure')) {
+. (Join-Path $implementation 'game-task.ps1')
+foreach ($name in @('Get-FullPath','Get-PlainFile','Assert-StartupSettings','Get-OptionalFileHash','Get-ExistingServerReview','Assert-ExistingHost','Assert-ReviewedReferences','Register-GameStartTask','Get-ComparableTaskXml','Restore-GameTaskOnFailure')) {
   . ([scriptblock]::Create((Definition $source $name).Text))
 }
 # Every scheduler, process and identity interaction below is in-memory.
@@ -53,6 +54,7 @@ try {
   $script:tasks[0].TaskPath = '\'
   $failure = ''; try { Register-GameStartTask 'Mock Game' ([pscustomobject]@{}) -RequireNewTask } catch { $failure = $_.Exception.Message }
   Assert ($failure -ceq 'Mock task collision.' -and $script:applied -eq 0) 'Late collision replaced a task.'
+  $script:tasks[0].TaskName = 'Mock Game'
   $failure = ''; try { Restore-GameTaskOnFailure 'Mock Game' '' } catch { $failure = $_.Exception.Message }
   Assert ($failure -like '*retained for manual review*') 'An unverified task was not retained.'
   $original = '<Task><RegistrationInfo><Description>original</Description></RegistrationInfo><Settings><Enabled>true</Enabled></Settings></Task>'
@@ -135,6 +137,7 @@ function Unregister-ScheduledTask { throw 'Unexpected task removal.' }
   $real = $real.Insert($source.ParamBlock.Extent.EndOffset,$osFixture)
   [IO.File]::WriteAllText((Join-Path $root 'configure-game.ps1'),$real,$utf8NoBom)
   [IO.File]::Copy((Join-Path $implementation 'path-policy.ps1'),(Join-Path $root 'path-policy.ps1'),$true)
+  [IO.File]::Copy((Join-Path $implementation 'game-task.ps1'),(Join-Path $root 'game-task.ps1'),$true)
   [IO.File]::WriteAllText((Join-Path $root 'start-game.ps1'),'# unused fixture script',$utf8NoBom)
   function Get-SmbGlobalMapping { return @() }
   $game = Join-Path $root 'game'; $data = Join-Path $root 'control'; $save = Join-Path $root 'custom-saves'

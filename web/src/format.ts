@@ -38,6 +38,7 @@ export const jobStateLabels: Record<JobState, string> = {
   succeeded: '已完成',
   failed: '未完成',
   interrupted: '已中断',
+  cancelled: '已取消',
 }
 
 const backupReasonLabels: Record<string, string> = {

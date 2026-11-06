@@ -92,7 +92,7 @@ export function Shell({ page, session, serverState, onNavigate, onLogout, childr
 function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; onOpen: (open: boolean) => void; onActivity: () => void }) {
   const working = job.state === 'queued' || job.state === 'running'
   const latestStep = job.steps.at(-1)?.message
-  const tone = job.state === 'succeeded' ? 'good' : job.state === 'failed' || job.state === 'interrupted' ? 'bad' : 'warning'
+  const tone = job.state === 'succeeded' ? 'good' : job.state === 'cancelled' ? 'muted' : job.state === 'failed' || job.state === 'interrupted' ? 'bad' : 'warning'
   const summary = useMemo(() => job.state === 'failed' || job.state === 'interrupted'
     ? job.message || jobStateLabels[job.state]
     : formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])

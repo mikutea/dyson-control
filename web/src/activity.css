@@ -26,3 +26,6 @@
   .operation-history-filters { grid-template-columns: minmax(0, 3fr) minmax(0, 2fr); }
   .operation-history-filters .button { justify-self: start; }
 }
+.operation-row-action { padding: 0 1rem .7rem 3.5rem; }
+.operation-cancel-notice { display: flex; align-items: center; gap: .6rem; margin: .7rem 1rem; color: var(--text); font-size: .78rem; }
+.operation-cancelled, .state-cancelled { color: var(--muted); background: var(--surface-soft); }

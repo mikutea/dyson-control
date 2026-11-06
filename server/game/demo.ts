@@ -7,6 +7,7 @@ import type {
 } from '../../shared/contracts.js'
 import { GameAdapterError, invalidInput } from './errors.js'
 import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
+import { modConfigRollbackPreview, prepareModConfigRollback, prepareModConfigWrite, publicModConfig } from './mod-config.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { demoImportArchiveName, importUploadedBackup } from '../backup-import.js'
@@ -122,10 +123,20 @@ export class DemoGameAdapter implements GameAdapter {
   async versionLocks() { return this.#versionLocks.list() }
   async updateHistory(): Promise<UpdateHistoryEntry[]> { return structuredClone(this.#history).reverse() }
   async modConfigs(): Promise<ModConfigFile[]> {
-    return [{ id: 'demo-config', path: 'demo-tools.cfg', bytes: Buffer.byteLength(this.#modConfigContent), modifiedAt: this.#modConfigChangedAt, content: this.#modConfigContent, redactedKeys: [], revision: createHash('sha256').update(this.#modConfigContent).digest('hex') }]
+    return [{ id: 'demo-config', path: 'demo-tools.cfg', bytes: Buffer.byteLength(this.#modConfigContent), modifiedAt: this.#modConfigChangedAt, ...publicModConfig(this.#modConfigContent) }]
   }
   async modConfigHistory(configId?: string): Promise<ModConfigHistoryEntry[]> {
     return this.#modConfigHistory.filter(item => !configId || item.configId === configId).map(({ content: _content, ...item }) => ({ ...item })).reverse()
+  }
+  #modConfigSnapshot(id: unknown) {
+    const entry = this.#modConfigHistory.find(item => item.id === id)
+    if (!entry) throw new GameAdapterError('MOD_CONFIG_HISTORY_NOT_FOUND', 'The selected mod configuration history does not exist.')
+    return entry
+  }
+  async modConfigRollbackPreview(historyId: string) {
+    const current = (await this.modConfigs())[0]!
+    const merged = prepareModConfigRollback(this.#modConfigContent, this.#modConfigSnapshot(historyId).content)
+    return modConfigRollbackPreview(historyId, current, merged)
   }
   async modRemovalHistory(): Promise<ModRemovalHistoryEntry[]> { return this.#removedMods.map(({ mod: _mod, ...entry }) => ({ ...entry })).reverse() }
   async saves(): Promise<Save[]> { return structuredClone(this.#saves) }
@@ -267,10 +278,10 @@ export class DemoGameAdapter implements GameAdapter {
   async #changeModConfig(input: Record<string, unknown>, report: ReportStep, rollback: boolean): Promise<Record<string, unknown>> {
     const current = (await this.modConfigs())[0]!
     if (input.expectedRevision !== current.revision) throw new GameAdapterError('MOD_CONFIG_CHANGED', '配置已变化，请刷新后重试。')
-    const snapshot = rollback ? this.#modConfigHistory.find(item => item.id === input.historyId) : null
-    if ((rollback && !snapshot) || (!rollback && input.configId !== current.id)) invalidInput('The configuration does not exist.')
-    const content = rollback ? snapshot!.content : input.content
-    if (typeof content !== 'string' || Buffer.byteLength(content) > 256 * 1024) invalidInput('The configuration content is invalid.')
+    if (!rollback && input.configId !== current.id) invalidInput('The configuration does not exist.')
+    const content = rollback
+      ? prepareModConfigRollback(this.#modConfigContent, this.#modConfigSnapshot(input.historyId).content)
+      : prepareModConfigWrite(this.#modConfigContent, input.content)
     const historyId = randomUUID()
     this.#modConfigHistory.push({ id: historyId, configId: current.id, path: current.path, createdAt: now(), operation: rollback ? 'rollback' : 'write', bytes: current.bytes, canRollback: true, content: this.#modConfigContent })
     report(rollback ? '正在恢复演示模组配置' : '正在保存演示模组配置')

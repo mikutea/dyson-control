@@ -1,6 +1,7 @@
 param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'path-policy.ps1')
+. (Join-Path $PSScriptRoot 'game-task.ps1')
 $argsObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $checkRecovery = $argsObject.checkRecoveryStart -eq $true
 if ($null -eq $argsObject.gameRoot -or [string]::IsNullOrWhiteSpace([string]$argsObject.gameRoot)) { throw 'gameRoot is required.' }
@@ -85,13 +86,6 @@ if (-not $checkRecovery) {
     # on hosts without the NetAdapter module or when a physical adapter disappears mid-read.
     $networkResult = $null
   }
-}
-
-function Get-ExactTask([object]$NameValue) {
-  if ($null -eq $NameValue) { return $null }
-  $name = [string]$NameValue
-  if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 240 -or $name -match '[*?\[\]]') { return $null }
-  return Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ceq $name } | Select-Object -First 1
 }
 
 function Get-ActionOption([object]$Action, [string]$Name) {
@@ -196,11 +190,10 @@ function Get-RecoveryStartState([object]$Task, [bool]$Managed) {
   } catch { return 'unknown' }
 }
 
-if ($checkRecovery) {
-  $namedTasks = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -ieq $argsObject.startTaskName })
-  if ($namedTasks.Count -ne 1 -or $namedTasks[0].TaskPath -cne '\') { [ordered]@{ state = 'task-unavailable' } | ConvertTo-Json -Compress; return }
-  $startTask = $namedTasks[0]
-} else { $startTask = Get-ExactTask $argsObject.startTaskName }
+$selection = Get-DysonGameTaskSelection $argsObject.startTaskName
+$startTask = $selection.task
+if ($checkRecovery -and $selection.state -ceq 'unavailable') { [ordered]@{ state = 'unknown' } | ConvertTo-Json -Compress; return }
+if ($checkRecovery -and ($null -eq $startTask -or $startTask.TaskPath -cne '\')) { [ordered]@{ state = 'task-unavailable' } | ConvertTo-Json -Compress; return }
 $startManaged = $false
 $configuredTargetUps = $null
 if ($null -ne $startTask -and @($startTask.Actions).Count -eq 1) {
@@ -232,6 +225,7 @@ $result = [ordered]@{
   }
   tasks = [ordered]@{
     start = $null -ne $startTask
+    startIssue = $selection.message
     startManaged = $startManaged
     configuredTargetUps = $configuredTargetUps
   }

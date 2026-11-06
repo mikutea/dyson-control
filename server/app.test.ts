@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
+import fs, { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
@@ -28,6 +28,40 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('authenticates the read-only mod configuration rollback preview and confirms its revision through the job queue', async () => {
+    const fixture = await createFixture()
+    const adapter = new DemoGameAdapter(fixture.config)
+    const app = await buildApp({ config: fixture.config, adapter, databasePath: ':memory:' })
+    try {
+      const cookie = await loginCookie(app)
+      const get = (url: string) => app.inject({ url, headers: { cookie } })
+      const submit = (action: Action, input: Record<string, unknown>) => app.inject({
+        method: 'POST', url: '/api/actions', headers: { cookie }, payload: { requestId: randomUUID(), action, input }
+      })
+      const file = (await get('/api/mod-configs')).json().data[0]
+      const draft = file.content.replace('ShowTips = true', 'ShowTips = false')
+      expect((await submit('write-mod-config', { configId: file.id, content: draft, expectedRevision: file.revision })).statusCode).toBe(202)
+      await waitForJobs(app, cookie, 1)
+      const [entry] = (await get('/api/mod-config-history')).json().data
+      const url = `/api/mod-config-history/${entry.id}/rollback-preview`
+      expect((await app.inject({ url })).statusCode).toBe(401)
+      expect((await get(url + '?unexpected=1')).statusCode).toBe(400)
+      expect((await get('/api/mod-config-history/' + randomUUID() + '/rollback-preview')).statusCode).toBe(404)
+      const response = await get(url)
+      expect(response.statusCode).toBe(200)
+      expect(response.headers['cache-control']).toBe('no-store')
+      const preview = response.json().data
+      expect(preview).toMatchObject({ historyId: entry.id, configId: file.id, changes: [
+        { side: 'current', text: 'ShowTips = false\n' }, { side: 'restored', text: 'ShowTips = true\n' }
+      ] })
+      expect((await get('/api/jobs')).json().data).toHaveLength(1)
+      expect((await get('/api/mod-config-history')).json().data).toEqual([entry])
+      expect((await submit('rollback-mod-config', { historyId: entry.id, expectedRevision: preview.expectedRevision })).statusCode).toBe(202)
+      await waitForJobs(app, cookie, 2)
+      expect((await get('/api/mod-configs')).json().data[0].content).toBe(file.content)
+      expect((await get(url)).json().data.changes).toEqual([])
+    } finally { await app.close() }
+  })
   it('authenticates the single current-job snapshot and keeps a queued submission behind the running job', async () => {
     const f = await createFixture()
     let release!: () => void
@@ -720,6 +754,85 @@ describe('Dyson Control API', () => {
     await app.close()
   })
 
+  it('authenticates cancellation, discards only the bound staged import, and replays the same SQLite receipt after restart', async () => {
+    const fixture = await createFixture()
+    const databasePath = join(fixture.directory, 'cancel-test.sqlite')
+    let release = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let running = false, aborted = false
+    const calls: Action[] = []
+    fixture.adapter.run = async (action, _input, _report, signal) => {
+      calls.push(action)
+      signal.addEventListener('abort', () => { aborted = true }, { once: true })
+      running = true
+      await gate
+      return { action }
+    }
+    let app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath })
+    try {
+      let cookie = await loginCookie(app)
+      const submit = (requestId: string, action: Action, input = {}) => app.inject({ method: 'POST', url: '/api/actions', headers: { cookie }, payload: { requestId, action, input } })
+      const cancel = (id: string, headers = { cookie }) => app.inject({ method: 'POST', url: '/api/jobs/' + id + '/cancel', headers, payload: {} })
+      const active = (await submit('hold-worker', 'save')).json().data as Job
+      await vi.waitFor(() => expect(running).toBe(true))
+      const runningReply = await cancel(active.id)
+      expect(runningReply.statusCode).toBe(409)
+      expect(runningReply.json().error.code).toBe('job_already_running')
+      const headers = { cookie, 'content-type': 'application/zip', 'x-request-id': 'discard-upload' }
+      const bytes = Buffer.from('staged fixture ZIP never used')
+      const imported = (await app.inject({ method: 'POST', url: '/api/backups/import', headers, payload: bytes })).json().data as Job
+      const store = new JobStore(databasePath)
+      const uploadId = String(store.input(imported.id).uploadId)
+      store.close()
+      const uploadDir = join(fixture.config.dataDirectory, 'uploads')
+      const metadata = await readFile(join(uploadDir, uploadId + '.json'))
+      expect(await readFile(join(uploadDir, uploadId + '.zip'))).toEqual(bytes)
+      expect((await submit('wrong-upload-owner', 'import-backup', { uploadId })).statusCode).toBe(409)
+
+      const url = '/api/jobs/' + imported.id + '/cancel'
+      expect((await app.inject({ method: 'POST', url, payload: {} })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'POST', url, headers: { cookie, origin: 'https://foreign.invalid' }, payload: {} })).statusCode).toBe(403)
+      expect((await app.inject({ method: 'POST', url: url + '?extra=1', headers: { cookie }, payload: {} })).statusCode).toBe(400)
+      expect((await app.inject({ method: 'POST', url, headers: { cookie }, payload: { force: true } })).statusCode).toBe(400)
+      const remove = fs.rm.bind(fs)
+      const lock = vi.spyOn(fs, 'rm').mockImplementation(async (file, options) => {
+        if (file === join(uploadDir, uploadId + '.zip')) throw new Error('fixture: ZIP is temporarily locked')
+        await remove(file, options)
+      })
+      try {
+        const pending = await cancel(imported.id)
+        expect(pending.statusCode).toBe(503)
+        expect(pending.json().error.code).toBe('cancelled_upload_cleanup_pending')
+        expect((await app.inject({ method: 'GET', url: '/api/jobs/' + imported.id, headers: { cookie } })).json().data.state).toBe('cancelled')
+        expect(await readFile(join(uploadDir, uploadId + '.json'))).toEqual(metadata)
+      } finally { lock.mockRestore() }
+      const success = await cancel(imported.id)
+      expect(success.statusCode).toBe(200)
+      const receipt = success.json().data as Job
+      expect(receipt).toMatchObject({ id: imported.id, requestId: 'discard-upload', state: 'cancelled', startedAt: null, finishedAt: expect.any(String) })
+      expect((await cancel(imported.id)).json().data).toEqual(receipt)
+      expect((await app.inject({ method: 'POST', url: '/api/backups/import', headers, payload: bytes })).json().data).toEqual(receipt)
+      expect((await submit('discard-upload', 'import-backup', { uploadId })).json().data).toEqual(receipt)
+      await expect(readFile(join(uploadDir, uploadId + '.zip'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(readFile(join(uploadDir, uploadId + '.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+      expect((await app.inject({ method: 'GET', url: '/api/jobs/current', headers: { cookie } })).json().data.id).toBe(active.id)
+      const survivor = (await submit('after-cancel', 'backup')).json().data as Job
+      release()
+      await vi.waitFor(async () => expect((await app.inject({ method: 'GET', url: '/api/jobs/' + survivor.id, headers: { cookie } })).json().data.state).toBe('succeeded'))
+      expect(calls).toEqual(['save','backup']); expect(aborted).toBe(false)
+      await app.close()
+      // Recreate the precise staging residue of a process exit between the DB commit and file cleanup.
+      await writeFile(join(uploadDir, uploadId + '.json'), metadata)
+      await writeFile(join(uploadDir, uploadId + '.zip'), bytes)
+      app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath })
+      cookie = await loginCookie(app)
+      expect((await app.inject({ method: 'GET', url: '/api/jobs?state=cancelled', headers: { cookie } })).json().data).toEqual([receipt])
+      expect((await cancel(imported.id)).json().data).toEqual(receipt)
+      await expect(readFile(join(uploadDir, uploadId + '.zip'))).rejects.toMatchObject({ code: 'ENOENT' })
+      await expect(readFile(join(uploadDir, uploadId + '.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+    } finally { release(); await app.close() }
+  })
+
   it('streams backup uploads into an idempotent durable import job', async () => {
     const fixture = await createFixture()
     const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:' })
@@ -952,6 +1065,27 @@ it('exports every retained raw sample in the requested window, including legacy 
   } finally { await app.close() }
 })
 
+it('checks Windows startup readiness on demand without queuing a game action', async () => {
+  const f = await createFixture()
+  let steamReady = false
+  const probe = vi.fn(async () => steamReady ? 'ready' as const : 'steam-missing' as const)
+  const app = await buildApp({ config: f.config, adapter: { ...f.adapter, source: 'windows', recoveryStartReadiness: probe }, databasePath: ':memory:' })
+  try {
+    const url = '/api/server/start-readiness'
+    expect((await app.inject({ url })).statusCode).toBe(401)
+    const headers = { cookie: await loginCookie(app) }
+    expect((await app.inject({ url: url + '?task=external', headers })).statusCode).toBe(400)
+    expect(probe).not.toHaveBeenCalled()
+    const waiting = await app.inject({ url, headers })
+    expect(waiting.json().data).toMatchObject({ state: 'steam-missing', message: expect.stringContaining('桌面 Steam') })
+    expect(Number.isFinite(Date.parse(waiting.json().data.checkedAt))).toBe(true)
+    steamReady = true
+    expect((await app.inject({ url, headers })).json().data.state).toBe('ready')
+    expect(probe).toHaveBeenCalledTimes(2)
+    expect((await app.inject({ url: '/api/jobs', headers })).json().data).toEqual([])
+  } finally { await app.close() }
+})
+
 async function loginCookie(app: Awaited<ReturnType<typeof buildApp>>): Promise<string> {
   const response = await app.inject({ method: 'POST', url: '/api/session', payload: { password: 'correct horse battery staple' } })
   return firstSetCookie(response.headers['set-cookie'])
@@ -1012,6 +1146,9 @@ async function createFixture(delayMs = 0): Promise<{ directory: string; config: 
     async modInstallPlan() { return [] },
     async modConfigs() { return [] },
     async modConfigHistory() { return [] },
+    async modConfigRollbackPreview(historyId) {
+      return { historyId, configId: 'demo-config', path: 'demo.cfg', expectedRevision: 'a'.repeat(64), preservedSecretKeys: [], changes: [] }
+    },
     async modRemovalHistory() { return [] },
     async versions(): Promise<ComponentVersion[]> { return [] },
     async versionLocks() { return [] },

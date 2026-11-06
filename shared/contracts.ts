@@ -1,6 +1,6 @@
 export type Page = 'overview' | 'players' | 'versions' | 'mods' | 'saves' | 'clients' | 'server' | 'settings' | 'activity' | 'setup'
 export type Action = 'start' | 'save' | 'stop' | 'restart' | 'load-save' | 'backup' | 'verify-backup' | 'set-backup-retained' | 'restore' | 'import-backup' | 'install-update' | 'set-version-lock' | 'set-mod-side' | 'install-mod' | 'rollback-update' | 'toggle-mod' | 'remove-mod' | 'restore-removed-mod' | 'write-mod-config' | 'rollback-mod-config' | 'write-settings' | 'rollback-settings' | 'create-client-package' | 'kick-player' | 'prepare-steamcmd' | 'install-server' | 'prepare-first-world' | 'prepare-existing-server' | 'adopt-existing-server'
-export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted'
+export type JobState = 'queued' | 'running' | 'succeeded' | 'failed' | 'interrupted' | 'cancelled'
 export type ServerState = 'running' | 'stopped' | 'starting' | 'stopping' | 'unknown'
 
 /** Independently signed clock and player roster from the same Bridge process. */
@@ -48,6 +48,10 @@ export interface ModConfigFile {
 }
 export interface ModConfigHistoryEntry {
   id: string; configId: string; path: string; createdAt: string; operation: 'write' | 'rollback'; bytes: number; canRollback: boolean
+}
+export interface ModConfigRollbackPreview {
+  historyId: string; configId: string; path: string; expectedRevision: string; preservedSecretKeys: string[]
+  changes: Array<{ side: 'current' | 'restored'; startLine: number; lineCount: number; text: string }>
 }
 export interface ModRemovalHistoryEntry {
   id: string; modId: string; name: string; version: string; createdAt: string; paths: string[]; canRestore: boolean
@@ -152,6 +156,7 @@ export interface RuntimeStatus {
   recovery: { wantedRunning: boolean; blockedReason: string | null; waitingReason: string | null; attempts: number; nextAttemptAt: string | null }
 }
 export type RecoveryStartReadiness = 'ready' | 'game-present' | 'task-unavailable' | 'steam-missing' | 'steam-other-user' | 'session-ambiguous' | 'unknown'
+export interface StartupReadiness { state: RecoveryStartReadiness; message: string; checkedAt: string }
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
 export interface GameDownload { path: string; fileName: string; contentType: string; verifiedBytes?: Uint8Array }
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
@@ -211,6 +216,7 @@ export interface GameAdapter {
   modInstallPlan(packageName: string, version: string): Promise<ModPlanEntry[]>
   modConfigs(): Promise<ModConfigFile[]>
   modConfigHistory(configId?: string): Promise<ModConfigHistoryEntry[]>
+  modConfigRollbackPreview(historyId: string): Promise<ModConfigRollbackPreview>
   modRemovalHistory(): Promise<ModRemovalHistoryEntry[]>
   versions(): Promise<ComponentVersion[]>
   versionLocks(): Promise<VersionLock[]>
@@ -244,6 +250,7 @@ export interface ControlConfig {
 // GET /api/client-packages/:id compares one generated profile with the current client requirements.
 // GET /api/client-package-plan reads the current packaging blockers and exact eligible mod versions.
 // GET /api/jobs accepts JobHistoryQuery and returns Job[] newest first; before is an exclusive job ID.
+// POST /api/jobs/:id/cancel {} returns the cancelled Job. A job that already started returns 409.
 // GET /api/jobs/current returns one Job or null: running, first queued, then most recently submitted.
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.
 // GET /api/jobs/by-request/:requestId returns the recorded Job, or null if that request has no job yet.

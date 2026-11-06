@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import type {
   Action, Backup, BackupRestorePreview, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameDownload, GameSettings, GameSettingsHistoryEntry,
-  LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
+  LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModConfigRollbackPreview, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
 import { BackupRetention } from './backup-retention.js'
@@ -530,6 +530,11 @@ export class WindowsGameAdapter implements GameAdapter {
     return this.#modConfig.history(configId)
   }
 
+  async modConfigRollbackPreview(historyId: string): Promise<ModConfigRollbackPreview> {
+    await this.#initialization
+    return this.#modConfig.previewRollback(historyId)
+  }
+
   async modRemovalHistory(): Promise<ModRemovalHistoryEntry[]> {
     await this.#initialization
     return this.#modRemoval.history()
@@ -826,9 +831,9 @@ export class WindowsGameAdapter implements GameAdapter {
       await this.#wait(signal)
     }
     if (expectedProcessId === null) {
-      throw new GameAdapterError('GAME_START_TIMEOUT', 'The scheduled task did not start the exact DSP process before the timeout.')
+      throw new GameAdapterError('GAME_START_TIMEOUT', '计划任务已触发，但等待期间没有检测到配置的 DSP 游戏进程。请在服务器页点击“检查启动条件”，核对任务和桌面 Steam 会话。')
     }
-    throw new GameAdapterError('GAME_START_BRIDGE_TIMEOUT', 'DSPGAME.exe started, but its signed Bridge heartbeat did not become ready before the timeout.', {
+    throw new GameAdapterError('GAME_START_BRIDGE_TIMEOUT', 'DSP 游戏进程已启动，但该进程的签名 Bridge 心跳未就绪。请检查游戏日志和已安装的 Bridge 版本。', {
       cause: lastBridgeError ?? undefined
     })
   }
@@ -1714,7 +1719,8 @@ export class WindowsGameAdapter implements GameAdapter {
   async #rollbackModConfig(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     return this.#runModConfigOperation(
       () => this.#modConfig.rollback(input.historyId, input.expectedRevision),
-      'automatic-before-mod-config-rollback', '模组配置回滚', report, signal
+      'automatic-before-mod-config-rollback', '模组配置回滚', report, signal,
+      () => this.#modConfig.checkRollback(input.historyId, input.expectedRevision)
     )
   }
 
@@ -1723,7 +1729,8 @@ export class WindowsGameAdapter implements GameAdapter {
     backupReason: string,
     operationLabel: string,
     report: ReportStep,
-    signal: AbortSignal
+    signal: AbortSignal,
+    checkRollback?: () => Promise<void>
   ): Promise<Record<string, unknown>> {
     const before = await this.#inspect(true)
     const wasRunning = Boolean(before.process)
@@ -1731,12 +1738,15 @@ export class WindowsGameAdapter implements GameAdapter {
     let stoppedForOperation = false
 
     if (wasRunning) {
+      await checkRollback?.()
       await this.#save(report, signal)
       const receipt = this.#lastSaveReceipt
       if (!receipt) throw new GameAdapterError('MOD_CONFIG_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
       await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
+      // A file may also change while saving the world. Reject it while players are still connected.
+      await checkRollback?.()
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true

@@ -17,6 +17,7 @@ import { BackupImport } from './BackupImport'
 import { ModCatalog } from './ModCatalog'
 import { UpdateHistory } from './UpdateHistory'
 import { RuntimeSettingsPanel, RuntimeStatusPanel } from './RuntimePanel'
+import { StartReadinessCheck } from './StartReadinessCheck'
 import { ModConfigEditor } from './ModConfigEditor'
 import { PlayerHistory } from './PlayerHistory'
 import { ModRemovalHistory } from './ModRemovalHistory'
@@ -213,6 +214,7 @@ function ServerPage({ refreshToken, overview: streamedOverview, onOverview, runA
           {running && <Button variant="danger" icon={<Square />} disabled={!overview.capabilities.lifecycle} onClick={() => runAction('stop', {}, { title: '停止服务器？', description: '在线玩家会断开。系统会先保存游戏，然后安全停止服务器。', label: '停止服务器', danger: true })}>停止服务器</Button>}
         </div>
       </Panel>
+      {overview.source === 'windows' && !running && <StartReadinessCheck />}
       <div className="server-facts"><Fact label="运行时间" value={running ? formatDuration(overview.uptimeSeconds) : '—'} icon={<Clock3 />} /><Fact label="进程" value={overview.pid ? '正在运行' : '未运行'} icon={<Power />} /><Fact label="当前存档" value={overview.currentSave || '未识别'} icon={<Database />} /><Fact label="最近保存" value={formatDate(overview.lastSavedAt)} icon={<TimerReset />} /></div>
     </>}
     <RuntimeStatusPanel refreshToken={refreshToken} />

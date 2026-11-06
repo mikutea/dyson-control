@@ -95,6 +95,8 @@ ExpectedSaveDirectory = D:\DysonData\Save
 5. 保留有效的 `dataDirectory\game-startup\settings.json`，或创建 `{schema:1,targetUps:60,saveName:null}`；其父目录的继承只读权限保证后续同目录原子替换不会让 GameUser 丢失读取权。
 6. 注册根路径下 `game.startTaskName` 指定的任务。任务以指定 GameUser 的现有交互式会话运行固定 `start-game.ps1` 和固定 startup settings 路径，运行级别为 `Limited`，没有自动触发器，也不保存登录凭据。
 
-脚本只会更新描述精确为 `DYSON_CONTROL_MANAGED_GAME_START_V1` 的同名任务；任何没有该标记的同名任务都会被拒绝。失败时会尝试恢复原 DLL、配置、任务、startup 文件和 secret ACL，备份证据保留供检查。
+日常手动启动按配置中的任务名检查面板服务可见的 Windows 任务文件夹。只要名称拼写完全一致且只有一个匹配项，已有自定义任务仍可保留在自己的文件夹。多个文件夹同名或只有大小写不同的名称都会使启动不可用。管理员可在任务计划程序中核对名称与文件夹，为面板选择唯一名称。预览也需要读取任务列表的权限。
+
+面板新建和接入的受管任务使用根文件夹。其他文件夹中已有同名任务时，配置预览和应用都会提示冲突。重新配置已有根任务时，脚本要求描述精确为 `DYSON_CONTROL_MANAGED_GAME_START_V1`，并在部署和注册前核对它与备份的定义是否一致。原先没有根任务时采用仅新建注册。失败时尝试恢复原 DLL、配置、startup 文件和 secret ACL；任务定义无法确认时保留现场和备份 XML 供核对。
 
 成功返回中的 `taskStarted` 为 `false`，且 `savesMoved` 为 `false`。随后通过面板启动一次真实游戏，检查新 PID 的签名 heartbeat，再依次完成受保护的真实保存、受控停止、重启恢复和外部 Nebula 客户端加入；准备输出、任务注册或 Bridge 构建本身不构成这些验收。

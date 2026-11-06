@@ -121,6 +121,10 @@ jobs:
         shell: powershell
         run: .\scripts\tests\existing-server.fixture.ps1
 
+      - name: Exercise exact Windows game task selection
+        shell: powershell
+        run: .\scripts\tests\game-task-selection.fixture.ps1
+
       - name: Exercise desktop Steam crash recovery readiness
         shell: powershell
         run: .\scripts\tests\recovery-readiness.fixture.ps1
@@ -170,7 +174,7 @@ jobs:
             'dist/server/index.js', 'dist/server/admin.js', 'dist/web/index.html',
             'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1',
             'scripts/windows/uninstall-control.ps1', 'docs/installation.md',
-            'scripts/windows/configure-game.ps1', 'docs/game-configuration.md',
+            'scripts/windows/configure-game.ps1', 'scripts/windows/game-task.ps1', 'docs/game-configuration.md',
             'docs/images/overview.jpg', 'docs/images/saves.jpg',
             'scripts/windows/remove-install-directory.ps1',
             'release-manifest.json'

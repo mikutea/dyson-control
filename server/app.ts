@@ -14,6 +14,7 @@ import { loadHealthIdentity, MaintenanceGate } from './health.js'
 import { JobQueue, JobStore } from './jobs.js'
 import { RuntimeMonitor, runtimeSettingsSchema } from './runtime.js'
 import { PlayerHistoryStore, playerHistoryQuery } from './player-history.js'
+import { startReadinessMessages } from './game/start-readiness.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
 import { openGameLog } from './game/logs.js'
@@ -232,6 +233,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return data(sessionDto(false, adapter))
   })
 
+  app.get('/api/server/start-readiness', async request => {
+    assertNoQuery(request)
+    if (adapter.source !== 'windows') throw new ApiError(501, 'windows_required', '此检查需要 Windows 游戏实例。')
+    const state = await adapter.recoveryStartReadiness().catch(() => 'unknown' as const)
+    return data({ state, message: startReadinessMessages[state], checkedAt: new Date().toISOString() })
+  })
   app.get('/api/overview', async (request) => {
     assertNoQuery(request)
     const overview = await adapter.overview()
@@ -293,6 +300,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/mod-config-history', async (request) => {
     const { configId } = z.object({ configId: idSchema.optional() }).strict().parse(request.query)
     return data(await adapter.modConfigHistory(configId))
+  })
+  app.get('/api/mod-config-history/:id/rollback-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.modConfigRollbackPreview(id))
   })
   app.get('/api/versions', async (request) => { assertNoQuery(request); return data(await adapter.versions()) })
   app.get('/api/control-version', async (request) => { assertNoQuery(request); return data(healthIdentity) })
@@ -356,7 +368,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/jobs', async request => {
     const query = z.object({
       action: actionSchema.optional(),
-      state: z.enum(['queued', 'running', 'succeeded', 'failed', 'interrupted']).optional(),
+      state: z.enum(['queued', 'running', 'succeeded', 'failed', 'interrupted', 'cancelled']).optional(),
       before: z.string().uuid().optional(),
       limit: z.coerce.number().int().min(1).max(200).optional(),
     }).strict().parse(request.query)
@@ -402,11 +414,34 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const { id } = z.object({ id: idSchema }).strict().parse(request.params)
     return data(store.require(id))
   })
+  app.post('/api/jobs/:id/cancel', async request => {
+    assertNoQuery(request)
+    emptyObjectSchema.parse(request.body === undefined ? {} : request.body)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    const job = queue.cancelQueued(id)
+    if (job.action === 'import-backup') {
+      const { uploadId } = store.input(id)
+      if (typeof uploadId === 'string') {
+        try { await uploads.discardCancelled(uploadId, job.requestId) }
+        catch { throw new ApiError(503, 'cancelled_upload_cleanup_pending', '任务已取消，上传暂存文件待清理。可重试取消，服务启动时也会重新清理。') }
+      }
+    }
+    return data(job)
+  })
 
   app.post('/api/actions', { bodyLimit: 300 * 1024 }, async (request, reply) => {
     assertNoQuery(request)
     const parsed = z.object({ requestId: requestIdSchema, action: actionSchema, input: z.unknown().optional() }).strict().parse(request.body)
     const input = actionInputSchemas[parsed.action].parse(parsed.input ?? {})
+    if (parsed.action === 'import-backup' && !store.findByRequestId(parsed.requestId)) {
+      try {
+        const { metadata } = await uploads.require(input.uploadId as string)
+        if (metadata.requestId !== parsed.requestId) throw new ApiError(409, 'upload_request_mismatch', '该上传已绑定另一项导入请求。')
+      } catch (error) {
+        // Another submission may have completed and removed staging during this read. Replay its durable receipt.
+        if (!store.findByRequestId(parsed.requestId)) throw error
+      }
+    }
     const actionRequest: ActionRequest = { requestId: parsed.requestId, action: parsed.action, input }
     const job = queue.enqueue({ requestId: actionRequest.requestId, action: actionRequest.action, input })
     return reply.code(202).send(data(job))

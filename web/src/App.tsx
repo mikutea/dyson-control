@@ -145,6 +145,7 @@ export default function App() {
         const transition = next.id + '/' + next.state
         if (transition !== lastTransition) {
           lastTransition = transition
+          if (unfinished(next) && pageFromHash() === 'activity') setRefreshToken(value => value + 1)
           checkCurrentJob.current()
         }
       } catch { /* ignore malformed stream event */ }

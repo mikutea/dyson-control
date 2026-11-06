@@ -145,6 +145,29 @@ describe('background runtime monitoring', () => {
     expect(f.monitor.status().alerts.some(alert => alert.code === 'last-operation-failed' && alert.active)).toBe(true)
   })
 
+  it('does not change recovery intent, backup time or alerts when a waiting lifecycle action or backup is cancelled', async () => {
+    const f = await fixture()
+    const cancel = (requestId: string, action: Action, input = {}) => {
+      const job = f.queue.enqueue({ requestId, action, input })
+      return f.queue.cancelQueued(job.id)
+    }
+    const before = f.monitor.status()
+    expect(before.recovery.wantedRunning).toBe(false)
+    for (const action of ['start', 'restart', 'load-save', 'backup'] as const) {
+      expect(cancel('cancel-' + action, action, action === 'backup' ? { automatic: true } : {}).state).toBe('cancelled')
+    }
+    await f.idle()
+    expect(f.monitor.status()).toMatchObject({ lastBackupAt: before.lastBackupAt, recovery: before.recovery, alerts: before.alerts })
+    f.queue.enqueue({ requestId: 'really-start', action: 'start', input: {} })
+    await f.idle()
+    expect(f.monitor.status().recovery.wantedRunning).toBe(true)
+    expect(cancel('cancel-stop', 'stop').state).toBe('cancelled')
+    await f.idle()
+    expect(f.open().status().recovery.wantedRunning).toBe(true)
+    expect(f.monitor.status().alerts.some(alert => alert.active && ['last-operation-failed','backup-failed','recovery-blocked'].includes(alert.code))).toBe(false)
+    expect(f.calls.map(item => item.action)).toEqual(['start'])
+  })
+
   it('pauses recovery after a failed save switch and resumes after a successful explicit load', async () => {
     const f = await fixture()
     await f.monitor.sample()

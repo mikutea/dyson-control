@@ -136,6 +136,18 @@ export class BackupUploadStore {
     ])
   }
 
+  async discardCancelled(uploadId: string, requestId: string): Promise<void> {
+    const metadataPath = this.#metadataPath(uploadId)
+    const contents = await fs.readFile(metadataPath, 'utf8').catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
+    if (contents === null) return
+    const metadata = parseMetadata(JSON.parse(contents))
+    if (metadata.uploadId !== uploadId || metadata.requestId !== requestId) return
+    // Keep metadata until the ZIP is gone so a retry or startup cleanup can finish a partial removal.
+    const archive = this.#archivePath(uploadId)
+    await Promise.all([archive, archive + '.part', metadataPath + '.part'].map(file => fs.rm(file, { force: true })))
+    await fs.rm(metadataPath, { force: true })
+  }
+
   createReadStream(uploadId: string): ReadStream {
     assertUploadId(uploadId)
     return createReadStream(this.#archivePath(uploadId))

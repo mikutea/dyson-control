@@ -7,6 +7,7 @@ import type { EmptyWorldInterval, GameAdapter, Job, RuntimeAlert, RuntimeSample,
 import type { JobQueue, JobStore } from './jobs.js'
 import { ApiError } from './errors.js'
 import { EmptyWorldTracker } from './empty-world.js'
+import { startReadinessMessages } from './game/start-readiness.js'
 
 export const runtimeSettingsSchema = z.object({
   backupEveryMinutes: z.number().int().min(0).max(10_080),
@@ -17,14 +18,6 @@ export const runtimeSettingsSchema = z.object({
 
 const defaults: RuntimeSettings = { backupEveryMinutes: 60, autoRestart: false, minimumFreeDiskGiB: 5, minimumUps: 30 }
 const minute = 60_000
-const recoveryWaitReasons: Record<Exclude<RecoveryStartReadiness, 'ready'>, string> = {
-  'game-present': '检查时发现受管游戏进程，正在等待下一次运行采样。',
-  'task-unavailable': '受管启动任务未就绪，请检查任务是否启用、运行身份及启动配置。',
-  'steam-missing': '等待游戏用户登录 Windows，并在交互会话中打开桌面 Steam。',
-  'steam-other-user': '检测到其他 Windows 用户的 Steam，请在运行游戏的用户会话中打开桌面 Steam。',
-  'session-ambiguous': '游戏用户在多个 Windows 会话中运行 Steam，暂时无法确定启动任务会使用哪个会话。',
-  unknown: '未能确认 Windows 任务或桌面 Steam 会话，请检查面板服务的读取权限。',
-}
 interface State {
   nextBackupAt: number | null; lastBackupAt: number | null; wantedRunning: boolean
   blockedReason: string | null; recoveryAttempts: number[]; nextRecoveryAt: number | null
@@ -306,7 +299,7 @@ export class RuntimeMonitor {
       if (!current()) { this.#recoveryWait = null; this.#stoppedSince = null; return }
       now = this.#clock()
       if (readiness !== 'ready') {
-        this.#recoveryWait = { reason: recoveryWaitReasons[readiness], recheckAt: now + minute }
+        this.#recoveryWait = { reason: startReadinessMessages[readiness], recheckAt: now + minute }
         return
       }
       this.#recoveryWait = null
@@ -324,14 +317,14 @@ export class RuntimeMonitor {
   }
 
   #recordJob(job: Job): void {
-    if (this.#closed) return
+    if (this.#closed || job.state === 'cancelled') return
     this.#jobGeneration++
     this.#recoveryWait = null
     this.#emptyWorld.interrupt('operation', this.#clock())
     this.#stalledSince = null; this.#stalledPid = null
     const automatic = this.jobs.input(job.id).automatic === true
     const now = this.#clock()
-    if (job.state === 'queued' && !automatic) {
+    if (job.state === 'running' && !automatic) {
       if (job.action === 'stop') this.#state.wantedRunning = false
       if (job.action === 'start' || job.action === 'restart' || job.action === 'load-save') this.#state.wantedRunning = true
     }

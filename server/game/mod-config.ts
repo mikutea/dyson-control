@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { ModConfigFile, ModConfigHistoryEntry } from '../../shared/contracts.js'
+import { diff } from 'node:util'
+import type { ModConfigFile, ModConfigHistoryEntry, ModConfigRollbackPreview } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 
 const maximumConfigBytes = 256 * 1024
@@ -142,7 +143,7 @@ function mergeCurrentSecrets(currentContent: string, submittedContent: string): 
     }
   }
   if (!sameSecretSchema(current.secrets, submitted.secrets)) {
-    throw new GameAdapterError('MOD_CONFIG_SECRET_SCHEMA_CHANGED', 'Secret-bearing configuration keys changed and cannot be reconciled safely.')
+    throw new GameAdapterError('MOD_CONFIG_SECRET_SCHEMA_CHANGED', '目标配置的密码或密钥字段与当前配置不同，无法安全保留现有值。')
   }
 
   const available = new Map<string, string[]>()
@@ -181,6 +182,56 @@ function validateConfigText(content: unknown): string {
     throw new GameAdapterError('INVALID_INPUT', 'Mod configuration content must be valid UTF-8 text no larger than 256 KiB.')
   }
   return content
+}
+
+export function publicModConfig(rawContent: string): Pick<ModConfigFile, 'content' | 'revision' | 'redactedKeys'> {
+  const { content, redactedKeys } = parseAndRedact(rawContent)
+  return { content, redactedKeys, revision: digest(content) }
+}
+
+export function prepareModConfigWrite(currentContent: string, draft: unknown): string {
+  return validateConfigText(mergeCurrentSecrets(currentContent, validateConfigText(draft)))
+}
+
+export function prepareModConfigRollback(currentContent: string, snapshot: string): string {
+  // Only the public snapshot is restored. The private values always come from the current file.
+  return validateConfigText(mergeCurrentSecrets(currentContent, parseAndRedact(snapshot).content))
+}
+
+function changedLines(current: string, restored: string): ModConfigRollbackPreview['changes'] {
+  if (current === restored) return []
+  const lines = (text: string) => splitLines(text).map(line => line.body + line.eol)
+  const oldLines = lines(current), newLines = lines(restored)
+  let start = 0, oldEnd = oldLines.length, newEnd = newLines.length
+  while (start < oldEnd && start < newEnd && oldLines[start] === newLines[start]) start++
+  while (oldEnd > start && newEnd > start && oldLines[oldEnd - 1] === newLines[newEnd - 1]) { oldEnd--; newEnd-- }
+  const before = oldLines.slice(start, oldEnd), after = newLines.slice(start, newEnd)
+  const changes: ModConfigRollbackPreview['changes'] = []
+  // A large replacement can make a shortest-edit search quadratic. Show both complete ranges in that case.
+  if (!before.length || !after.length || before.length + after.length > 1024 || before.length * after.length > 131_072) {
+    if (before.length) changes.push({ side: 'current', startLine: start + 1, lineCount: before.length, text: before.join('') })
+    if (after.length) changes.push({ side: 'restored', startLine: start + 1, lineCount: after.length, text: after.join('') })
+    return changes
+  }
+  let oldLine = start + 1, newLine = start + 1
+  for (const [op, text] of diff(before, after)) {
+    if (op === 0) { oldLine++; newLine++; continue }
+    const side = op === 1 ? 'current' : 'restored'
+    const line = op === 1 ? oldLine++ : newLine++
+    const last = changes.at(-1)
+    if (last?.side === side && last.startLine + last.lineCount === line) {
+      last.lineCount++
+      last.text += text
+    } else changes.push({ side, startLine: line, lineCount: 1, text })
+  }
+  return changes
+}
+
+export function modConfigRollbackPreview(historyId: string, current: ModConfigFile, restoredRaw: string): ModConfigRollbackPreview {
+  return {
+    historyId, configId: current.id, path: current.path, expectedRevision: current.revision,
+    preservedSecretKeys: current.redactedKeys, changes: changedLines(current.content, parseAndRedact(restoredRaw).content)
+  }
 }
 
 function validateExpectedRevision(value: unknown): string {
@@ -235,8 +286,7 @@ export class ModConfigManager {
   async write(selectedConfigId: unknown, content: unknown, expectedRevision: unknown): Promise<ModConfigMutationResult> {
     const current = await this.#selectedConfig(selectedConfigId)
     this.#assertRevision(current, validateExpectedRevision(expectedRevision))
-    const submitted = validateConfigText(content)
-    const merged = validateConfigText(mergeCurrentSecrets(current.rawContent, submitted))
+    const merged = prepareModConfigWrite(current.rawContent, content)
     const snapshot = await this.#snapshot(current, 'write')
     await this.#atomicReplace(current.absolutePath, merged, current.rawContent)
     return {
@@ -247,15 +297,27 @@ export class ModConfigManager {
     }
   }
 
-  async rollback(historyId: unknown, expectedRevision: unknown): Promise<ModConfigMutationResult> {
+  async #rollbackTarget(historyId: unknown, expectedRevision?: string) {
     const desired = await this.#selectedHistory(historyId)
     const current = await this.#selectedConfig(desired.manifest.configId)
     if (current.relativePath !== desired.manifest.path) {
       throw new GameAdapterError('MOD_CONFIG_HISTORY_INVALID', 'The selected history entry no longer identifies the same managed configuration file.')
     }
-    this.#assertRevision(current, validateExpectedRevision(expectedRevision))
-    const historicalPublicContent = parseAndRedact(desired.rawContent).content
-    const merged = validateConfigText(mergeCurrentSecrets(current.rawContent, historicalPublicContent))
+    if (expectedRevision !== undefined) this.#assertRevision(current, expectedRevision)
+    return { current, merged: prepareModConfigRollback(current.rawContent, desired.rawContent) }
+  }
+
+  async previewRollback(historyId: string): Promise<ModConfigRollbackPreview> {
+    const { current, merged } = await this.#rollbackTarget(historyId)
+    return modConfigRollbackPreview(historyId, current.dto, merged)
+  }
+
+  async checkRollback(historyId: unknown, expectedRevision: unknown): Promise<void> {
+    await this.#rollbackTarget(historyId, validateExpectedRevision(expectedRevision))
+  }
+
+  async rollback(historyId: unknown, expectedRevision: unknown): Promise<ModConfigMutationResult> {
+    const { current, merged } = await this.#rollbackTarget(historyId, validateExpectedRevision(expectedRevision))
     const snapshot = await this.#snapshot(current, 'rollback')
     await this.#atomicReplace(current.absolutePath, merged, current.rawContent)
     return {
@@ -273,13 +335,13 @@ export class ModConfigManager {
       throw new GameAdapterError('MOD_CONFIG_HISTORY_INVALID', 'The recovery history no longer identifies the same managed configuration file.')
     }
     this.#assertRevision(current, validateExpectedRevision(expectedRevision))
-    const recovered = validateConfigText(mergeCurrentSecrets(current.rawContent, parseAndRedact(desired.rawContent).content))
+    const recovered = prepareModConfigRollback(current.rawContent, desired.rawContent)
     await this.#atomicReplace(current.absolutePath, recovered, current.rawContent)
   }
 
   #assertRevision(current: ManagedConfig, expectedRevision: string): void {
     if (current.dto.revision !== expectedRevision) {
-      throw new GameAdapterError('MOD_CONFIG_CHANGED', 'The configuration changed after it was loaded. Refresh it and try again.')
+      throw new GameAdapterError('MOD_CONFIG_CHANGED', '服务器上的配置已变化，请重新载入并检查差异。')
     }
   }
 
@@ -345,7 +407,6 @@ export class ModConfigManager {
       throw new GameAdapterError('MOD_CONFIG_CHANGED', 'A managed configuration changed while it was being read.')
     }
     const rawContent = decodeUtf8(bytes)
-    const parsed = parseAndRedact(rawContent)
     const id = configId(relativePath)
     return {
       absolutePath,
@@ -356,9 +417,7 @@ export class ModConfigManager {
         path: relativePath,
         bytes: bytes.length,
         modifiedAt: after.mtime.toISOString(),
-        content: parsed.content,
-        redactedKeys: parsed.redactedKeys,
-        revision: digest(parsed.content)
+        ...publicModConfig(rawContent)
       }
     }
   }
