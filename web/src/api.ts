@@ -3,7 +3,7 @@ import type { ApiErrorBody, Job } from '../../shared/contracts'
 type Envelope<T> = { data: T }
 
 export class ApiError extends Error {
-  constructor(message: string, readonly status: number) {
+  constructor(message: string, readonly status: number, readonly code?: string) {
     super(message)
     this.name = 'ApiError'
   }
@@ -77,7 +77,7 @@ export function uploadBackup(file: File, requestId: string, signal: AbortSignal,
       try {
         const body = JSON.parse(request.responseText) as Envelope<Job> & Partial<ApiErrorBody>
         if (request.status === 401) window.dispatchEvent(new CustomEvent('dyson-auth-required'))
-        if (request.status < 200 || request.status >= 300) throw new ApiError(body.error?.message || `上传失败（${request.status}）`, request.status)
+        if (request.status < 200 || request.status >= 300) throw new ApiError(body.error?.message || `上传失败（${request.status}）`, request.status, body.error?.code)
         if (!body.data?.id) throw new Error('未收到导入任务，请重试确认结果。')
         resolve(body.data)
       } catch (error) { reject(error) }

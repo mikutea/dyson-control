@@ -90,13 +90,15 @@ async function submitWithReceipt(action: Action, requestId: string, send: () => 
     forget(action, requestId)
     return { job, recovered: false }
   } catch (error) {
-    if (!prior && error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
+    const uploading = action === 'import-backup' && error instanceof ApiError && error.code === 'upload_in_progress'
+    if (!prior && !uploading && error instanceof ApiError && error.status >= 400 && error.status < 500 && error.status !== 408) {
       forget(action, requestId)
       throw error
     }
     if (signal?.aborted && signal.reason === 'page-left') throw error
     const recorded = await lookup(action, requestId).catch(() => null)
     if (recorded) return { job: recorded, recovered: true }
+    if (uploading) throw new Error('服务端仍在接收同一请求的文件，请稍后核对回执。', { cause: error })
     if (signal?.aborted) throw new Error('已停止发送文件，尚未确认导入任务。可在连接恢复后核对回执。', { cause: error })
     throw new Error(action === 'import-backup' ? '上传结果尚未确认。可核对回执，或用当前文件重试。' :
       '尚未确认服务端是否已接收操作。恢复连接后可核对回执，或从原入口使用同一编号重试。', { cause: error })
