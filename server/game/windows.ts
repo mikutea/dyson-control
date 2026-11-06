@@ -23,12 +23,12 @@ import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, displayModName, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
 import { assertSettingsRollback, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
 import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, timestampId } from './system.js'
-import { GameUpdateManager } from './updates.js'
+import { GameUpdateManager, installedPackageName, packageIdentityFromVersionedReference } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
 import { SteamGameUpdateBackend } from './steam-update.js'
 import { steamExecutable } from '../steam-auth.js'
@@ -42,7 +42,14 @@ interface InspectResult {
   network?: HostNetworkCounterSample | null
 }
 
-interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
+interface ModRecord { dto: Mod; location: string; directory: string | null; packageIdentity: string | null; dependencies: string[] }
+
+function uniqueMod(records: ModRecord[], id: unknown): ModRecord | undefined {
+  const matches = records.filter(record => record.dto.id === id)
+  if (matches.length > 1) throw new GameAdapterError('MOD_INSTALL_CONFLICT',
+    `${displayModName(matches[0]!.dto.name)} 有多个安装位置，请先核对目录：${matches.map(record => record.location).join('、')}`)
+  return matches[0]
+}
 interface StoredSettings { schema: 1; serverName: string; backupKeep: number; address: string }
 interface StartupSettings { schema: 1; targetUps: number; saveName: string | null }
 interface SettingsFile { bytes: Buffer; sha256: string }
@@ -106,10 +113,6 @@ function saveNameFromId(id: string): string {
 }
 function validSaveName(name: string): boolean {
   return name.length > 0 && name.length <= 120 && name !== '.' && name !== '..' && !/[\\/:*?"<>|\u0000-\u001f]/u.test(name)
-}
-function packageIdentityFromVersionedReference(reference: string): string | null {
-  const match = /^(.+)-(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:[-+][A-Za-z0-9.-]+)?$/.exec(reference.trim())
-  return match?.[1] ?? null
 }
 function dependencyPackageIdentity(reference: string): string | null {
   return packageIdentityFromVersionedReference(reference)?.toLowerCase() ?? null
@@ -424,13 +427,13 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async versions(): Promise<ComponentVersion[]> {
-    const inspected = await this.#inspect()
+    const [inspected, records] = await Promise.all([this.#inspect(), this.#scanMods()])
     const [runtime, nebula, bepinex] = await Promise.all([
       inspected.process
         ? readBridgeVersions(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, inspected.process.pid).catch(() => null)
         : Promise.resolve(null),
-      this.#installedComponentPackageVersion('nebula'),
-      this.#installedComponentPackageVersion('bepinex')
+      this.#installedComponentPackageVersion('nebula', records),
+      this.#installedComponentPackageVersion('bepinex', records)
     ])
     const versions = await this.#updates.versions({
       game: runtime?.game ?? 'unknown',
@@ -445,12 +448,16 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async versionLocks() { return this.#versionLocks.list() }
 
-  async #installedComponentPackageVersion(component: 'nebula' | 'bepinex'): Promise<string | null> {
+  async #installedComponentPackageVersion(component: 'nebula' | 'bepinex', records: ModRecord[]): Promise<string | null> {
     const packageId = componentPackageIds[component]
+    const matches = records.filter(record => record.packageIdentity === packageId.toLowerCase())
+    if (matches.length > 1) {
+      const active = matches.filter(record => record.dto.enabled)
+      return active.length === 1 && active[0]!.dto.version !== 'unknown' ? active[0]!.dto.version : null
+    }
     const recorded = await this.#updates.installedPackageVersion(packageId)
     if (recorded) return recorded
-    const installed = (await this.#scanMods()).find(record =>
-      record.dto.enabled && record.packageIdentity?.toLowerCase() === packageId.toLowerCase())
+    const installed = matches.find(record => record.dto.enabled)
     return installed && installed.dto.version !== 'unknown' ? installed.dto.version : null
   }
 
@@ -462,13 +469,15 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!['game', 'nebula', 'bepinex'].includes(String(input.component))) invalidInput('Unknown component.')
       const component = input.component as 'game' | 'nebula' | 'bepinex'
       packageId = component === 'game' ? GAME_VERSION_LOCK_ID : component === 'nebula' ? 'nebula-NebulaMultiplayerMod' : 'xiaoye97-BepInEx'
+      const records = component === 'game' ? [] : await this.#scanMods()
+      if (component !== 'game') uniqueMod(records, modId(packageId))
       if (input.locked) {
         currentVersion = component === 'game'
           ? await this.#steamUpdates?.currentBuild() ?? null
-          : await this.#installedComponentPackageVersion(component)
+          : await this.#installedComponentPackageVersion(component, records)
       }
     } else {
-      const record = (await this.#scanMods()).find(item => item.dto.id === input.modId)
+      const record = uniqueMod(await this.#scanMods(), input.modId)
       if (!record?.packageIdentity) throw new GameAdapterError('MOD_NOT_FOUND', 'A known installed package is required to lock its version.')
       packageId = record.packageIdentity
       currentVersion = record.dto.version
@@ -569,7 +578,24 @@ export class WindowsGameAdapter implements GameAdapter {
     return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
   }
 
-  async mods(): Promise<Mod[]> { return this.#modSides.apply((await this.#scanMods()).map((record) => record.dto)) }
+  async mods(): Promise<Mod[]> {
+    const groups = new Map<string, ModRecord[]>()
+    for (const record of await this.#scanMods()) {
+      const group = groups.get(record.dto.id)
+      if (group) group.push(record)
+      else groups.set(record.dto.id, [record])
+    }
+    const mods = Array.from(groups.values(), (group, index) => {
+      const first = group[0]!.dto
+      if (group.length === 1) return first
+      const active = group.filter(record => record.dto.enabled)
+      const effective = active.length === 1 ? active[0]!.dto : null
+      return { ...(effective ?? first), name: displayModName((effective ?? first).name, index), enabled: active.length > 0, version: effective?.version ?? 'unknown',
+        required: group.some(record => record.dto.required), description: '',
+        installations: group.map(({ dto, location }) => ({ path: location, version: dto.version, enabled: dto.enabled })) }
+    })
+    return this.#modSides.apply(mods)
+  }
 
   async modCatalog(search: string): Promise<ModCatalogEntry[]> {
     await this.#initialization
@@ -1183,11 +1209,11 @@ export class WindowsGameAdapter implements GameAdapter {
     const enabledRoot = path.join(this.#config.game.root, 'BepInEx', 'plugins')
     const disabledRoot = path.join(this.#config.game.root, 'BepInEx', 'disabled-plugins')
     const results: ModRecord[] = []
-    const seen = new Set<string>()
     for (const [root, enabled] of [[enabledRoot, true], [disabledRoot, false]] as const) {
       const entries = await fs.readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? [] : Promise.reject(error))
       for (const entry of entries) {
         if (entry.name.startsWith('.')) continue
+        const location = `BepInEx/${enabled ? 'plugins' : 'disabled-plugins'}/${entry.name}`
         if (entry.isDirectory()) {
           const directory = ensureInside(root, path.join(root, entry.name))
           const manifestPath = path.join(directory, 'manifest.json')
@@ -1200,58 +1226,45 @@ export class WindowsGameAdapter implements GameAdapter {
             const exactBridge = dlls.some(candidate => candidate.name.toLowerCase() === 'dysoncontrolbridge.dll')
             const name = exactBridge ? 'DysonControlBridge' : entry.name
             const id = modId(name)
-            if (seen.has(id)) continue
-            seen.add(id)
             results.push({
               dto: { id, name, version: 'unknown', enabled, required: true, description: 'Unmanaged plugin directory without package metadata; package changes are unavailable.', side: 'unknown' },
-              directory: null,
+              location, directory: null,
               packageIdentity: null,
               dependencies: []
             })
             continue
           }
           const rawVersion = typeof manifest.version_number === 'string' ? manifest.version_number : /-(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)$/.exec(entry.name)?.[1] ?? 'unknown'
-          const rawName = typeof manifest.name === 'string' ? manifest.name : entry.name.replace(/-\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/, '')
-          const author = typeof manifest.author_name === 'string' ? manifest.author_name : ''
-          const directoryIdentity = packageIdentityFromVersionedReference(entry.name)
-          const importName = author && !rawName.startsWith(`${author}-`)
-            ? `${author}-${rawName}`
-            : entry.name === rawName || entry.name.endsWith(`-${rawName}`) ? entry.name
-              : directoryIdentity?.endsWith(`-${rawName}`) ? directoryIdentity : rawName
+          const importName = installedPackageName(entry.name, manifest)
           const id = modId(importName)
-          if (seen.has(id)) continue
-          seen.add(id)
           const serverOnly = importName.toLowerCase() === 'dysoncontrolbridge'
           const dependencies = Array.isArray(manifest.dependencies)
             ? manifest.dependencies.filter((value): value is string => typeof value === 'string').map(dependencyPackageIdentity).filter((value): value is string => value !== null)
             : []
           results.push({
             dto: { id, name: importName, version: rawVersion, enabled, required: serverOnly || requiredModPattern.test(importName), description: typeof manifest.description === 'string' ? manifest.description.slice(0, 500) : '', side: 'unknown' },
-            directory,
+            location, directory,
             packageIdentity: importName.toLowerCase(),
             dependencies
           })
         } else if (enabled && entry.isFile() && entry.name.toLowerCase().endsWith('.dll')) {
           const name = path.basename(entry.name, path.extname(entry.name))
           const id = modId(name)
-          if (!seen.has(id)) {
-            seen.add(id)
-            results.push({
-              dto: { id, name, version: 'unknown', enabled: true, required: true, description: 'Standalone plugin; package toggle is unavailable.', side: 'unknown' },
-              directory: null, packageIdentity: null, dependencies: []
-            })
-          }
+          results.push({
+            dto: { id, name, version: 'unknown', enabled: true, required: true, description: 'Standalone plugin; package toggle is unavailable.', side: 'unknown' },
+            location, directory: null, packageIdentity: null, dependencies: []
+          })
         }
       }
     }
-    return results.sort((left, right) => left.dto.name.localeCompare(right.dto.name))
+    return results.sort((left, right) => left.dto.name.localeCompare(right.dto.name) || left.location.localeCompare(right.location))
   }
 
   async #toggleMod(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.modId !== 'string' || typeof input.enabled !== 'boolean') invalidInput('modId and enabled are required.')
     const enabled = input.enabled
     const records = await this.#scanMods()
-    const record = records.find((item) => item.dto.id === input.modId)
+    const record = uniqueMod(records, input.modId)
     if (!record) invalidInput('The selected mod does not exist.')
     if (record.dto.required && !enabled) throw new GameAdapterError('REQUIRED_MOD', `${record.dto.name} is required and cannot be disabled.`)
     if (record.dto.enabled === enabled) return { modId: record.dto.id, enabled: record.dto.enabled, unchanged: true }
@@ -1278,7 +1291,7 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async #setModSide(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (typeof input.modId !== 'string') invalidInput('modId is required.')
-    const mod = (await this.mods()).find(item => item.id === input.modId)
+    const mod = uniqueMod(await this.#scanMods(), input.modId)?.dto
     if (!mod) throw new GameAdapterError('MOD_NOT_FOUND', 'The selected mod does not exist.')
     await this.#modSides.set(mod, input.expectedVersion, input.side)
     return { modId: mod.id, version: mod.version, side: input.side }
@@ -1306,7 +1319,7 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #moveModPackage(modIdValue: string, fromEnabled: boolean, toEnabled: boolean, report: ReportStep): Promise<Record<string, unknown>> {
-    const record = (await this.#scanMods()).find(item => item.dto.id === modIdValue)
+    const record = uniqueMod(await this.#scanMods(), modIdValue)
     if (!record || record.dto.enabled !== fromEnabled) throw new GameAdapterError('MOD_CHANGED', 'The selected mod changed before its files could be moved.')
     const paths = await this.#validateModTogglePaths(record, toEnabled)
     await fs.mkdir(path.dirname(paths.destination), { recursive: true })
@@ -1471,10 +1484,13 @@ export class WindowsGameAdapter implements GameAdapter {
   async #installThunderstorePackage(
     packageName: string, version: string | undefined, component: 'nebula' | 'bepinex' | 'mod', report: ReportStep, signal: AbortSignal
   ): Promise<Record<string, unknown>> {
+    uniqueMod(await this.#scanMods(), modId(packageName))
     const plan = await this.#updates.resolvePackagePlan(packageName, version, signal)
     const versions = plan.map(item => ({ package: item.packageFullName, version: item.version }))
     await this.#versionLocks.assertPlan(versions)
     return this.#updates.withPreparedPackages(plan, component, report, signal, async prepared => {
+      const records = await this.#scanMods()
+      for (const item of plan) uniqueMod(records, modId(item.packageFullName))
       await this.#versionLocks.assertPlan(versions)
       signal.throwIfAborted()
       return this.#runOfflinePackageOperation(
@@ -1489,6 +1505,11 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async #rollbackUpdate(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     const historyId = safeId(input.historyId, 'historyId')
+    const history = (await this.#updates.updateHistory()).find(entry => entry.id === historyId)
+    if (history?.packages.length) {
+      const records = await this.#scanMods()
+      for (const item of history.packages) uniqueMod(records, modId(item.package))
+    }
     return this.#runOfflinePackageOperation(
       () => this.#updates.rollbackUpdate(historyId, report, signal),
       'automatic-before-update-rollback', '更新回滚', report, signal
@@ -1649,7 +1670,7 @@ export class WindowsGameAdapter implements GameAdapter {
       invalidInput('modId and expectedVersion are required.')
     }
     const records = await this.#scanMods()
-    const record = records.find(item => item.dto.id === input.modId)
+    const record = uniqueMod(records, input.modId)
     if (!record) throw new GameAdapterError('MOD_NOT_FOUND', 'The selected mod does not exist.')
     if (record.dto.version !== input.expectedVersion) {
       throw new GameAdapterError('MOD_VERSION_CHANGED', 'The installed mod version changed after it was loaded. Refresh it and try again.')
@@ -1689,9 +1710,14 @@ export class WindowsGameAdapter implements GameAdapter {
     const selected = (await this.#modRemoval.history()).find(entry => entry.id === historyId)
     if (!selected) throw new GameAdapterError('MOD_REMOVAL_HISTORY_NOT_FOUND', 'The selected mod removal history entry does not exist.')
     if (!selected.canRestore) throw new GameAdapterError('MOD_REMOVAL_DESTINATION_EXISTS', 'The removed mod cannot be restored because its destination is occupied or its recovery copy is invalid.')
+    const checkDestination = async () => {
+      if (uniqueMod(await this.#scanMods(), selected.modId)) throw new GameAdapterError('MOD_INSTALL_CONFLICT',
+        `${displayModName(selected.name)} 已安装在另一个位置，请先核对模组目录。`)
+    }
+    await checkDestination()
     if (/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/.test(selected.name)) await this.#versionLocks.assertPlan([{ package: selected.name, version: selected.version }])
     return this.#runModRemovalOperation(
-      () => this.#modRemoval.restore(historyId),
+      async () => { await checkDestination(); return this.#modRemoval.restore(historyId) },
       result => this.#modRemoval.recoverRestore(result.historyId),
       'automatic-before-mod-restore', '模组恢复', report, signal
     )

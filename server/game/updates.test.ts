@@ -88,6 +88,28 @@ function fixtureFetch(packages: ReturnType<typeof packageFixture>[]): typeof fet
   }) as typeof fetch
 }
 
+it('detects duplicate dependency targets before the prepared callback can stop the game', async () => {
+  const roots = await fixtureRoot()
+  const shared = packageFixture({ owner: 'libs', name: 'Shared', version: '1.0.0' })
+  const feature = packageFixture({ owner: 'mods', name: 'Feature', version: '1.0.0', dependencies: ['libs-Shared-1.0.0'] })
+  for (const location of ['plugins/primary', 'disabled-plugins/alternate']) {
+    const folder = path.join(roots.game, 'BepInEx', location)
+    await fs.mkdir(folder, { recursive: true })
+    await fs.writeFile(path.join(folder, 'manifest.json'), JSON.stringify({ name: 'SHARED', version_number: '0.9.0' }))
+  }
+  const manager = new GameUpdateManager({ gameRoot: roots.game, workDirectory: roots.work, backupDirectory: roots.backups,
+    catalogUrl: 'https://catalog.test/packages', isGameRunning: async () => true, fetch: fixtureFetch([shared, feature]) })
+  const signal = new AbortController().signal
+  const plan = await manager.resolvePackagePlan('mods-Feature', '1.0.0', signal)
+  let enteredMaintenance = false
+  await expect(manager.withPreparedPackages(plan, 'mod', () => {}, signal, async () => { enteredMaintenance = true }))
+    .rejects.toMatchObject({ code: 'PACKAGE_INSTALL_CONFLICT' })
+  expect(enteredMaintenance).toBe(false)
+  expect(await fs.readdir(roots.work)).toEqual([])
+  await fs.rename(path.join(roots.game, 'BepInEx/disabled-plugins/alternate'), path.join(roots.game, 'BepInEx/disabled-plugins/another-Shared-0.9.0'))
+  await expect(manager.withPreparedPackages(plan, 'mod', () => {}, signal, async () => 'ready')).resolves.toBe('ready')
+})
+
 it('shows the exact transitive package and lock versions while the game is running without downloading archives', async () => {
   const roots = await fixtureRoot()
   const dependency = packageFixture({ owner: 'libs', name: 'Shared', version: '2.0.0' })

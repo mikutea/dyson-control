@@ -9,6 +9,20 @@ import type { VersionLockStore } from './version-locks.js'
 
 export const THUNDERSTORE_DSP_CATALOG_URL = 'https://thunderstore.io/c/dyson-sphere-program/api/v1/package/'
 
+export function packageIdentityFromVersionedReference(reference: string): string | null {
+  return /^(.+)-(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:[-+][A-Za-z0-9.-]+)?$/.exec(reference.trim())?.[1] ?? null
+}
+
+export function installedPackageName(folder: string, manifest: Record<string, unknown>): string {
+  const folderPackage = packageIdentityFromVersionedReference(folder)
+  const name = typeof manifest.name === 'string' ? manifest.name : folder.replace(/-\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/, '')
+  const author = typeof manifest.author_name === 'string' ? manifest.author_name : ''
+  if (author) return name.toLowerCase().startsWith(author.toLowerCase() + '-') ? name : `${author}-${name}`
+  const suffix = '-' + name.toLowerCase()
+  if (folder.toLowerCase().endsWith(suffix)) return folder
+  return folderPackage?.toLowerCase().endsWith(suffix) ? folderPackage : name
+}
+
 const defaultPackages = {
   nebula: 'nebula-NebulaMultiplayerMod',
   bepinex: 'xiaoye97-BepInEx'
@@ -1158,6 +1172,7 @@ export class GameUpdateManager {
         prepared.push({ item, sha256: digest, files: await this.#packageFiles(item, extracted, files) })
       }
       signal.throwIfAborted()
+      for (const item of plan) await this.#installedPluginTarget(item)
       report('所有包及依赖均已下载并校验，准备进入离线安装')
       signal.throwIfAborted()
       return await use({ component, package: root.packageFullName, version: root.version, install: async () => {
@@ -1754,8 +1769,9 @@ export class GameUpdateManager {
         const directory = path.join(root, entry.name)
         try {
           const manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(path.join(directory, 'manifest.json')))) as Record<string, unknown>
-          const author = typeof manifest.author_name === 'string' ? manifest.author_name : null
-          if (manifest.name === item.packageName && (author === null || author.toLowerCase() === item.owner.toLowerCase())) matches.push(directory)
+          if (typeof manifest.name !== 'string') continue
+          const identity = installedPackageName(entry.name, manifest).toLowerCase()
+          if (identity === item.packageFullName.toLowerCase() || identity === item.packageName.toLowerCase()) matches.push(directory)
         } catch { /* An unrelated or incomplete package is not an update target. */ }
       }
     }

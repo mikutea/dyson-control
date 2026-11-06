@@ -134,6 +134,16 @@ function VersionsPage({ refreshToken, runAction }: PagesProps) {
     </Panel><UpdateHistory refreshToken={refreshToken} runAction={runAction} /></>
 }
 
+function ConflictingMod({ mod }: { mod: Mod }) {
+  return <article className="mod-install-conflict"><div className="mod-status"><Box /></div><div className="mod-copy">
+    <h2>{mod.name}</h2>
+    <p>同一模组有多个安装位置。请核对目录，保留一个安装位置后再更改此模组。</p>
+    <ul aria-label={`${mod.name} 安装位置`}>{mod.installations?.map(item => <li key={item.path}>
+      <code>{item.path}</code><span>{item.enabled ? '已启用' : '已停用'} · 版本 {item.version}</span>
+    </li>)}</ul>
+  </div></article>
+}
+
 function ModsPage({ refreshToken, runAction }: PagesProps) {
   const mods = useResource<Mod[]>('/mods', refreshToken)
   const locks = useResource<VersionLock[]>('/version-locks', refreshToken)
@@ -144,7 +154,7 @@ function ModsPage({ refreshToken, runAction }: PagesProps) {
     {tab === 'removed' ? <ModRemovalHistory refreshToken={refreshToken} runAction={runAction} /> : tab === 'catalog' ? <Panel><ModCatalog refreshToken={refreshToken} runAction={runAction} /></Panel> : tab === 'config' ? <ModConfigEditor refreshToken={refreshToken} runAction={runAction} /> : <>
     <div className="mod-scope segmented" aria-label="模组范围">{([['all', '全部'], ['unknown', '待确认'], ['both', '双方'], ['server', '服务器'], ['client', '客户端']] as const).map(([value, label]) => <button key={value} className={scope === value ? 'selected' : ''} onClick={() => setScope(value)}>{label}</button>)}</div>
     <Panel className="table-panel">
-      {mods.loading && !mods.data ? <LoadingBlock rows={6} /> : mods.error && !mods.data ? <ErrorBlock message={mods.error} retry={mods.reload} /> : !visible.length ? <EmptyBlock title="没有符合条件的模组" description="切换范围查看其他模组" /> : <div className="mod-list">{visible.map((mod) => <article key={mod.id}><div className="mod-status"><Box /></div><div className="mod-copy"><div><h2>{mod.name}</h2>{mod.required && <span className="required-label">必需</span>}</div><p>{mod.description}</p><span>版本 {mod.version} · {sideLabel(mod.side)}</span><ModSideControl mod={mod} runAction={runAction} />{mod.updateVersion && <small>可更新至 {mod.updateVersion}</small>}</div><div className="mod-actions">{/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/.test(mod.name) && <VersionLockButton packageId={mod.name} modId={mod.id} currentVersion={mod.version} locks={locks.error ? null : locks.data} runAction={runAction} />}{!mod.required && <Button variant="quiet" onClick={() => runAction('remove-mod', { modId: mod.id, expectedVersion: mod.version }, { title: `移除 ${mod.name}？`, description: '系统会保存模组恢复副本并保留配置。游戏运行中会先保存、备份和停服，移除后重新启动；其他模组依赖它时将停止操作。', label: '移除模组', danger: true })}>移除</Button>}<label className="switch"><input aria-label={`启用 ${mod.name}`} type="checkbox" checked={mod.enabled} disabled={mod.required} onChange={(event) => runAction('toggle-mod', { modId: mod.id, enabled: event.target.checked }, { title: `${event.target.checked ? '启用' : '停用'} ${mod.name}？`, description: '游戏运行中会先保存、备份并停服，变更后重新启动。若启动失败，会恢复原状态。请确认玩家使用相同的模组组合。', label: event.target.checked ? '启用模组' : '停用模组' })} /><span /></label></div></article>)}</div>}
+      {mods.loading && !mods.data ? <LoadingBlock rows={6} /> : mods.error && !mods.data ? <ErrorBlock message={mods.error} retry={mods.reload} /> : !visible.length ? <EmptyBlock title="没有符合条件的模组" description="切换范围查看其他模组" /> : <div className="mod-list">{visible.map((mod) => mod.installations ? <ConflictingMod key={mod.id} mod={mod} /> : <article key={mod.id}><div className="mod-status"><Box /></div><div className="mod-copy"><div><h2>{mod.name}</h2>{mod.required && <span className="required-label">必需</span>}</div><p>{mod.description}</p><span>版本 {mod.version} · {sideLabel(mod.side)}</span><ModSideControl mod={mod} runAction={runAction} />{mod.updateVersion && <small>可更新至 {mod.updateVersion}</small>}</div><div className="mod-actions">{/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/.test(mod.name) && <VersionLockButton packageId={mod.name} modId={mod.id} currentVersion={mod.version} locks={locks.error ? null : locks.data} runAction={runAction} />}{!mod.required && <Button variant="quiet" onClick={() => runAction('remove-mod', { modId: mod.id, expectedVersion: mod.version }, { title: `移除 ${mod.name}？`, description: '系统会保存模组恢复副本并保留配置。游戏运行中会先保存、备份和停服，移除后重新启动；其他模组依赖它时将停止操作。', label: '移除模组', danger: true })}>移除</Button>}<label className="switch"><input aria-label={`启用 ${mod.name}`} type="checkbox" checked={mod.enabled} disabled={mod.required} onChange={(event) => runAction('toggle-mod', { modId: mod.id, enabled: event.target.checked }, { title: `${event.target.checked ? '启用' : '停用'} ${mod.name}？`, description: '游戏运行中会先保存、备份并停服，变更后重新启动。若启动失败，会恢复原状态。请确认玩家使用相同的模组组合。', label: event.target.checked ? '启用模组' : '停用模组' })} /><span /></label></div></article>)}</div>}
     </Panel></>}</>
 }
 

@@ -35,7 +35,12 @@ export interface PlayerHistory {
 export interface PlayerHistoryFilter { type?: PlayerHistoryEntry['type']; name?: string; cursor?: string }
 export interface LogEntry { id: string; time: string | null; level: 'info' | 'warning' | 'error'; message: string }
 export type ModSide = 'both' | 'server' | 'client' | 'unknown'
-export interface Mod { id: string; name: string; version: string; enabled: boolean; required: boolean; description: string; side: ModSide; sideSource?: 'builtin' | 'administrator' | 'unverified'; updateVersion?: string }
+export interface Mod {
+  id: string; name: string; version: string; enabled: boolean; required: boolean; description: string; side: ModSide
+  sideSource?: 'builtin' | 'administrator' | 'unverified'; updateVersion?: string
+  /** Multiple locations discovered for this identity, relative to the game root. */
+  installations?: Array<{ path: string; version: string; enabled: boolean }>
+}
 export interface ModCatalogEntry {
   package: string; name: string; owner: string; description: string; latestVersion: string; installedVersion: string | null
   downloads: number; ratingScore: number; updatedAt: string | null; packageUrl: string | null; dependencies: string[]; isCoreComponent: boolean
@@ -171,7 +176,7 @@ export type GameDownload = { fileName: string; contentType: string } & (
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
 export interface ClientPackageBlocker {
   code: 'INVALID_INPUT' | 'PACKAGE_LOCK_INCOMPLETE' | 'MOD_SIDE_UNCONFIRMED' | 'MOD_PACKAGE_UNIDENTIFIED' |
-    'MOD_VERSION_UNSUPPORTED' | 'NO_CLIENT_MODS' | 'PACKAGE_SIZE_LIMIT' | 'CLIENT_MODS_UNAVAILABLE'
+    'MOD_VERSION_UNSUPPORTED' | 'MOD_INSTALL_CONFLICT' | 'NO_CLIENT_MODS' | 'PACKAGE_SIZE_LIMIT' | 'CLIENT_MODS_UNAVAILABLE'
   modName: string | null; version: string | null; message: string
 }
 export interface ClientPackagePlan { ready: boolean; mods: ClientProfile['mods']; blockers: ClientPackageBlocker[] }

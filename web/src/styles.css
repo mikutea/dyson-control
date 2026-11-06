@@ -185,6 +185,10 @@ svg { width: 1.1rem; height: 1.1rem; stroke-width: 1.8; flex: none; }
 .version-copy h2, .mod-copy h2 { margin: 0; font-size: .87rem; font-weight: 650; }
 .mod-copy > div { flex-wrap: wrap; }
 .mod-copy h2 { min-width: 0; overflow-wrap: anywhere; }
+.mod-install-conflict .mod-copy { flex: 1; grid-column: 2 / -1; }
+.mod-install-conflict ul { display: grid; gap: .55rem; margin: 0; padding: 0; list-style: none; }
+.mod-install-conflict li { display: grid; gap: .2rem; font-size: .74rem; color: var(--muted); }
+.mod-install-conflict code { color: var(--text); overflow-wrap: anywhere; }
 .version-copy > p, .mod-copy > p { margin: .4rem 0 .75rem; color: var(--muted); font-size: .72rem; line-height: 1.5; }
 .version-copy dl { margin: 0; display: flex; flex-wrap: wrap; gap: .75rem 2rem; }
 .version-copy dl > div { display: flex; flex-direction: column; gap: .25rem; }

@@ -38,8 +38,10 @@ function checkSize(bytes: number): void {
 }
 
 export function withClientRuntime(mods: Mod[], bepinexVersion: string | null): Mod[] {
+  const runtime = mods.find(mod => /^xiaoye97-BepInEx$/i.test(mod.name))
   return [
-    { id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion ?? '', enabled: true, required: true, description: 'BepInEx runtime', side: 'both' },
+    { id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion ?? '', enabled: true, required: true, description: 'BepInEx runtime', side: 'both',
+      ...(runtime?.installations ? { installations: runtime.installations } : {}) },
     ...mods.filter(mod => !/^xiaoye97-BepInEx$/i.test(mod.name))
   ]
 }
@@ -47,16 +49,29 @@ export function withClientRuntime(mods: Mod[], bepinexVersion: string | null): M
 type CurrentMods = Mod[] | (() => Mod[] | Promise<Mod[]>)
 interface PreparedPackage { plan: ClientPackagePlan; bytes: Buffer | null }
 
+export function displayModName(name: string, index?: number): string {
+  return /^[\p{L}\p{N}_ .-]{1,200}$/u.test(name) ? name : (index === undefined ? '未识别模组' : `未识别模组 ${index + 1}`)
+}
+
 function preparePackage(profileName: string, address: string, mods: Mod[]): PreparedPackage {
   const blockers: ClientPackageBlocker[] = []
   const locks: ClientProfile['mods'] = []
   if (!address || address.length > 255 || /[\s\0]/u.test(address)) {
     blockers.push({ code: 'INVALID_INPUT', modName: null, version: null, message: '请在设置页填写单行且不含空白的连接地址。' })
   }
+  const conflicts = new Set<string>()
+  for (const [index, mod] of mods.entries()) {
+    const active = mod.installations?.filter(item => item.enabled)
+    if (!active || active.length < 2) continue
+    conflicts.add(mod.id)
+    blockers.push({ code: 'MOD_INSTALL_CONFLICT', modName: displayModName(mod.name, index), version: null,
+      message: '多个启用副本，请到模组页核对各副本的安装位置和版本。' })
+  }
   const candidates = mods.filter(mod => mod.enabled && mod.side !== 'server')
   if (!candidates.length) blockers.push({ code: 'NO_CLIENT_MODS', modName: null, version: null, message: '请启用至少一个适用于客户端的模组。' })
   for (const [index, mod] of candidates.entries()) {
-    const modName = /^[\p{L}\p{N}_ .-]{1,200}$/u.test(mod.name) ? mod.name : `未识别模组 ${index + 1}`
+    if (conflicts.has(mod.id)) continue
+    const modName = displayModName(mod.name, index)
     const version = /^[\w.+-]{1,100}$/.test(mod.version) && mod.version !== 'unknown' ? mod.version : null
     const issue = (code: ClientPackageBlocker['code'], message: string) => blockers.push({ code, modName, version, message })
     const previous = blockers.length

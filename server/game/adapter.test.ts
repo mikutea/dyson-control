@@ -2257,6 +2257,45 @@ describe('Windows adapter fixture behavior', () => {
     expect((await adapter.backups()).some(backup => backup.reason === 'automatic-before-mod-removal')).toBe(true)
   })
 
+  it('lists every installed copy and refuses ambiguous package operations before inspecting the game', async () => {
+    const fixture = await config('windows')
+    const root = path.join(fixture.game.root, 'BepInEx')
+    const write = async (folder: string, version: string, author: string, name: string) => {
+      const dir = path.join(root, 'plugins', folder)
+      await fs.mkdir(dir, { recursive: true })
+      await fs.writeFile(path.join(dir, 'manifest.json'), JSON.stringify({ author_name: author, name, version_number: version }))
+      await fs.writeFile(path.join(dir, 'Feature.dll'), version)
+      return dir
+    }
+    const inspect = vi.fn(async () => { throw Error('must reject before inspecting or interrupting the game') })
+    const adapter = new WindowsGameAdapter(fixture, { inspect,
+      updates: updateFixture({ installedPackageVersion: async name => name === 'xiaoye97-BepInEx' ? '5.4.17' : null }) })
+    const run = (action: Parameters<typeof adapter.run>[0], input: Record<string, unknown>) =>
+      adapter.run(action, input, () => {}, new AbortController().signal)
+    const active = await write('Z-current', '2.0.0', 'Maker', 'Feature')
+    const { id } = (await adapter.mods())[0]!
+    await run('set-mod-side', { modId: id, expectedVersion: '2.0.0', side: 'both' })
+    const other = await write('A-old', '1.0.0', 'maker', 'Maker-Feature')
+    expect(await adapter.mods()).toEqual([expect.objectContaining({ id, version: 'unknown', installations: [
+      { path: 'BepInEx/plugins/A-old', enabled: true, version: '1.0.0' },
+      { path: 'BepInEx/plugins/Z-current', enabled: true, version: '2.0.0' },
+    ] })])
+    for (const [action, input] of [
+      ['toggle-mod', { modId: id, enabled: false }], ['remove-mod', { modId: id, expectedVersion: '1.0.0' }],
+      ['set-version-lock', { modId: id, locked: true }], ['set-version-lock', { modId: id, locked: false }],
+      ['set-mod-side', { modId: id, expectedVersion: '1.0.0', side: 'server' }],
+      ['install-mod', { package: 'Maker-Feature' }],
+    ] as const) await expect(run(action, input)).rejects.toMatchObject({ code: 'MOD_INSTALL_CONFLICT' })
+    expect(inspect).not.toHaveBeenCalled()
+    expect(await adapter.clientPackagePlan()).toMatchObject({ ready: false, blockers: [{ code: 'MOD_INSTALL_CONFLICT' }] })
+    await expect(run('create-client-package', {})).rejects.toMatchObject({ code: 'MOD_INSTALL_CONFLICT' })
+    await fs.mkdir(path.join(root, 'disabled-plugins'))
+    await fs.rename(other, path.join(root, 'disabled-plugins', 'A-old'))
+    expect(await adapter.clientPackagePlan()).toMatchObject({ ready: true, mods: expect.arrayContaining([{ name: 'Maker-Feature', version: '2.0.0' }]) })
+    await fs.rename(active, path.join(root, 'disabled-plugins', 'Z-current'))
+    expect(await adapter.clientPackagePlan()).toMatchObject({ ready: true, mods: [{ name: 'xiaoye97-BepInEx', version: '5.4.17' }] })
+  })
+
   it('exports exact package versions from BOM-prefixed installed manifests', async () => {
     const fixture = await config('windows')
     let runtimeVersion = '5.4.17'

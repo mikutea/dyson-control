@@ -40,6 +40,18 @@ describe('r2modman export', () => {
 })
 
 describe('client package creation plan', () => {
+  it('keeps unsafe manifest names and supplied file paths out of duplicate-package blockers', async () => {
+    const unsafe = 'C:\\fixture-private\\plugins\nspoof'
+    const item = { ...mod(unsafe), installations: [
+      { path: 'C:\\fixture-private\\one', version: '1.2.3', enabled: true },
+      { path: '\\nforged path', version: '2.0.0', enabled: true },
+    ] }
+    const plan = await readClientPackagePlan('fixture.example.test', [item])
+    expect(plan.blockers).toEqual([{ code: 'MOD_INSTALL_CONFLICT', modName: '未识别模组 1', version: null,
+      message: '多个启用副本，请到模组页核对各副本的安装位置和版本。' }])
+    expect(() => createR2ModmanPackage('Fixture', 'fixture.example.test', [item])).toThrow('未识别模组 1')
+  })
+
   it('collects all actionable issues in one read and lists only the exact included packages', async () => {
     const current = withClientRuntime([
       mod('Owner-Ready', '1.2.3', 'client'), mod('Owner-NeedsSide', '0.2.0', 'unknown'),
