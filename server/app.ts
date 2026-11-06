@@ -652,6 +652,8 @@ function gameErrorStatus(code: string): number {
   if (code === 'LOG_UNAVAILABLE') return 503
   if (['RESTORE_STATE_UNKNOWN', 'RESTORE_STORAGE_UNAVAILABLE', 'BACKUP_STORAGE_UNAVAILABLE'].includes(code)) return 503
   if (['BACKUP_MANIFEST_INVALID', 'BACKUP_VERIFICATION_FAILED', 'RESTORE_STARTUP_INVALID'].includes(code)) return 409
+  if (code === 'BACKUP_EXPORT_SPACE') return 507
+  if (code === 'BACKUP_EXPORT_STORAGE') return 503
   if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
@@ -691,7 +693,10 @@ async function sendDownload(
     const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
     reply.type(download.contentType)
     reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
-    if (download.stream) return await reply.send(download.stream)
+    if (download.stream) {
+      if (download.length !== undefined) reply.header('content-length', download.length)
+      return await reply.send(download.stream)
+    }
     return await reply.send(download.verifiedBytes ?? createReadStream(download.path))
   } finally {
     stream?.destroy()

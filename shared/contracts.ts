@@ -160,7 +160,7 @@ export interface StartupReadiness { state: RecoveryStartReadiness; message: stri
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
 export type GameDownload = { fileName: string; contentType: string } & (
   { path: string; verifiedBytes?: Uint8Array; stream?: never } |
-  { stream: import('node:stream').Readable; path?: never; verifiedBytes?: never }
+  { stream: import('node:stream').Readable; length?: number; path?: never; verifiedBytes?: never }
 )
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
 export interface ClientPackageBlocker {

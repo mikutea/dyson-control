@@ -109,6 +109,7 @@ export async function verifyBackupFiles(directory: string, manifest: BackupManif
       } finally { await handle.close() }
     } catch (error) {
       signal?.throwIfAborted()
+      if (error instanceof GameAdapterError) throw error
       throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `无法读取备份成员：${member.fileName}；请检查文件权限和存储是否可用。`, { cause: error })
     }
     const after = await backupStat(file)

@@ -3,6 +3,7 @@ import type { FileHandle } from 'node:fs/promises'
 import { Transform, Writable, type Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { crc32, createDeflateRaw } from 'node:zlib'
+import { backupExportStorageError } from './errors.js'
 
 export interface ZipEntry {
   name: string
@@ -100,7 +101,8 @@ async function writeAt(handle: FileHandle, data: Buffer, position: number): Prom
   let written = 0
   while (written < data.length) {
     const result = await handle.write(data, written, data.length - written, position + written)
-    if (!result.bytesWritten) throw new Error('ZIP write did not advance.')
+      .catch(cause => { throw backupExportStorageError(cause) })
+    if (!result.bytesWritten) throw backupExportStorageError(new Error('ZIP write did not advance.'))
     written += result.bytesWritten
   }
 }

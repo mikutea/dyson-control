@@ -766,6 +766,7 @@ describe('Dyson Control API', () => {
       const get = () => app.inject({ url, headers })
       const [first, second] = await Promise.all([get(), get()])
       expect(first.statusCode).toBe(200)
+      expect(Number(first.headers['content-length'])).toBe(first.rawPayload.length)
       expect(second.statusCode).toBe(200)
       expect(first.rawPayload).toEqual(second.rawPayload)
       expect(first.rawPayload).not.toEqual(wrong)
@@ -1145,6 +1146,55 @@ it('checks Windows startup readiness on demand without queuing a game action', a
     expect((await app.inject({ url, headers })).json().data.state).toBe('ready')
     expect(probe).toHaveBeenCalledTimes(2)
     expect((await app.inject({ url: '/api/jobs', headers })).json().data).toEqual([])
+  } finally { await app.close() }
+})
+
+it('reports a full export volume separately from a corrupt backup and allows a download retry', async () => {
+  const f = await createFixture()
+  f.config.dataDirectory = join(f.directory, 'data')
+  f.config.game.backupDirectory = join(f.directory, 'backups')
+  const adapter = new DemoGameAdapter(f.config)
+  const id = String((await adapter.run('backup', {}, () => {}, new AbortController().signal)).backupId)
+  const app = await buildApp({ config: f.config, adapter, databasePath: ':memory:' })
+  const originalOpen = fs.open.bind(fs)
+  try {
+    const headers = { cookie: await loginCookie(app) }, url = '/api/backups/' + id + '/download'
+    let attempted = 0
+    const failWrite = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await originalOpen(...args)
+      if (args[1] === 'wx+' && String(args[0]).includes('dyson-backup-export-')) {
+        attempted++
+        // Allow the manifest's compressed bytes and header. The next write is for a save member.
+        const write = handle.write.bind(handle)
+        vi.spyOn(handle, 'write').mockImplementationOnce(write).mockImplementationOnce(write)
+          .mockRejectedValueOnce(Object.assign(new Error('synthetic temporary volume is full'), { code: 'ENOSPC' }))
+      }
+      return handle
+    })
+    let failed
+    try { failed = await app.inject({ url, headers }) } finally { failWrite.mockRestore() }
+    expect(attempted).toBe(1)
+    expect(failed.statusCode).toBe(507)
+    expect(failed.json().error).toMatchObject({ code: 'BACKUP_EXPORT_SPACE', message: expect.stringContaining('临时卷空间不足') })
+    const unlinkFile = fs.unlink.bind(fs)
+    let deniedPath = ''
+    const denyOnce = vi.spyOn(fs, 'unlink').mockImplementation(async file => {
+      if (!deniedPath && String(file).includes('dyson-backup-export-')) {
+        deniedPath = String(file)
+        throw Object.assign(new Error('synthetic volume cannot unlink an open handle'), { code: 'EPERM' })
+      }
+      return unlinkFile(file)
+    })
+    try {
+      const denied = await app.inject({ url, headers })
+      expect(denied.statusCode).toBe(503)
+      expect(denied.json().error.code).toBe('BACKUP_EXPORT_STORAGE')
+    } finally { denyOnce.mockRestore() }
+    expect(deniedPath).toBeTruthy()
+    await expect(fs.lstat(deniedPath)).rejects.toMatchObject({ code: 'ENOENT' })
+    const retry = await app.inject({ url, headers })
+    expect(retry.statusCode).toBe(200)
+    expect(Number(retry.headers['content-length'])).toBe(retry.rawPayload.length)
   } finally { await app.close() }
 })
 
