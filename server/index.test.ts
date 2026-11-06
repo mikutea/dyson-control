@@ -1,13 +1,15 @@
 import { EventEmitter, once } from 'node:events'
 import { link, mkdir, mkdtemp, readFile, rm, rmdir, writeFile } from 'node:fs/promises'
+import { createServer, type AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, expect, it } from 'vitest'
+import { afterEach, expect, it, vi } from 'vitest'
 import type { ControlConfig } from '../shared/contracts.js'
 import { buildApp } from './app.js'
 import { DemoGameAdapter } from './game/demo.js'
 import { startServer } from './index.js'
 import { JobStore } from './jobs.js'
+import { SteamAuthManager } from './steam-auth.js'
 
 const directories: string[] = []
 afterEach(async () => { await Promise.all(directories.splice(0).map(dir => rm(dir, { recursive: true, force: true }))) })
@@ -62,6 +64,48 @@ it('releases ownership if app construction fails before the close hook can run',
   await rmdir(blocked)
   const server = await startServer(settings)
   await server.close()
+})
+
+it('rejects an occupied fixed address before touching a prior panel job, then releases the directory', async () => {
+  const settings = await config()
+  const oldListener = createServer()
+  oldListener.listen(0, settings.host)
+  await once(oldListener, 'listening')
+  const store = new JobStore(path.join(settings.dataDirectory, 'control.sqlite'))
+  try {
+    const job = store.create({ requestId: 'older-panel', action: 'save', input: {} }).job
+    store.start(job.id)
+    const port = (oldListener.address() as AddressInfo).port
+    await expect(startServer({ ...settings, port })).rejects.toMatchObject({ code: 'EADDRINUSE' })
+    expect(store.require(job.id).state).toBe('running')
+    await new Promise<void>(resolve => oldListener.close(() => resolve()))
+    const retry = await startServer({ ...settings, port })
+    try { expect(store.require(job.id).state).toBe('interrupted') }
+    finally { await retry.close() }
+  } finally { if (oldListener.listening) oldListener.close(); store.close() }
+})
+
+it('still relies on the final bind if another process takes the port after the probe', async () => {
+  const settings = await config(), competitor = createServer()
+  competitor.listen(0, settings.host)
+  await once(competitor, 'listening')
+  const port = (competitor.address() as AddressInfo).port
+  await new Promise<void>(resolve => competitor.close(() => resolve()))
+  const initialize = SteamAuthManager.prototype.initialize
+  const race = vi.spyOn(SteamAuthManager.prototype, 'initialize').mockImplementationOnce(async function (this: SteamAuthManager) {
+    await initialize.call(this)
+    competitor.listen(port, settings.host)
+    await once(competitor, 'listening')
+  })
+  try {
+    await expect(startServer({ ...settings, port })).rejects.toMatchObject({ code: 'EADDRINUSE' })
+    expect(race).toHaveBeenCalledOnce()
+  } finally {
+    race.mockRestore()
+    if (competitor.listening) await new Promise<void>(resolve => competitor.close(() => resolve()))
+  }
+  const retry = await startServer({ ...settings, port })
+  await retry.close()
 })
 
 it('does not lock a file hard-linked from a different directory', async () => {

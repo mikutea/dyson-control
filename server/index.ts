@@ -1,5 +1,6 @@
 import { pathToFileURL } from 'node:url'
 import { lstat, mkdir } from 'node:fs/promises'
+import { createServer } from 'node:net'
 import { join } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import type { ControlConfig } from '../shared/contracts.js'
@@ -35,11 +36,22 @@ async function ownDataDirectory(directory: string): Promise<() => void> {
   return () => { if (owner.isOpen) owner.close() }
 }
 
+async function checkListenAddress(host: string, port: number): Promise<void> {
+  if (port === 0) return
+  // Older panels do not hold the data lock. Detect an existing listener before startup can alter its jobs.
+  const probe = createServer(socket => socket.destroy())
+  await new Promise<void>((resolve, reject) => {
+    probe.once('error', reject)
+    probe.listen({ host, port, exclusive: true }, () => probe.close(error => error ? reject(error) : resolve()))
+  })
+}
+
 export async function startServer(config?: ControlConfig) {
   const resolvedConfig = config ?? await loadConfig()
   const releaseDataDirectory = await ownDataDirectory(resolvedConfig.dataDirectory)
   let app: Awaited<ReturnType<typeof buildApp>> | undefined
   try {
+    await checkListenAddress(resolvedConfig.host, resolvedConfig.port)
     app = await buildApp({ config: resolvedConfig, logger: true, releaseDataDirectory })
     await app.listen({ host: resolvedConfig.host, port: resolvedConfig.port })
     return app
