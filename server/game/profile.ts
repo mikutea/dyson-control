@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import { buffer as readStreamBuffer } from 'node:stream/consumers'
 import { z } from 'zod'
-import type { ClientPackage, ClientPackageDetails, ClientProfile, Mod } from '../../shared/contracts.js'
+import type { ClientPackage, ClientPackageBlocker, ClientPackageDetails, ClientPackagePlan, ClientProfile, Mod } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 import { safeId, timestampId } from './system.js'
 import { buildStoredZip } from './zip.js'
@@ -27,11 +27,9 @@ const recordSchema = z.object({
   })).min(1) })
 })
 
-function versionParts(version: string): { major: number; minor: number; patch: number } {
+function versionParts(version: string): { major: number; minor: number; patch: number } | null {
   const match = versionPattern.exec(version)
-  if (!match || !match.slice(1).every(part => Number.isSafeInteger(Number(part)))) {
-    throw new GameAdapterError('MOD_VERSION_UNSUPPORTED', `Mod version is not compatible with r2modman: ${version}`)
-  }
+  if (!match || !match.slice(1).every(part => Number.isSafeInteger(Number(part)))) return null
   return { major: Number(match[1]), minor: Number(match[2]), patch: Number(match[3]) }
 }
 
@@ -40,42 +38,77 @@ function checkSize(bytes: number): void {
 }
 
 export function withClientRuntime(mods: Mod[], bepinexVersion: string | null): Mod[] {
-  if (!bepinexVersion) throw new GameAdapterError('PACKAGE_LOCK_INCOMPLETE', '缺少已安装 BepInEx 的 Thunderstore 版本记录。')
   return [
-    { id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion, enabled: true, required: true, description: 'BepInEx runtime', side: 'both' },
+    { id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion ?? '', enabled: true, required: true, description: 'BepInEx runtime', side: 'both' },
     ...mods.filter(mod => !/^xiaoye97-BepInEx$/i.test(mod.name))
   ]
 }
 
-function clientModLocks(mods: Mod[]): ClientProfile['mods'] {
-  const unconfirmed = mods.filter(mod => mod.enabled && mod.side === 'unknown')
-  if (unconfirmed.length) throw new GameAdapterError('MOD_SIDE_UNCONFIRMED', `请先在模组页面确认这些版本的适用端：${unconfirmed.map(mod => mod.name).join('、')}`)
-  const importable = mods.filter(mod => mod.enabled && mod.side !== 'server')
-  if (!importable.length) throw new GameAdapterError('NO_CLIENT_MODS', 'No enabled client-compatible mods were found.')
-  return importable.map(mod => {
-    if (!packageNamePattern.test(mod.name)) {
-      throw new GameAdapterError('MOD_PACKAGE_UNIDENTIFIED', `The Thunderstore identity for ${mod.name} is unknown. Record its owner and package name before exporting.`)
+type CurrentMods = Mod[] | (() => Mod[] | Promise<Mod[]>)
+interface PreparedPackage { plan: ClientPackagePlan; bytes: Buffer | null }
+
+function preparePackage(profileName: string, address: string, mods: Mod[]): PreparedPackage {
+  const blockers: ClientPackageBlocker[] = []
+  const locks: ClientProfile['mods'] = []
+  if (!address || address.length > 255 || /[\s\0]/u.test(address)) {
+    blockers.push({ code: 'INVALID_INPUT', modName: null, version: null, message: '请在设置页填写单行且不含空白的连接地址。' })
+  }
+  const candidates = mods.filter(mod => mod.enabled && mod.side !== 'server')
+  if (!candidates.length) blockers.push({ code: 'NO_CLIENT_MODS', modName: null, version: null, message: '请启用至少一个适用于客户端的模组。' })
+  for (const [index, mod] of candidates.entries()) {
+    const modName = /^[\p{L}\p{N}_ .-]{1,200}$/u.test(mod.name) ? mod.name : `未识别模组 ${index + 1}`
+    const version = /^[\w.+-]{1,100}$/.test(mod.version) && mod.version !== 'unknown' ? mod.version : null
+    const issue = (code: ClientPackageBlocker['code'], message: string) => blockers.push({ code, modName, version, message })
+    const previous = blockers.length
+    if (mod.side === 'unknown') issue('MOD_SIDE_UNCONFIRMED', '请在模组页确认此版本的适用端。')
+    if (!packageNamePattern.test(mod.name)) issue('MOD_PACKAGE_UNIDENTIFIED', '缺少完整的 Thunderstore 作者名和包名。如需分发，请核对安装来源。')
+    if (mod.id === 'bepinex-runtime' && !mod.version) issue('PACKAGE_LOCK_INCOMPLETE', '无法取得 BepInEx 的精确包版本，请核对本地安装记录。')
+    else if (!versionParts(mod.version)) issue('MOD_VERSION_UNSUPPORTED', 'r2modman 需要精确的三段版本号（如 1.2.3），请核对已安装的包版本。')
+    if (blockers.length === previous) locks.push({ name: mod.name, version: mod.version })
+  }
+  let bytes: Buffer | null = null
+  if (!blockers.length) {
+    const r2x = { profileName, mods: locks.map(mod => ({ name: mod.name, version: versionParts(mod.version)!, enabled: true })) }
+    const config = `[Nebula - Settings]\nNickname =\nServerPassword =\nLastClientPassword =\nHostPort = 8469\nEnableUPnpOrPmpSupport = false\nEnableNgrok = false\nNgrokAuthtoken =\nRememberLastIP = true\nRememberLastClientPassword = false\nLastIP = ${address}\nRemoteAccessEnabled = false\nRemoteAccessPassword =\n`
+    bytes = buildStoredZip([
+      { name: 'export.r2x', data: `${JSON.stringify(r2x, null, 2)}\n` },
+      { name: 'config/nebula.cfg', data: config }
+    ])
+    if (bytes.length > maxClientArchiveBytes) {
+      bytes = null
+      blockers.push({ code: 'PACKAGE_SIZE_LIMIT', modName: null, version: null, message: '客户端配置包超过 4 MiB 大小上限。' })
     }
-    versionParts(mod.version)
-    return { name: mod.name, version: mod.version }
-  })
+  }
+  return { plan: { ready: !blockers.length, mods: locks, blockers }, bytes }
 }
 
-function buildPackage(profileName: string, address: string, mods: Mod[]) {
-  if (!address || address.length > 255 || /[\s\0]/u.test(address)) throw new GameAdapterError('INVALID_INPUT', 'The game connection address must be one nonempty line without whitespace.')
-  const profile: ClientProfile = { address, mods: clientModLocks(mods) }
-  const r2x = { profileName, mods: profile.mods.map(mod => ({ name: mod.name, version: versionParts(mod.version), enabled: true })) }
-  const config = `[Nebula - Settings]\nNickname =\nServerPassword =\nLastClientPassword =\nHostPort = 8469\nEnableUPnpOrPmpSupport = false\nEnableNgrok = false\nNgrokAuthtoken =\nRememberLastIP = true\nRememberLastClientPassword = false\nLastIP = ${profile.address}\nRemoteAccessEnabled = false\nRemoteAccessPassword =\n`
-  const bytes = buildStoredZip([
-    { name: 'export.r2x', data: `${JSON.stringify(r2x, null, 2)}\n` },
-    { name: 'config/nebula.cfg', data: config }
-  ])
-  checkSize(bytes.length)
-  return { profile, bytes }
+async function prepareCurrentPackage(profileName: string, address: string, current: CurrentMods): Promise<PreparedPackage> {
+  let mods: Mod[]
+  try { mods = typeof current === 'function' ? await current() : current }
+  catch {
+    return { bytes: null, plan: { ready: false, mods: [], blockers: [{
+      code: 'CLIENT_MODS_UNAVAILABLE', modName: null, version: null, message: '无法读取当前模组清单或适用端记录，请检查模组页后重试。'
+    }] } }
+  }
+  return preparePackage(profileName, address, mods)
+}
+
+export async function readClientPackagePlan(address: string, current: CurrentMods): Promise<ClientPackagePlan> {
+  // Match the generated profile name's encoded length so the same archive size limit applies.
+  return (await prepareCurrentPackage('Dyson-Control-00000000T000000Z-00000000', address, current)).plan
+}
+
+function blockerSummary(plan: ClientPackagePlan): string {
+  return plan.blockers.map(issue => issue.modName ? `${issue.modName}${issue.version ? ' ' + issue.version : ''} · ${issue.message}` : issue.message).join(' ')
+}
+
+function requirePackageBytes(prepared: PreparedPackage): Buffer {
+  if (prepared.bytes) return prepared.bytes
+  throw new GameAdapterError(prepared.plan.blockers[0]!.code, blockerSummary(prepared.plan))
 }
 
 export function createR2ModmanPackage(profileName: string, address: string, mods: Mod[]): Buffer {
-  return buildPackage(profileName, address, mods).bytes
+  return requirePackageBytes(preparePackage(profileName, address, mods))
 }
 
 // Bind the exact export inputs to the archived bytes. A damaged profile record cannot establish a match.
@@ -115,13 +148,15 @@ export async function listClientPackages(directory: string): Promise<ClientPacka
   return items.sort((a, b) => b.createdAt.localeCompare(a.createdAt))
 }
 
-export async function writeClientPackage(directory: string, address: string, mods: Mod[]): Promise<ClientPackage> {
+export async function writeClientPackage(directory: string, address: string, mods: CurrentMods): Promise<ClientPackage> {
   const created = new Date()
   const stamp = timestampId(created)
   const uuid = randomUUID()
   const id = `client-${stamp}-${uuid}`
   const profileName = `Dyson-Control-${stamp}-${uuid.slice(0, 8)}`
-  const { profile, bytes } = buildPackage(profileName, address, mods)
+  const prepared = await prepareCurrentPackage(profileName, address, mods)
+  const bytes = requirePackageBytes(prepared)
+  const profile: ClientProfile = { address, mods: prepared.plan.mods }
   const fileName = `${id}.r2z`
   const item = publicItem({ id, name: `${profileName}.r2z`, createdAt: created.toISOString(), bytes: bytes.length, modCount: profile.mods.length })
   const archiveSha256 = createHash('sha256').update(bytes).digest('hex')
@@ -187,14 +222,13 @@ export async function compareClientPackage(directory: string, id: string, curren
     return details
   }
   const changedAddress = currentAddress !== details.profile.address
-  try {
-    details.currentMods = clientModLocks(await readMods())
-  } catch (error) {
-    const known = error instanceof GameAdapterError && ['PACKAGE_LOCK_INCOMPLETE', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_METADATA_INVALID'].includes(error.code)
-    details.reason = known ? error.message : '无法确定当前启用的客户端模组和精确版本，请检查模组记录。'
+  const plan = await readClientPackagePlan(currentAddress, readMods)
+  if (!plan.ready) {
+    details.reason = blockerSummary(plan)
     if (changedAddress) details.status = 'outdated'
     return details
   }
+  details.currentMods = plan.mods
   const locked = new Map(details.profile.mods.map(mod => [mod.name.toLowerCase(), mod.version]))
   const changedMods = locked.size !== details.currentMods.length || details.currentMods.some(mod => locked.get(mod.name.toLowerCase()) !== mod.version)
   details.status = changedAddress || changedMods ? 'outdated' : 'current'

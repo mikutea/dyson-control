@@ -30,13 +30,18 @@ export interface PlayerHistoryEntry {
 }
 export interface PlayerHistory {
   entries: PlayerHistoryEntry[]; total: number; status: 'waiting' | 'available' | 'unavailable'; lastReadAt: string | null
+  pageCursor: string; nextCursor: string | null
 }
+export interface PlayerHistoryFilter { type?: PlayerHistoryEntry['type']; name?: string; cursor?: string }
 export interface LogEntry { id: string; time: string | null; level: 'info' | 'warning' | 'error'; message: string }
 export type ModSide = 'both' | 'server' | 'client' | 'unknown'
 export interface Mod { id: string; name: string; version: string; enabled: boolean; required: boolean; description: string; side: ModSide; sideSource?: 'builtin' | 'administrator' | 'unverified'; updateVersion?: string }
 export interface ModCatalogEntry {
   package: string; name: string; owner: string; description: string; latestVersion: string; installedVersion: string | null
   downloads: number; ratingScore: number; updatedAt: string | null; packageUrl: string | null; dependencies: string[]; isCoreComponent: boolean
+}
+export interface ModPlanEntry {
+  package: string; version: string; installedVersion: string | null; lockedVersion: string | null; downloadBytes: number | null
 }
 export interface ModConfigFile {
   id: string; path: string; bytes: number; modifiedAt: string; content: string; redactedKeys: string[]; revision: string
@@ -150,6 +155,12 @@ export type RecoveryStartReadiness = 'ready' | 'game-present' | 'task-unavailabl
 export interface ClientPackage { id: string; name: string; createdAt: string; bytes: number; modCount: number; downloadUrl: string }
 export interface GameDownload { path: string; fileName: string; contentType: string; verifiedBytes?: Uint8Array }
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
+export interface ClientPackageBlocker {
+  code: 'INVALID_INPUT' | 'PACKAGE_LOCK_INCOMPLETE' | 'MOD_SIDE_UNCONFIRMED' | 'MOD_PACKAGE_UNIDENTIFIED' |
+    'MOD_VERSION_UNSUPPORTED' | 'NO_CLIENT_MODS' | 'PACKAGE_SIZE_LIMIT' | 'CLIENT_MODS_UNAVAILABLE'
+  modName: string | null; version: string | null; message: string
+}
+export interface ClientPackagePlan { ready: boolean; mods: ClientProfile['mods']; blockers: ClientPackageBlocker[] }
 export interface ClientPackageDetails {
   id: string; profile: ClientProfile | null; currentAddress: string; currentMods: ClientProfile['mods'] | null
   status: 'current' | 'outdated' | 'unknown'; reason: string | null; downloadable: boolean; sha256: string | null
@@ -197,6 +208,7 @@ export interface GameAdapter {
   logs(): Promise<LogEntry[]>
   mods(): Promise<Mod[]>
   modCatalog(search: string): Promise<ModCatalogEntry[]>
+  modInstallPlan(packageName: string, version: string): Promise<ModPlanEntry[]>
   modConfigs(): Promise<ModConfigFile[]>
   modConfigHistory(configId?: string): Promise<ModConfigHistoryEntry[]>
   modRemovalHistory(): Promise<ModRemovalHistoryEntry[]>
@@ -209,6 +221,7 @@ export interface GameAdapter {
   settings(): Promise<GameSettings>
   settingsHistory(): Promise<GameSettingsHistoryEntry[]>
   clientPackages(): Promise<ClientPackage[]>
+  clientPackagePlan?(): Promise<ClientPackagePlan>
   clientPackageDetails?(id: string): Promise<ClientPackageDetails>
   run(action: Action, input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>>
   download?(kind: 'backup' | 'client', id: string): Promise<GameDownload>
@@ -229,6 +242,7 @@ export interface ControlConfig {
 // POST /api/session {password}; DELETE /api/session. One administrator session.
 // GET /api/{overview,players,logs,mods,versions,saves,backups,settings,client-packages,jobs}.
 // GET /api/client-packages/:id compares one generated profile with the current client requirements.
+// GET /api/client-package-plan reads the current packaging blockers and exact eligible mod versions.
 // GET /api/jobs accepts JobHistoryQuery and returns Job[] newest first; before is an exclusive job ID.
 // GET /api/jobs/current returns one Job or null: running, first queued, then most recently submitted.
 // POST /api/actions accepts ActionRequest and returns Job (202); GET /api/jobs/:id returns Job.

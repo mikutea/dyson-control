@@ -1,6 +1,6 @@
 import { useState } from 'react'
-import { Box, Download, FileArchive, RefreshCw } from 'lucide-react'
-import type { ClientPackage, ClientPackageDetails } from '../../shared/contracts'
+import { Box, ClipboardCheck, Download, FileArchive, RefreshCw } from 'lucide-react'
+import type { ClientPackage, ClientPackageBlocker, ClientPackageDetails, ClientPackagePlan } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock, PageHeader, Panel } from './components'
 import { formatBytes, formatFullDate } from './format'
@@ -14,9 +14,10 @@ export function ClientsPage({ refreshToken, runAction, operationActive }: { refr
   const packages = useResource<ClientPackage[]>('/client-packages', revision)
   const selected = packages.data?.find(item => item.id === selection) ?? packages.data?.[0]
   return <>
-    <PageHeader title="客户端" description="核对配置包内的连接地址和模组版本，再发给玩家。"
-      actions={<Button variant="primary" icon={<Box />} disabled={operationActive} onClick={() => { setSelection(''); runAction('create-client-package') }}>创建客户端包</Button>} />
-    <Panel title="已生成的客户端包" icon={<FileArchive />} action={<Button variant="quiet" icon={<RefreshCw />} onClick={() => setManualRefresh(value => value + 1)}>刷新</Button>}>
+    <PageHeader title="客户端" description="检查新包的模组清单，或核对已生成的配置包再分发。"
+      actions={<Button icon={<RefreshCw />} onClick={() => setManualRefresh(value => value + 1)}>刷新</Button>} />
+    <CreationPlan key={revision} operationActive={operationActive} create={() => { setSelection(''); runAction('create-client-package') }} />
+    <Panel title="已生成的客户端包" icon={<FileArchive />}>
       {packages.error ? <ErrorBlock message={packages.error} retry={packages.reload} />
         : packages.loading ? <LoadingBlock />
         : !selected ? <EmptyBlock title="还没有客户端包" description="创建后即可核对配置并下载给玩家。" />
@@ -32,6 +33,39 @@ export function ClientsPage({ refreshToken, runAction, operationActive }: { refr
     </Panel>
     <p className="client-import-note">玩家可在 r2modman 配置选择页依次选择 <b>Import/Update → Import new profile → From file</b>，导入下载的 .r2z。模组下载完成后，用与服务器相同的游戏版本启动该配置并实际入服。</p>
   </>
+}
+
+function CreationPlan({ operationActive, create }: { operationActive: boolean; create: () => void }) {
+  const resource = useResource<ClientPackagePlan>('/client-package-plan')
+  const plan = resource.data
+  const groups = new Map<string, ClientPackageBlocker[]>()
+  for (const issue of plan?.blockers ?? []) {
+    const key = issue.modName ? issue.modName + ' ' + (issue.version ?? '') : issue.code
+    const group = groups.get(key)
+    if (group) group.push(issue)
+    else groups.set(key, [issue])
+  }
+  return <Panel title="创建前检查" icon={<ClipboardCheck />} action={
+    <Button variant="primary" icon={<Box />} disabled={operationActive || resource.loading || Boolean(resource.error) || !plan?.ready} onClick={create}>创建客户端包</Button>
+  }>
+    {resource.error ? <ErrorBlock message={resource.error} retry={resource.reload} /> : !plan ? <LoadingBlock /> :
+      <div className="client-plan">
+        <h3 aria-live="polite" className={`client-status client-status-${plan.ready ? 'current' : 'outdated'}`}>
+          {plan.ready ? '可以创建客户端包' : `创建前还需处理 ${plan.blockers.length} 项问题`}
+        </h3>
+        {groups.size > 0 && <ul className="client-plan-issues">{[...groups].map(([key, issues]) => <li key={key}>
+          {issues[0]!.modName && <strong>{issues[0]!.modName} <small>{issues[0]!.version}</small></strong>}
+          {issues.map(issue => <p key={issue.code}>{issue.message}</p>)}
+        </li>)}</ul>}
+        {plan.blockers.some(issue => issue.modName || issue.code === 'CLIENT_MODS_UNAVAILABLE' || issue.code === 'NO_CLIENT_MODS') &&
+          <a className="button button-quiet" href="#/mods">查看已安装模组</a>}
+        {plan.blockers.some(issue => issue.code === 'INVALID_INPUT') && <a className="button button-quiet" href="#/settings">查看连接设置</a>}
+        {!!plan.mods.length && <details className="client-plan-locks" open={plan.ready && plan.mods.length <= 8}>
+          <summary>{plan.ready ? '将纳入的精确版本' : '已确认可纳入的模组'}（{plan.mods.length}）</summary>
+          <ul>{plan.mods.map(mod => <li key={mod.name}><span>{mod.name}</span><code>{mod.version}</code></li>)}</ul>
+        </details>}
+      </div>}
+  </Panel>
 }
 
 const statusLabel = { current: '与当前配置一致', outdated: '与当前配置有差异', unknown: '配置匹配情况未知' }

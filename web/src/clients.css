@@ -35,3 +35,12 @@
   .client-address { grid-template-columns: minmax(0, 1fr); gap: .6rem; }
   .client-mods col:first-child { width: 48%; }
 }
+.client-plan { padding: .9rem 1rem 1rem; }
+.client-plan-issues, .client-plan-locks ul { margin: .75rem 0; padding: 0; list-style: none; }
+.client-plan-issues li { padding: .6rem 0; border-bottom: 1px solid var(--line); }
+.client-plan-issues strong, .client-plan-locks li { font-size: .78rem; overflow-wrap: anywhere; }
+.client-plan-issues small, .client-plan-locks code { color: var(--muted); }
+.client-plan-issues p { margin: .25rem 0; color: var(--muted); font-size: .76rem; line-height: 1.6; }
+.client-plan-locks { margin-top: .85rem; font-size: .76rem; }
+.client-plan-locks summary { cursor: pointer; }
+.client-plan-locks li { display: flex; justify-content: space-between; gap: 1rem; padding: .45rem 0; border-bottom: 1px solid var(--line); }

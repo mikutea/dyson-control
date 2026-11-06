@@ -718,8 +718,8 @@ async function bridgeKickWorker(
 }
 
 type UpdateFixture = Pick<GameUpdateManager,
-  'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
-  'installedPackageVersion' | 'searchPackages' | 'updateHistory' | 'recoverInterrupted'>
+  'versions' | 'resolvePackagePlan' | 'withPreparedPackages' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
+  'installedPackageVersion' | 'searchPackages' | 'describePackagePlan' | 'updateHistory' | 'recoverInterrupted'>
 
 function resolvedPackage(packageFullName: string, version: string, dependencies: string[] = []): ResolvedPackage {
   const separator = packageFullName.indexOf('-')
@@ -737,7 +737,10 @@ function updateFixture(overrides: Partial<UpdateFixture> = {}): UpdateFixture {
     recoverInterrupted: async () => undefined,
     versions: async () => [],
     installedPackageVersion: async () => null,
+    describePackagePlan: async () => [],
     resolvePackagePlan: async (packageFullName, version) => [resolvedPackage(packageFullName, version ?? '1.0.0')],
+    withPreparedPackages: async (plan, component, _report, _signal, use) => use({ component,
+      package: plan.at(-1)!.packageFullName, version: plan.at(-1)!.version, install: async () => { throw new Error('Fixture uses its install override') } }),
     installComponent: async (component, version) => ({ component, version: version ?? 'latest' }),
     installPackage: async (packageName, version, component) => ({
       component, package: packageName, version: version ?? 'latest', installed: [], backupId: 'fixture-update',
@@ -786,6 +789,100 @@ function packageCatalogFetch(packageFullName: string, packageVersions: string[],
       : new Response('not found', { status: 404 })
   }) as typeof fetch
 }
+
+describe('live Thunderstore package preparation', () => {
+  it.each([
+    ['http', 'mods-Feature', 'mod', 'UPDATE_DOWNLOAD_FAILED'],
+    ['identity', 'nebula-NebulaMultiplayerMod', 'nebula', 'PACKAGE_MANIFEST_MISMATCH'],
+    ['dependency', 'xiaoye97-BepInEx', 'bepinex', 'PACKAGE_MANIFEST_MISMATCH'],
+    ['cancel', 'mods-Feature', 'mod', 'cancelled-download'],
+  ] as const)('keeps the running world untouched on %s during preflight', async (failure, packageName, component, code) => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root)
+    const packageVersion = '1.2.0'
+    const catalog = packageCatalogFetch(packageName, [packageVersion], 'Fixture.dll')
+    const work = path.join(fixture.dataDirectory, 'updates', 'work')
+    const backups = path.join(fixture.dataDirectory, 'updates', 'backups')
+    const controller = new AbortController()
+    let streamCancelled = false
+    const updates = new GameUpdateManager({ gameRoot: fixture.game.root, workDirectory: work, backupDirectory: backups,
+      isGameRunning: async () => true, catalogUrl: 'https://catalog.test/packages',
+      fetch: async (input, init) => {
+        if (String(input).endsWith('/packages')) {
+          const metadata = await (await catalog(input, init)).json()
+          metadata[0].versions[0].file_size = null
+          return Response.json(metadata)
+        }
+        if (failure === 'http') return new Response('fixture unavailable', { status: 503 })
+        if (failure === 'cancel') return new Response(new ReadableStream({
+          start(stream) {
+            stream.enqueue(new Uint8Array([1]))
+            setTimeout(() => controller.abort(new Error('cancelled-download')), 5)
+          }, cancel() { streamCancelled = true }
+        }))
+        const manifest = { name: failure === 'identity' ? 'Wrong' : packageName.split('-')[1],
+          version_number: packageVersion, dependencies: failure === 'dependency' ? ['unplanned-Dependency-1.0.0'] : [] }
+        const bytes = buildStoredZip([{ name: 'manifest.json', data: JSON.stringify(manifest) }, { name: 'Fixture.dll', data: 'fixture binary' }])
+        return new Response(Uint8Array.from(bytes))
+      } })
+    const inspect = vi.fn(async () => ({ process: { pid: 4104, startedAt: new Date().toISOString(), workingSetBytes: 10,
+      totalProcessorSeconds: 1, targetUps: 60, selectedSave: 'World' }, tasks: { start: true, startManaged: true, configuredTargetUps: null },
+      versions: { game: null, nebula: null, bepinex: null } }))
+    const runScript = vi.fn(async () => { throw new Error('Unexpected lifecycle script') })
+    const adapter = new WindowsGameAdapter(fixture, { updates, inspect, runScript })
+    const reports: string[] = []
+    const operation = adapter.run(component === 'mod' ? 'install-mod' : 'install-update',
+      component === 'mod' ? { package: packageName, version: packageVersion } : { component, version: packageVersion },
+      message => reports.push(message), controller.signal)
+    if (failure === 'cancel') {
+      await expect(operation).rejects.toThrow(code)
+      expect(streamCancelled).toBe(true)
+    } else await expect(operation).rejects.toMatchObject({ code })
+    expect(inspect).not.toHaveBeenCalled()
+    expect(runScript).not.toHaveBeenCalled()
+    expect(reports.join(' ')).not.toMatch(/保存当前游戏|停止服务器/)
+    expect(await adapter.backups()).toEqual([])
+    expect(await fs.readdir(work)).toEqual([])
+    await expect(fs.lstat(backups)).rejects.toMatchObject({ code: 'ENOENT' })
+    expect(await fs.readdir(fixture.game.root)).toEqual([])
+  })
+
+  it('downloads while running, saves and stops only after verification, then installs the downloaded version and restarts', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root)
+    for (const ext of ['.dsv', '.server']) await fs.writeFile(path.join(fixture.game.saveDirectory, 'World' + ext), 'fixture' + ext)
+    let running = true
+    const pid = 4105
+    const packageName = 'mods-Feature', version = '1.2.0'
+    const source = packageCatalogFetch(packageName, [version], 'Fixture.dll')
+    const requests: string[] = [], reports: string[] = []
+    const work = path.join(fixture.dataDirectory, 'updates', 'work')
+    const updates = new GameUpdateManager({ gameRoot: fixture.game.root, workDirectory: work,
+      backupDirectory: path.join(fixture.dataDirectory, 'updates', 'backups'), isGameRunning: async () => running,
+      catalogUrl: 'https://catalog.test/packages', fetch: async (input, init) => {
+        expect(running).toBe(true)
+        requests.push(String(input))
+        return source(input, init)
+      } })
+    const adapter = new WindowsGameAdapter(fixture, { updates, pollIntervalMs: 5,
+      inspect: async () => ({ process: running ? { pid, startedAt: new Date(Date.now() - 1000).toISOString(), workingSetBytes: 10,
+        totalProcessorSeconds: 1, targetUps: 60, selectedSave: 'World' } : null,
+        tasks: { start: true, startManaged: true, configuredTargetUps: null }, versions: { game: null, nebula: null, bepinex: null } }),
+      runScript: async <T>() => { running = true; return {} as T } })
+    const secret = await prepareBridge(fixture, pid)
+    const workers = Promise.all([bridgeSaveWorker(fixture, secret, 'World'), bridgeStopWorker(fixture, secret, () => { running = false })])
+    const result = await adapter.run('install-mod', { package: packageName, version }, message => reports.push(message), new AbortController().signal)
+    await workers
+    expect(result).toMatchObject({ package: packageName, version, wasRunning: true, restarted: true, automaticBackupId: expect.any(String) })
+    expect(requests).toEqual(['https://catalog.test/packages', `https://packages.test/${packageName}-${version}.zip`])
+    const beforeSave = reports.indexOf('所有包及依赖均已下载并校验，准备进入离线安装')
+    expect(beforeSave).toBeGreaterThanOrEqual(0)
+    expect(reports.indexOf('正在保存当前游戏进度')).toBeGreaterThan(beforeSave)
+    expect(reports.indexOf('正在停止服务器')).toBeGreaterThan(beforeSave)
+    expect(await fs.readFile(path.join(fixture.game.root, 'BepInEx', 'plugins', packageName, 'Fixture.dll'), 'utf8')).toBe(`${packageName}-${version}-binary`)
+    expect(await fs.readdir(work)).toEqual([])
+  })
+})
 
 describe('demo adapter', () => {
   it('provides working routes and reversible actions', async () => {
@@ -2078,6 +2175,48 @@ describe('Windows adapter fixture behavior', () => {
     runtimeVersion = '5.4.23'
     expect(await adapter.clientPackageDetails(item!.id)).toMatchObject({ status: 'outdated',
       currentMods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.23' }]) })
+    expect(searchPackages).not.toHaveBeenCalled()
+  })
+
+  it('previews every local package blocker and reruns the Windows scan before writing a file', async () => {
+    const fixture = await config('windows')
+    const plugins = path.join(fixture.game.root, 'BepInEx', 'plugins')
+    const plugin = async (owner: string, name: string, version: string) => {
+      const dir = path.join(plugins, owner + '-' + name)
+      await fs.mkdir(dir, { recursive: true })
+      await fs.writeFile(path.join(dir, 'manifest.json'), JSON.stringify({ author_name: owner, name, version_number: version, dependencies: [] }))
+    }
+    await plugin('Owner', 'Alpha', '1.0.0')
+    await plugin('Owner', 'Beta', '1.2.3-preview')
+    let runtime: string | null = null
+    const searchPackages = vi.fn(async () => { throw new Error('Cannot use the catalog for a local profile') })
+    const adapter = new WindowsGameAdapter(fixture, {
+      inspect: vi.fn(async () => { throw new Error('No game inspection required') }),
+      runScript: async () => { throw new Error('No script required') },
+      updates: updateFixture({ installedPackageVersion: async () => runtime, searchPackages })
+    })
+    const original = await adapter.clientPackagePlan()
+    expect(original.blockers.map(i => [i.modName, i.code])).toEqual([
+      ['xiaoye97-BepInEx', 'PACKAGE_LOCK_INCOMPLETE'], ['Owner-Alpha', 'MOD_SIDE_UNCONFIRMED'],
+      ['Owner-Beta', 'MOD_SIDE_UNCONFIRMED'], ['Owner-Beta', 'MOD_VERSION_UNSUPPORTED'],
+    ])
+    await expect(adapter.run('create-client-package', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ message: expect.stringMatching(/BepInEx.*Owner-Alpha.*Owner-Beta/) })
+    const alpha = (await adapter.mods()).find(mod => mod.name === 'Owner-Alpha')!
+    const beta = (await adapter.mods()).find(mod => mod.name === 'Owner-Beta')!
+    const side = (mod: typeof alpha, side: 'both' | 'server') => adapter.run('set-mod-side',
+      { modId: mod.id, expectedVersion: mod.version, side }, () => {}, new AbortController().signal)
+    await side(alpha, 'both')
+    await side(beta, 'server')
+    runtime = '5.4.17'
+    const ready = await adapter.clientPackagePlan()
+    expect(ready).toEqual({ ready: true, blockers: [], mods: [{ name: 'xiaoye97-BepInEx', version: '5.4.17' }, { name: 'Owner-Alpha', version: '1.0.0' }] })
+    await plugin('Owner', 'Alpha', '1.0.1')
+    await expect(adapter.run('create-client-package', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'MOD_SIDE_UNCONFIRMED' })
+    expect(await adapter.clientPackages()).toEqual([])
+    const upgraded = (await adapter.mods()).find(mod => mod.id === alpha.id)!
+    await side(upgraded, 'both')
+    const created = await adapter.run('create-client-package', {}, () => {}, new AbortController().signal)
+    expect((await adapter.clientPackageDetails(String(created.packageId))).profile?.mods).toEqual((await adapter.clientPackagePlan()).mods)
     expect(searchPackages).not.toHaveBeenCalled()
   })
 

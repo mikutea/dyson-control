@@ -4,7 +4,7 @@ import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import type { Mod } from '../../shared/contracts.js'
-import { clientPackageDownload, compareClientPackage, createR2ModmanPackage, listClientPackages, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, createR2ModmanPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { extractZipBuffer } from './updates.js'
 
 const mod = (name: string, version = '1.2.3', side: Mod['side'] = 'both', enabled = true): Mod => ({
@@ -30,11 +30,72 @@ describe('r2modman export', () => {
 
   it('rejects unidentifiable packages and versions instead of exporting a different version', () => {
     expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', '1.0.0', 'unknown')])).toThrow(/适用端/)
-    expect(() => createR2ModmanPackage('Profile', 'game.test\nRemoteAccessEnabled = true', [mod('Owner-Package')])).toThrow(/address/)
-    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('StandalonePlugin')])).toThrow(/identity/)
+    expect(() => createR2ModmanPackage('Profile', 'game.test\nRemoteAccessEnabled = true', [mod('Owner-Package')])).toThrow(/连接地址/)
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('StandalonePlugin')])).toThrow(/Thunderstore 作者名和包名/)
     for (const version of ['1.2.3-preview', '1.2.3.4', 'unknown']) {
-      expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', version)])).toThrow(/version/)
+      expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', version)])).toThrow(/三段版本号/)
     }
+  })
+})
+
+describe('client package creation plan', () => {
+  it('collects all actionable issues in one read and lists only the exact included packages', async () => {
+    const current = withClientRuntime([
+      mod('Owner-Ready', '1.2.3', 'client'), mod('Owner-NeedsSide', '0.2.0', 'unknown'),
+      mod('Unidentified', '1.2.3-preview', 'unknown'), mod('Ignored-Server', 'unsupported', 'server'),
+      mod('Ignored-Disabled', 'unsupported', 'unknown', false),
+    ], null)
+    const read = vi.fn(async () => current)
+    const plan = await readClientPackagePlan('fixture.example.test', read)
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(plan.ready).toBe(false)
+    expect(plan.mods).toEqual([{ name: 'Owner-Ready', version: '1.2.3' }])
+    expect(plan.blockers.map(issue => [issue.modName, issue.code])).toEqual([
+      ['xiaoye97-BepInEx', 'PACKAGE_LOCK_INCOMPLETE'], ['Owner-NeedsSide', 'MOD_SIDE_UNCONFIRMED'],
+      ['Unidentified', 'MOD_SIDE_UNCONFIRMED'], ['Unidentified', 'MOD_PACKAGE_UNIDENTIFIED'], ['Unidentified', 'MOD_VERSION_UNSUPPORTED'],
+    ])
+    expect(await readClientPackagePlan('fixture.test', [mod('Only-Server', '0.0.1', 'server')])).toMatchObject({ ready: false, mods: [], blockers: [{ code: 'NO_CLIENT_MODS' }] })
+  })
+
+  it('keeps unsafe display fields and inventory exceptions out of the read-only plan and job message', async () => {
+    const value = 'C:\\private-folder\\private-user\\token=value'
+    const privateMod = { ...mod(value, value, 'unknown'), id: value, description: value }
+    const plan = await readClientPackagePlan('bad endpoint ' + value, [privateMod])
+    expect(JSON.stringify(plan)).not.toContain('private-')
+    expect(plan.blockers.map(issue => issue.code)).toEqual(['INVALID_INPUT', 'MOD_SIDE_UNCONFIRMED', 'MOD_PACKAGE_UNIDENTIFIED', 'MOD_VERSION_UNSUPPORTED'])
+    expect(plan.blockers[1]).toMatchObject({ modName: '未识别模组 1', version: null })
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [privateMod])).toThrow('未识别模组 1')
+    try { createR2ModmanPackage('Profile', 'fixture.test', [privateMod]) } catch (error) { expect(String(error)).not.toContain('private-') }
+    const unreadable = await readClientPackagePlan('fixture.test', async () => { throw new Error(value) })
+    expect(unreadable).toMatchObject({ ready: false, mods: [], blockers: [{ code: 'CLIENT_MODS_UNAVAILABLE' }] })
+    expect(JSON.stringify(unreadable)).not.toContain('private-')
+  })
+
+  it('reruns the same check when creating, preserves earlier downloads when blocked, and exports the cleared plan', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-client-plan-'))
+    try {
+      const address = 'fixture.example.test:8469'
+      let mods = [mod('Owner-Alpha'), mod('Owner-Beta')]
+      const read = vi.fn(async () => mods)
+      const original = await writeClientPackage(root, address, read)
+      const before = await readClientPackagePlan(address, read)
+      expect(before).toMatchObject({ ready: true, blockers: [] })
+      mods = [mod('Owner-Alpha', '1.2.3', 'unknown'), mod('Owner-Beta', '1.3.2-preview')]
+      await expect(writeClientPackage(root, address, read)).rejects.toMatchObject({ message: expect.stringMatching(/Owner-Alpha.*Owner-Beta/) })
+      expect(await listClientPackages(root)).toEqual([original])
+      expect((await clientPackageDownload(root, original.id)).verifiedBytes).toBeDefined()
+      mods = [mod('Owner-Alpha', '1.2.3', 'server'), mod('Owner-Beta', '1.3.2', 'client')]
+      const plan = await readClientPackagePlan(address, read)
+      expect(plan).toEqual({ ready: true, blockers: [], mods: [{ name: 'Owner-Beta', version: '1.3.2' }] })
+      const item = await writeClientPackage(root, address, read)
+      const download = await clientPackageDownload(root, item.id)
+      const extracted = path.join(root, 'readback')
+      await extractZipBuffer(download.verifiedBytes!, extracted)
+      const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8'))
+      expect(profile.mods).toEqual([{ name: 'Owner-Beta', version: { major: 1, minor: 3, patch: 2 }, enabled: true }])
+      expect(await fs.readFile(path.join(extracted, 'config/nebula.cfg'), 'utf8')).toContain('LastIP = ' + address + '\n')
+      expect(read).toHaveBeenCalledTimes(5)
+    } finally { await fs.rm(root, { recursive: true, force: true }) }
   })
 })
 

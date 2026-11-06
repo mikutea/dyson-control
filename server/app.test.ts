@@ -411,6 +411,13 @@ describe('Dyson Control API', () => {
       const response = await app.inject({ method: 'GET', url: '/api/player-history?limit=1&offset=0', headers: { cookie } })
       expect(response.statusCode).toBe(200)
       expect(response.json().data).toMatchObject({ total: 1, status: 'available', entries: [{ type: 'join', name: 'Fixture player' }] })
+      const pageCursor = response.json().data.pageCursor
+      expect(pageCursor).toMatch(/^\d+$/)
+      expect((await app.inject({ method: 'GET', url: '/api/player-history?type=join&name=PLAYER&cursor=' + pageCursor, headers: { cookie } })).json().data.total).toBe(1)
+      expect((await app.inject({ method: 'GET', url: '/api/player-history?type=gap&name=PLAYER', headers: { cookie } })).json().data.total).toBe(0)
+      for (const query of ['cursor=1.2', 'cursor=1.2.3', 'cursor=9007199254740992', 'cursor=0&offset=1', 'type=unknown']) {
+        expect((await app.inject({ method: 'GET', url: '/api/player-history?' + query, headers: { cookie } })).statusCode).toBe(400)
+      }
       expect((await app.inject({ method: 'GET', url: '/api/player-history?limit=10001', headers: { cookie } })).statusCode).toBe(400)
     } finally { await app.close() }
   })
@@ -614,10 +621,15 @@ describe('Dyson Control API', () => {
     await app.ready()
     try {
       expect((await app.inject({ method: 'GET', url: '/api/client-packages/unlisted' })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'GET', url: '/api/client-package-plan' })).statusCode).toBe(401)
       const cookie = await loginCookie(app)
       const headers = { cookie }
       const action = (name: Action, input = {}) => app.inject({ method: 'POST', url: '/api/actions', headers,
         payload: { action: name, requestId: randomUUID(), input } })
+      expect((await app.inject({ method: 'GET', url: '/api/client-package-plan?extra=1', headers })).statusCode).toBe(400)
+      const plan = (await app.inject({ method: 'GET', url: '/api/client-package-plan', headers })).json().data
+      expect(plan).toMatchObject({ ready: true, blockers: [], mods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.17' }]) })
+      expect((await app.inject({ method: 'GET', url: '/api/client-packages', headers })).json().data).toEqual([])
       expect((await action('create-client-package')).statusCode).toBe(202)
       await waitForJobs(app, cookie, 1)
       const [item] = (await app.inject({ method: 'GET', url: '/api/client-packages', headers })).json().data as ClientPackage[]
@@ -628,6 +640,7 @@ describe('Dyson Control API', () => {
         address: fixture.config.game.address, mods: expect.arrayContaining([{ name: 'xiaoye97-BepInEx', version: '5.4.17' }])
       } })
       expect(original.profile.mods).not.toContainEqual(expect.objectContaining({ name: 'mikutea-DysonControlBridge' }))
+      expect(original.profile.mods).toEqual(plan.mods)
       expect((await action('install-update', { component: 'bepinex', version: '5.4.23' })).statusCode).toBe(202)
       await waitForJobs(app, cookie, 2)
       const changed = (await app.inject({ method: 'GET', url, headers })).json().data
@@ -996,6 +1009,7 @@ async function createFixture(delayMs = 0): Promise<{ directory: string; config: 
     async logs(): Promise<LogEntry[]> { return [] },
     async mods(): Promise<Mod[]> { return [] },
     async modCatalog() { return [] },
+    async modInstallPlan() { return [] },
     async modConfigs() { return [] },
     async modConfigHistory() { return [] },
     async modRemovalHistory() { return [] },

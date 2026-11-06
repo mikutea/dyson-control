@@ -6,7 +6,7 @@ import type {
   LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { GameAdapterError, invalidInput } from './errors.js'
-import { clientPackageDownload, compareClientPackage, listClientPackages, withClientRuntime, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { timestampId } from './system.js'
 import { writeStoredZip } from './zip.js'
 import { demoImportArchiveName, importUploadedBackup } from '../backup-import.js'
@@ -107,6 +107,18 @@ export class DemoGameAdapter implements GameAdapter {
     }))
   }
   async versions(): Promise<ComponentVersion[]> { return structuredClone(this.#versions) }
+  async modInstallPlan(packageName: string, version: string) {
+    const key = packageName.toLowerCase()
+    const component = this.#versions.find(item =>
+      (item.id === 'nebula' && key === 'nebula-nebulamultiplayermod') || (item.id === 'bepinex' && key === 'xiaoye97-bepinex'))
+    const item = (await this.modCatalog('')).find(entry => entry.package.toLowerCase() === key)
+    if ((!item && !component) || ![item?.latestVersion, item?.installedVersion, component?.current, component?.latest].includes(version)) {
+      throw new GameAdapterError('PACKAGE_VERSION_NOT_FOUND', '演示目录中没有这个包版本。')
+    }
+    const locked = (await this.#versionLocks.list()).find(lock => lock.package === key)
+    return [{ package: item?.package ?? packageName, version, installedVersion: component?.current ?? item?.installedVersion ?? null,
+      lockedVersion: locked?.version ?? null, downloadBytes: null }]
+  }
   async versionLocks() { return this.#versionLocks.list() }
   async updateHistory(): Promise<UpdateHistoryEntry[]> { return structuredClone(this.#history).reverse() }
   async modConfigs(): Promise<ModConfigFile[]> {
@@ -121,6 +133,8 @@ export class DemoGameAdapter implements GameAdapter {
   async settings(): Promise<GameSettings> { return structuredClone(this.#settings) }
   async settingsHistory(): Promise<GameSettingsHistoryEntry[]> { return structuredClone(this.#settingsHistory).reverse() }
   async clientPackages(): Promise<ClientPackage[]> { return listClientPackages(this.#packageDirectory) }
+
+  async clientPackagePlan() { return readClientPackagePlan(this.#settings.address, () => this.#clientMods()) }
 
   async clientPackageDetails(id: string) {
     return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
@@ -444,7 +458,7 @@ export class DemoGameAdapter implements GameAdapter {
 
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {
     report('正在生成可导入的 r2modman 配置包')
-    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, this.#clientMods())
+    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, () => this.#clientMods())
     return { packageId: item.id, fileName: item.name, modCount: item.modCount }
   }
 }

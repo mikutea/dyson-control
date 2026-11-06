@@ -3,7 +3,7 @@ import { createReadStream } from 'node:fs'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 import { inflateRawSync } from 'node:zlib'
-import type { ComponentVersion, ModCatalogEntry, ReportStep, UpdateHistoryEntry as UpdateHistoryDto } from '../../shared/contracts.js'
+import type { ComponentVersion, ModCatalogEntry, ModPlanEntry, ReportStep, UpdateHistoryEntry as UpdateHistoryDto } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 import type { VersionLockStore } from './version-locks.js'
 
@@ -100,6 +100,11 @@ export interface InstallResult extends Record<string, unknown> {
   restartRequired: true
 }
 
+export interface PreparedPackageInstall {
+  readonly component: InstallResult['component']; readonly package: string; readonly version: string
+  install(): Promise<InstallResult>
+}
+
 export interface ZipExtractLimits {
   maxEntries: number
   maxEntryBytes: number
@@ -133,9 +138,10 @@ interface CatalogPackageSource {
 
 interface PreparedPackage {
   item: ResolvedPackage
-  extracted: string
   sha256: string
+  files: Record<'plugins' | 'patchers' | 'config' | 'root', PreparedFile[]>
 }
+interface PreparedFile { source: string; relative: string; sha256: string }
 
 interface RollbackSource {
   kind: 'file' | 'directory'
@@ -153,6 +159,7 @@ interface Change {
   existed: boolean
   movedOld: boolean
   promoted: boolean
+  expectedPackageHash?: string
 }
 
 interface ManifestChange {
@@ -257,7 +264,8 @@ function findEndOfCentralDirectory(buffer: Buffer): number {
 export async function extractZipBuffer(
   archive: Uint8Array,
   destination: string,
-  limits: ZipExtractLimits = defaultExtractLimits
+  limits: ZipExtractLimits = defaultExtractLimits,
+  verify?: { signal: AbortSignal; files: Map<string, string> }
 ): Promise<string[]> {
   const buffer = Buffer.from(archive)
   if (buffer.length < 22) throw updateError('ARCHIVE_INVALID', 'ZIP archive is truncated.')
@@ -279,6 +287,7 @@ export async function extractZipBuffer(
   let cursor = centralOffset
   let totalBytes = 0
   for (let index = 0; index < totalEntries; index++) {
+    verify?.signal.throwIfAborted()
     if (cursor + 46 > buffer.length || buffer.readUInt32LE(cursor) !== 0x02014b50) throw updateError('ARCHIVE_INVALID', 'ZIP central directory is malformed.')
     const flags = buffer.readUInt16LE(cursor + 8)
     const method = buffer.readUInt16LE(cursor + 10)
@@ -318,7 +327,8 @@ export async function extractZipBuffer(
     if (data.length !== uncompressedSize || crc32(data) !== expectedCrc) throw updateError('ARCHIVE_CHECKSUM_FAILED', `ZIP entry failed size or CRC verification: ${name}`)
     const output = inside(destination, name)
     await fs.mkdir(path.dirname(output), { recursive: true })
-    await fs.writeFile(output, data, { flag: 'wx' })
+    await fs.writeFile(output, data, { flag: 'wx', signal: verify?.signal })
+    verify?.files.set(path.relative(destination, output), createHash('sha256').update(data).digest('hex'))
     written.push(name)
     totalBytes += data.length
   }
@@ -412,27 +422,37 @@ function selectVersion(item: ThunderstorePackage, requested?: string): Thunderst
   return [...item.versions].sort((left, right) => compareVersions(right.version, left.version))[0]!
 }
 
-async function readResponse(response: Response, maximum: number, label: string): Promise<Buffer> {
+async function readResponse(response: Response, maximum: number, label: string, signal: AbortSignal): Promise<Buffer> {
+  signal.throwIfAborted()
   if (!response.ok) throw updateError('UPDATE_DOWNLOAD_FAILED', `${label} returned HTTP ${response.status}.`)
   const declared = Number(response.headers.get('content-length'))
   if (Number.isFinite(declared) && declared > maximum) throw updateError('UPDATE_DOWNLOAD_TOO_LARGE', `${label} exceeds the configured download limit.`)
   if (!response.body) {
     const value = Buffer.from(await response.arrayBuffer())
+    signal.throwIfAborted()
     if (value.length > maximum) throw updateError('UPDATE_DOWNLOAD_TOO_LARGE', `${label} exceeds the configured download limit.`)
     return value
   }
   const reader = response.body.getReader()
+  const cancel = () => { void reader.cancel(signal.reason).catch(() => undefined) }
+  signal.addEventListener('abort', cancel, { once: true })
   const chunks: Buffer[] = []
   let total = 0
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    total += value.byteLength
-    if (total > maximum) {
-      await reader.cancel()
-      throw updateError('UPDATE_DOWNLOAD_TOO_LARGE', `${label} exceeds the configured download limit.`)
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      signal.throwIfAborted()
+      if (done) break
+      total += value.byteLength
+      if (total > maximum) {
+        await reader.cancel()
+        throw updateError('UPDATE_DOWNLOAD_TOO_LARGE', `${label} exceeds the configured download limit.`)
+      }
+      chunks.push(Buffer.from(value))
     }
-    chunks.push(Buffer.from(value))
+  } finally {
+    signal.removeEventListener('abort', cancel)
+    reader.releaseLock()
   }
   return Buffer.concat(chunks, total)
 }
@@ -465,15 +485,18 @@ async function sha256File(filePath: string): Promise<string> {
 
 async function backupDigest(source: string, kind: 'file' | 'directory'): Promise<string> {
   if (kind === 'file') return sha256File(source)
+  const files = []
+  for (const relative of await listFiles(source)) files.push({ relative, sha256: await sha256File(path.join(source, relative)) })
+  return directoryDigest(files)
+}
+
+function directoryDigest(files: Array<{ relative: string; sha256: string }>): string {
   const hash = createHash('sha256')
-  const files = (await listFiles(source)).sort((left, right) => left.localeCompare(right))
-  for (const relative of files) {
-    const normalized = relative.replace(/\\/g, '/')
-    const name = Buffer.from(normalized, 'utf8')
-    const digest = await sha256File(path.join(source, relative))
+  for (const file of [...files].sort((left, right) => left.relative.localeCompare(right.relative))) {
+    const name = Buffer.from(file.relative.replace(/\\/g, '/'), 'utf8')
     const length = Buffer.allocUnsafe(4)
     length.writeUInt32LE(name.length)
-    hash.update(length).update(name).update(Buffer.from(digest, 'hex'))
+    hash.update(length).update(name).update(Buffer.from(file.sha256, 'hex'))
   }
   return hash.digest('hex')
 }
@@ -660,14 +683,16 @@ export class GameUpdateManager {
   }
 
   async #catalog(signal: AbortSignal): Promise<ThunderstorePackage[]> {
+    signal.throwIfAborted()
     if (this.#catalogCache && Date.now() - this.#catalogCache.at < 5 * 60_000) return this.#catalogCache.value
     const url = this.#options.catalogUrl ?? THUNDERSTORE_DSP_CATALOG_URL
     let parsed: unknown
     try {
       const response = await this.#fetch(url, { headers: { accept: 'application/json' }, signal })
-      const body = await readResponse(response, maxCatalogBytes, 'Thunderstore package catalog')
+      const body = await readResponse(response, maxCatalogBytes, 'Thunderstore package catalog', signal)
       parsed = JSON.parse(body.toString('utf8'))
     } catch (error) {
+      signal.throwIfAborted()
       if (error instanceof GameAdapterError) throw error
       throw updateError('PACKAGE_CATALOG_UNAVAILABLE', 'Thunderstore package catalog could not be loaded.', error)
     }
@@ -756,6 +781,19 @@ export class GameUpdateManager {
     safeSegment(packageFullName, 'package name')
     const lock = await this.#readInstalledPackageLock()
     return lock?.packages.find((item) => item.package.toLowerCase() === packageFullName.toLowerCase())?.version ?? null
+  }
+
+  async describePackagePlan(packageName: string, version: string, signal: AbortSignal): Promise<ModPlanEntry[]> {
+    const [plan, installed, locks] = await Promise.all([
+      this.resolvePackagePlan(packageName, version, signal), this.#readInstalledPackageLock(), this.#options.versionLocks?.list(),
+    ])
+    const currentVersions = new Map(installed?.packages.map(item => [item.package.toLowerCase(), item.version]))
+    const lockedVersions = new Map(locks?.map(item => [item.package.toLowerCase(), item.version]))
+    return plan.map(item => {
+      const key = item.packageFullName.toLowerCase()
+      return { package: item.packageFullName, version: item.version, installedVersion: currentVersions.get(key) ?? null,
+        lockedVersion: lockedVersions.get(key) ?? null, downloadBytes: item.fileSize }
+    })
   }
 
   async searchPackages(query = '', limit = 50, signal = new AbortController().signal): Promise<PackageSearchResult[]> {
@@ -1031,16 +1069,18 @@ export class GameUpdateManager {
     component: 'game' | 'nebula' | 'bepinex',
     requestedVersion: string | undefined,
     report: ReportStep,
-    signal: AbortSignal
+    signal: AbortSignal,
+    prepared?: PreparedPackageInstall
   ): Promise<Record<string, unknown>> {
     signal.throwIfAborted()
     if (component === 'game') {
+      if (prepared) throw updateError('UPDATE_PREPARATION_MISMATCH', 'Thunderstore 包不能用于 Steam 游戏更新。')
       if (!this.#options.gameUpdateBackend) throw updateError('UPDATE_BACKEND_REQUIRED', 'Game updates require an explicitly configured and authorized Steam update backend.')
       await this.#assertStopped()
       await this.recoverInterrupted(report, signal)
       return this.#options.gameUpdateBackend.install(requestedVersion, report, signal)
     }
-    return this.installPackage(this.#packages[component], requestedVersion, component, report, signal)
+    return this.installPackage(this.#packages[component], requestedVersion, component, report, signal, prepared)
   }
 
   async installPackage(
@@ -1048,53 +1088,107 @@ export class GameUpdateManager {
     requestedVersion: string | undefined,
     component: 'nebula' | 'bepinex' | 'mod',
     report: ReportStep,
-    signal: AbortSignal
+    signal: AbortSignal,
+    prepared?: PreparedPackageInstall
   ): Promise<InstallResult> {
     signal.throwIfAborted()
     if (component === 'mod' && Object.values(this.#packages).some((item) => item.toLowerCase() === packageFullName.toLowerCase())) {
       throw updateError('CORE_COMPONENT_REQUIRED', `${packageFullName} must be installed through its component update action.`)
     }
+    if (prepared) {
+      if (prepared.package.toLowerCase() !== packageFullName.toLowerCase() || prepared.component !== component ||
+          (requestedVersion !== undefined && prepared.version !== requestedVersion)) {
+        throw updateError('UPDATE_PREPARATION_MISMATCH', '准备好的包与所选组件或版本不一致。')
+      }
+      return prepared.install()
+    }
+    // Direct callers (including first installation) must already own a stopped installation.
     await this.#assertStopped()
     await this.recoverInterrupted(report, signal)
+    const plan = await this.resolvePackagePlan(packageFullName, requestedVersion, signal)
+    return this.withPreparedPackages(plan, component, report, signal, verified => verified.install())
+  }
+
+  /** Keeps the verified files private to one operation, including through its save/stop handoff. */
+  async withPreparedPackages<T>(
+    plan: ResolvedPackage[], component: InstallResult['component'], report: ReportStep, signal: AbortSignal,
+    use: (prepared: PreparedPackageInstall) => Promise<T>
+  ): Promise<T> {
+    signal.throwIfAborted()
+    const root = plan.at(-1)
+    if (!root) throw updateError('PACKAGE_NOT_FOUND', '缺少需要安装的包。')
+    if (component === 'mod' && Object.values(this.#packages).some(name => name.toLowerCase() === root.packageFullName.toLowerCase())) {
+      throw updateError('CORE_COMPONENT_REQUIRED', `${root.packageFullName} must be installed through its component update action.`)
+    }
+    if (component !== 'mod' && root.packageFullName.toLowerCase() !== this.#packages[component].toLowerCase()) {
+      throw updateError('UPDATE_PREPARATION_MISMATCH', '解析出的包与所选组件不一致。')
+    }
     const operationId = safeSegment(this.#options.operationId?.() ?? `update-${Date.now()}-${randomUUID()}`, 'update operation id')
     const operationRoot = inside(this.#options.workDirectory, operationId)
     const backupRoot = inside(this.#options.backupDirectory, operationId)
-    const plan = await this.resolvePackagePlan(packageFullName, requestedVersion, signal)
     await this.#options.versionLocks?.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
     report(`已解析 ${plan.length} 个 Thunderstore 包及精确依赖`)
     if (await exists(operationRoot) || await exists(backupRoot)) throw updateError('UPDATE_OPERATION_EXISTS', `Update operation already exists: ${operationId}`)
-    await fs.mkdir(path.join(operationRoot, 'downloads'), { recursive: true })
-    await fs.mkdir(path.join(operationRoot, 'extracted'), { recursive: true })
-    await fs.mkdir(path.join(backupRoot, 'content'), { recursive: true })
-
+    await fs.mkdir(this.#options.workDirectory, { recursive: true })
+    await fs.mkdir(operationRoot)
     const prepared: PreparedPackage[] = []
+    let available = true
+    try {
+      await fs.mkdir(path.join(operationRoot, 'downloads'))
+      await fs.mkdir(path.join(operationRoot, 'extracted'))
+      for (const item of plan) {
+        signal.throwIfAborted()
+        if (item.packageFullName !== `${item.owner}-${item.packageName}` || item.name !== item.packageName || item.fullName !== `${item.packageFullName}-${item.version}`) {
+          throw updateError('PACKAGE_CATALOG_INVALID', 'Thunderstore 目录中的包标识或版本不一致。')
+        }
+        report(`正在下载 ${item.packageFullName} ${item.version}`)
+        let response: Response
+        try { response = await this.#fetch(item.downloadUrl, { signal }) }
+        catch (error) { signal.throwIfAborted(); throw updateError('UPDATE_DOWNLOAD_FAILED', `无法下载 ${item.fullName}。`, error) }
+        const bytes = await readResponse(response, maxArchiveBytes, item.fullName, signal)
+        signal.throwIfAborted()
+        if (item.fileSize !== null && bytes.length !== item.fileSize) throw updateError('UPDATE_DOWNLOAD_INVALID', `${item.fullName} size does not match Thunderstore metadata.`)
+        const digest = createHash('sha256').update(bytes).digest('hex')
+        const archiveName = `${safeSegment(item.packageFullName, 'package name')}-${safeSegment(item.version, 'package version')}.zip`
+        await fs.writeFile(path.join(operationRoot, 'downloads', archiveName), bytes, { flag: 'wx', signal })
+        const extracted = path.join(operationRoot, 'extracted', `${item.packageFullName}-${item.version}`)
+        const files = new Map<string, string>()
+        await extractZipBuffer(bytes, extracted, defaultExtractLimits, { signal, files })
+        await this.#validateManifest(extracted, files, item)
+        prepared.push({ item, sha256: digest, files: await this.#packageFiles(item, extracted, files) })
+      }
+      signal.throwIfAborted()
+      report('所有包及依赖均已下载并校验，准备进入离线安装')
+      signal.throwIfAborted()
+      return await use({ component, package: root.packageFullName, version: root.version, install: async () => {
+        if (!available) throw updateError('UPDATE_PREPARATION_EXPIRED', '这批临时包已经使用或清理，请重新准备。')
+        available = false
+        signal.throwIfAborted()
+        await this.#assertStopped()
+        await this.recoverInterrupted(report, signal)
+        await this.#options.versionLocks?.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
+        signal.throwIfAborted()
+        return this.#installPrepared(prepared, component, operationId, backupRoot, report, signal)
+      } })
+    } finally {
+      available = false
+      try { await fs.rm(operationRoot, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }) }
+      catch { report(`无法清理更新工作目录 ${operationId}，请检查文件占用。`) }
+    }
+  }
+
+  async #installPrepared(
+    prepared: PreparedPackage[], component: InstallResult['component'], operationId: string,
+    backupRoot: string, report: ReportStep, signal: AbortSignal
+  ): Promise<InstallResult> {
+    await fs.mkdir(this.#options.backupDirectory, { recursive: true })
+    await fs.mkdir(backupRoot)
     let preserveBackup = false
     let preparedChanges: Change[] | null = null
     let promotionStarted = false
     try {
-      for (const item of plan) {
-        signal.throwIfAborted()
-        report(`正在下载 ${item.packageFullName} ${item.version}`)
-        let response: Response
-        try { response = await this.#fetch(item.downloadUrl, { signal }) }
-        catch (error) { throw updateError('UPDATE_DOWNLOAD_FAILED', `Could not download ${item.fullName}.`, error) }
-        const bytes = await readResponse(response, maxArchiveBytes, item.fullName)
-        if (item.fileSize !== null && bytes.length !== item.fileSize) throw updateError('UPDATE_DOWNLOAD_INVALID', `${item.fullName} size does not match Thunderstore metadata.`)
-        const digest = createHash('sha256').update(bytes).digest('hex')
-        const archiveName = `${safeSegment(item.packageFullName, 'package name')}-${safeSegment(item.version, 'package version')}.zip`
-        await fs.writeFile(path.join(operationRoot, 'downloads', archiveName), bytes, { flag: 'wx' })
-        const extracted = path.join(operationRoot, 'extracted', `${item.packageFullName}-${item.version}`)
-        await extractZipBuffer(bytes, extracted)
-        await this.#validateManifest(extracted, item)
-        prepared.push({ item, extracted, sha256: digest })
-      }
-
-      let changes: Change[]
-      try { changes = await this.#prepareChanges(prepared, operationId, backupRoot) }
-      catch (error) {
-        await fs.rm(backupRoot, { recursive: true, force: true }).catch(() => undefined)
-        throw error
-      }
+      await fs.mkdir(path.join(backupRoot, 'content'))
+      const changes = await this.#prepareChanges(prepared, operationId, backupRoot)
       preparedChanges = changes
       const manifest: BackupManifest = {
         schema: 2,
@@ -1112,7 +1206,7 @@ export class GameUpdateManager {
       report('下载内容已校验，正在以可回滚事务安装')
       promotionStarted = true
       await this.#promote(changes, manifest, backupRoot, signal)
-      const root = plan.at(-1)!
+      const root = prepared.at(-1)!.item
       report(`${root.packageFullName} ${root.version} 已安装；重启后生效`)
       return {
         component,
@@ -1125,21 +1219,60 @@ export class GameUpdateManager {
       }
     } finally {
       if (preparedChanges && !promotionStarted) await this.#discardPreparedChanges(preparedChanges)
-      await fs.rm(operationRoot, { recursive: true, force: true }).catch(() => undefined)
       if (!preserveBackup) await fs.rm(backupRoot, { recursive: true, force: true }).catch(() => undefined)
     }
   }
 
-  async #validateManifest(extracted: string, item: ResolvedPackage): Promise<void> {
-    const manifestPath = path.join(extracted, 'manifest.json')
+  async #validateManifest(extracted: string, files: Map<string, string>, item: ResolvedPackage): Promise<void> {
+    const entry = [...files.keys()].find(relative => relative.toLowerCase() === 'manifest.json')
     let manifest: unknown
-    try { manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(await fs.readFile(manifestPath))) }
+    try {
+      if (!entry) throw new Error('Missing manifest')
+      const bytes = await fs.readFile(path.join(extracted, entry))
+      if (createHash('sha256').update(bytes).digest('hex') !== files.get(entry)) throw new Error('Manifest changed after extraction')
+      manifest = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes))
+    }
     catch (error) { throw updateError('PACKAGE_MANIFEST_INVALID', `${item.fullName} does not contain a valid root manifest.json.`, error) }
     if (!manifest || typeof manifest !== 'object') throw updateError('PACKAGE_MANIFEST_INVALID', `${item.fullName} manifest is malformed.`)
     const record = manifest as Record<string, unknown>
-    if (record.name !== item.packageName || record.version_number !== item.version) {
-      throw updateError('PACKAGE_MANIFEST_MISMATCH', `${item.fullName} manifest name or version does not match Thunderstore metadata.`)
+    const deps = record.dependencies === undefined ? [] : record.dependencies
+    if (record.name !== item.packageName || record.version_number !== item.version || !Array.isArray(deps) ||
+        deps.some(value => typeof value !== 'string') || JSON.stringify(deps.map(value => value.toLowerCase()).sort()) !==
+        JSON.stringify(item.dependencies.map(value => value.toLowerCase()).sort())) {
+      throw updateError('PACKAGE_MANIFEST_MISMATCH', `${item.fullName} 的清单名称、版本或依赖与目录不一致。`)
     }
+  }
+
+  async #packageFiles(item: ResolvedPackage, extracted: string, hashes: Map<string, string>): Promise<PreparedPackage['files']> {
+    const files: PreparedPackage['files'] = { plugins: [], patchers: [], config: [], root: [] }
+    const bepinex = item.packageFullName.toLowerCase() === this.#packages.bepinex.toLowerCase()
+    const pack = bepinex && (await fs.readdir(extracted, { withFileTypes: true }))
+      .find(entry => entry.isDirectory() && entry.name.toLowerCase() === 'bepinexpack')?.name
+    const targets = new Set<string>()
+    for (const [sourceRelative, sha256] of hashes) {
+      const segments = sourceRelative.split(path.sep)
+      let group: keyof PreparedPackage['files'] = 'plugins'
+      let start = 0
+      if (bepinex) {
+        group = 'root'
+        if (pack) {
+          if (segments[0] !== pack) continue
+          start = 1
+        } else if (metadataFiles.has(sourceRelative.toLowerCase())) continue
+      } else {
+        const offset = segments[0].toLowerCase() === 'bepinex' ? 1 : 0
+        const folder = segments[offset]?.toLowerCase()
+        if (folder === 'plugins' || folder === 'patchers' || folder === 'config') { group = folder; start = offset + 1 }
+      }
+      const relative = segments.slice(start).join(path.sep)
+      if (!relative) continue
+      const key = group + '/' + relative.toLowerCase()
+      if (targets.has(key)) throw updateError('PACKAGE_FILE_CONFLICT', `${item.fullName} 的多个文件指向相同的安装位置。`)
+      targets.add(key)
+      files[group].push({ relative, sha256, source: path.join(extracted, sourceRelative) })
+    }
+    if (bepinex && !files.root.length) throw updateError('PACKAGE_LAYOUT_INVALID', `${item.fullName} 中没有可安装的 BepInEx 文件。`)
+    return files
   }
 
   async #prepareChanges(prepared: PreparedPackage[], operationId: string, backupRoot: string): Promise<Change[]> {
@@ -1521,14 +1654,9 @@ export class GameUpdateManager {
   }
 
   async #prepareBepInExChanges(item: PreparedPackage, operationId: string, backupRoot: string): Promise<Change[]> {
-    const top = await fs.readdir(item.extracted, { withFileTypes: true })
-    const pack = top.find((entry) => entry.isDirectory() && entry.name.toLowerCase() === 'bepinexpack')
-    const sourceRoot = pack ? path.join(item.extracted, pack.name) : item.extracted
-    const files = (await listFiles(sourceRoot)).filter((relative) => pack || !metadataFiles.has(relative.toLowerCase()))
-    if (files.length === 0) throw updateError('PACKAGE_LAYOUT_INVALID', `${item.item.fullName} contains no installable BepInEx files.`)
     const changes: Change[] = []
     try {
-      for (const relative of files) {
+      for (const { relative, source, sha256 } of item.files.root) {
         const target = inside(this.#options.gameRoot, relative)
         const stat = await fs.lstat(target).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
         if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw updateError('UPDATE_TARGET_INVALID', `BepInEx update target is not a regular file: ${relative}`)
@@ -1538,9 +1666,9 @@ export class GameUpdateManager {
         const staged = `${target}.dyson-stage-${operationId}`
         const rollback = `${target}.dyson-rollback-${operationId}`
         if (await exists(staged) || await exists(rollback)) throw updateError('UPDATE_STAGE_CONFLICT', `Update staging path already exists for ${relative}.`)
-        const change: Change = { kind: 'file', target, staged, rollback, backup, existed: Boolean(stat), movedOld: false, promoted: false }
+        const change: Change = { kind: 'file', target, staged, rollback, backup, existed: Boolean(stat), movedOld: false, promoted: false, expectedPackageHash: sha256 }
         changes.push(change)
-        await fs.copyFile(path.join(sourceRoot, relative), staged, fs.constants.COPYFILE_EXCL)
+        await fs.copyFile(source, staged, fs.constants.COPYFILE_EXCL)
       }
       return changes
     } catch (error) {
@@ -1553,25 +1681,7 @@ export class GameUpdateManager {
     const pluginTarget = await this.#installedPluginTarget(item.item) ?? inside(this.#options.gameRoot, path.join('BepInEx', 'plugins', item.item.packageFullName))
     const disabled = path.basename(path.dirname(pluginTarget)).toLowerCase() === 'disabled-plugins'
     const patcherTarget = inside(this.#options.gameRoot, path.join('BepInEx', disabled ? 'disabled-patchers' : 'patchers', path.basename(pluginTarget)))
-    const pluginFiles: Array<{ source: string; relative: string }> = []
-    const patcherFiles: Array<{ source: string; relative: string }> = []
-    const configFiles: Array<{ source: string; relative: string }> = []
-
-    for (const relative of await listFiles(item.extracted)) {
-      const segments = relative.split(path.sep)
-      const lower = segments.map((segment) => segment.toLowerCase())
-      let target = pluginFiles
-      let start = 0
-      if (lower[0] === 'bepinex' && lower[1] === 'plugins') start = 2
-      else if (lower[0] === 'bepinex' && lower[1] === 'patchers') { target = patcherFiles; start = 2 }
-      else if (lower[0] === 'bepinex' && lower[1] === 'config') { target = configFiles; start = 2 }
-      else if (lower[0] === 'plugins') start = 1
-      else if (lower[0] === 'patchers') { target = patcherFiles; start = 1 }
-      else if (lower[0] === 'config') { target = configFiles; start = 1 }
-      const mapped = segments.slice(start).join(path.sep)
-      if (!mapped) continue
-      target.push({ source: path.join(item.extracted, relative), relative: mapped })
-    }
+    const { plugins: pluginFiles, patchers: patcherFiles, config: configFiles } = item.files
 
     const changes: Change[] = []
     try {
@@ -1591,7 +1701,7 @@ export class GameUpdateManager {
         const staged = `${target}.dyson-stage-${operationId}`
         const rollback = `${target}.dyson-rollback-${operationId}`
         if (await exists(staged) || await exists(rollback)) throw updateError('UPDATE_STAGE_CONFLICT', `Update staging path already exists for ${file.relative}.`)
-        const change: Change = { kind: 'file', target, staged, rollback, backup: null, existed: false, movedOld: false, promoted: false }
+        const change: Change = { kind: 'file', target, staged, rollback, backup: null, existed: false, movedOld: false, promoted: false, expectedPackageHash: file.sha256 }
         changes.push(change)
         await fs.copyFile(file.source, staged, fs.constants.COPYFILE_EXCL)
       }
@@ -1604,7 +1714,7 @@ export class GameUpdateManager {
 
   async #prepareDirectoryChange(
     target: string,
-    files: Array<{ source: string; relative: string }>,
+    files: PreparedFile[],
     operationId: string,
     backupRoot: string
   ): Promise<Change> {
@@ -1630,7 +1740,8 @@ export class GameUpdateManager {
         throw error
       }
     }
-    return { kind: 'directory', target, staged, rollback, backup, existed: Boolean(stat), movedOld: false, promoted: false }
+    return { kind: 'directory', target, staged, rollback, backup, existed: Boolean(stat), movedOld: false, promoted: false,
+      expectedPackageHash: staged ? directoryDigest(files) : undefined }
   }
 
   async #installedPluginTarget(item: ResolvedPackage): Promise<string | null> {
@@ -1742,6 +1853,9 @@ export class GameUpdateManager {
     for (const change of changes) {
       const beforeSha256 = change.backup ? await backupDigest(change.backup, change.kind) : null
       const afterSha256 = change.staged ? await backupDigest(change.staged, change.kind) : null
+      if (change.expectedPackageHash !== undefined && change.expectedPackageHash !== afterSha256) {
+        throw updateError('UPDATE_PREPARED_CHANGED', '临时包内容已变化，请重新下载安装。')
+      }
       const transaction = transactionPaths(change.target, change.kind, path.basename(backupRoot))
       if ((change.staged !== null && path.resolve(change.staged) !== path.resolve(transaction.staged)) ||
           path.resolve(change.rollback) !== path.resolve(transaction.rollback)) {

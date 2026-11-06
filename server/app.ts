@@ -13,7 +13,7 @@ import { EventHub } from './events.js'
 import { loadHealthIdentity, MaintenanceGate } from './health.js'
 import { JobQueue, JobStore } from './jobs.js'
 import { RuntimeMonitor, runtimeSettingsSchema } from './runtime.js'
-import { PlayerHistoryStore } from './player-history.js'
+import { PlayerHistoryStore, playerHistoryQuery } from './player-history.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
 import { openGameLog } from './game/logs.js'
@@ -264,8 +264,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
   app.get('/api/players', async (request) => { assertNoQuery(request); return data(await adapter.players()) })
   app.get('/api/player-history', async request => {
-    const query = z.object({ limit: z.coerce.number().int().min(1).max(200).default(100), offset: z.coerce.number().int().min(0).max(10_000).default(0) }).strict().parse(request.query)
-    return data(playerHistory.read(query.limit, query.offset))
+    const query = playerHistoryQuery.parse(request.query)
+    return data(playerHistory.read(query.limit, query.offset, query))
   })
   app.get('/api/logs', async (request) => { assertNoQuery(request); return data(await adapter.logs()) })
   app.get('/api/logs/download', async (request, reply) => {
@@ -280,6 +280,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/mod-catalog', async (request) => {
     const query = z.object({ search: z.string().trim().max(128).default('') }).strict().parse(request.query)
     return data(await adapter.modCatalog(query.search))
+  })
+  app.get('/api/mod-catalog/plan', async request => {
+    const query = z.object({
+      package: z.string().max(200).regex(/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/),
+      version: z.string().max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._+-]*$/),
+    }).strict().parse(request.query)
+    return data(await adapter.modInstallPlan(query.package, query.version))
   })
   app.get('/api/mod-configs', async (request) => { assertNoQuery(request); return data(await adapter.modConfigs()) })
   app.get('/api/mod-removal-history', async request => { assertNoQuery(request); return data(await adapter.modRemovalHistory()) })
@@ -332,6 +339,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
   app.get('/api/settings', async (request) => { assertNoQuery(request); return data(await adapter.settings()) })
   app.get('/api/settings-history', async request => { assertNoQuery(request); return data(await adapter.settingsHistory()) })
+  app.get('/api/client-package-plan', async request => {
+    assertNoQuery(request)
+    if (!adapter.clientPackagePlan) throw new ApiError(501, 'client_plan_unavailable', '当前适配器无法检查客户端包。')
+    return data(await adapter.clientPackagePlan())
+  })
   app.get('/api/client-packages', async (request) => { assertNoQuery(request); return data(await adapter.clientPackages()) })
   app.get('/api/client-packages/:id', async (request) => {
     assertNoQuery(request)

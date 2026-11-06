@@ -21,7 +21,7 @@ import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { clientPackageDownload, compareClientPackage, listClientPackages, withClientRuntime, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
 import { SettingsHistoryManager } from './settings-history.js'
@@ -47,8 +47,8 @@ type WindowsScriptRunner = <T>(name: string, input: unknown, signal?: AbortSigna
 interface WindowsAdapterOptions {
   inspect?: () => Promise<InspectResult>
   updates?: Pick<GameUpdateManager,
-    'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
-    'installedPackageVersion' | 'searchPackages' | 'updateHistory' | 'recoverInterrupted'>
+    'versions' | 'resolvePackagePlan' | 'withPreparedPackages' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
+    'installedPackageVersion' | 'searchPackages' | 'describePackagePlan' | 'updateHistory' | 'recoverInterrupted'>
   runScript?: WindowsScriptRunner
   logicalProcessorCount?: number
   clock?: () => number
@@ -126,8 +126,8 @@ export class WindowsGameAdapter implements GameAdapter {
   readonly #retention: BackupRetention
   readonly #inspectOverride: WindowsAdapterOptions['inspect']
   readonly #updates: Pick<GameUpdateManager,
-    'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
-    'installedPackageVersion' | 'searchPackages' | 'updateHistory' | 'recoverInterrupted'>
+    'versions' | 'resolvePackagePlan' | 'withPreparedPackages' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
+    'installedPackageVersion' | 'searchPackages' | 'describePackagePlan' | 'updateHistory' | 'recoverInterrupted'>
   readonly #updateOverrideConfigured: boolean
   readonly #runScript: WindowsScriptRunner
   readonly #modConfig: ModConfigManager
@@ -498,6 +498,11 @@ export class WindowsGameAdapter implements GameAdapter {
     return listClientPackages(this.#packageDirectory)
   }
 
+  async clientPackagePlan() {
+    await this.#initialization
+    return readClientPackagePlan(this.#settings.address, () => this.#clientMods())
+  }
+
   async clientPackageDetails(id: string) {
     await this.#initialization
     return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
@@ -508,6 +513,11 @@ export class WindowsGameAdapter implements GameAdapter {
   async modCatalog(search: string): Promise<ModCatalogEntry[]> {
     await this.#initialization
     return this.#updates.searchPackages(search)
+  }
+
+  async modInstallPlan(packageName: string, version: string) {
+    await this.#initialization
+    return this.#updates.describePackagePlan(packageName, version, AbortSignal.timeout(30_000))
   }
 
   async modConfigs(): Promise<ModConfigFile[]> {
@@ -1355,10 +1365,7 @@ export class WindowsGameAdapter implements GameAdapter {
       // Fail before saving/stopping players when login or a version query already owns SteamCMD.
       const release = acquireSteamProcess(steamExecutable(this.#config)); release()
       if (version) await this.#versionLocks.assertPlan([{ package: GAME_VERSION_LOCK_ID, version }])
-    } else {
-      const plan = await this.#updates.resolvePackagePlan(componentPackageIds[component], version, signal)
-      await this.#versionLocks.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
-    }
+    } else return this.#installThunderstorePackage(componentPackageIds[component], version, component, report, signal)
     return this.#runOfflinePackageOperation(
       () => this.#updates.installComponent(component, version, report, signal),
       'automatic-before-update', '更新', report, signal,
@@ -1375,13 +1382,26 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     const packageName = input.package
     const version = typeof input.version === 'string' ? input.version.trim() : undefined
+    return this.#installThunderstorePackage(packageName, version, 'mod', report, signal)
+  }
+
+  async #installThunderstorePackage(
+    packageName: string, version: string | undefined, component: 'nebula' | 'bepinex' | 'mod', report: ReportStep, signal: AbortSignal
+  ): Promise<Record<string, unknown>> {
     const plan = await this.#updates.resolvePackagePlan(packageName, version, signal)
-    await this.#versionLocks.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
-    return this.#runOfflinePackageOperation(
-      () => this.#updates.installPackage(packageName, version, 'mod', report, signal),
-      'automatic-before-mod-install', '模组安装', report, signal,
-      result => this.#rollbackInstalledPackage(result, report)
-    )
+    const versions = plan.map(item => ({ package: item.packageFullName, version: item.version }))
+    await this.#versionLocks.assertPlan(versions)
+    return this.#updates.withPreparedPackages(plan, component, report, signal, async prepared => {
+      await this.#versionLocks.assertPlan(versions)
+      signal.throwIfAborted()
+      return this.#runOfflinePackageOperation(
+        () => component === 'mod' ? this.#updates.installPackage(packageName, version, component, report, signal, prepared)
+          : this.#updates.installComponent(component, version, report, signal, prepared),
+        component === 'mod' ? 'automatic-before-mod-install' : 'automatic-before-update',
+        component === 'mod' ? '模组安装' : '更新', report, signal,
+        result => this.#rollbackInstalledPackage(result, report)
+      )
+    })
   }
 
   async #rollbackUpdate(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -1401,6 +1421,7 @@ export class WindowsGameAdapter implements GameAdapter {
     recoverInstalled?: (result: Record<string, unknown>) => Promise<void>
   ): Promise<Record<string, unknown>> {
     const before = await this.#inspect(true)
+    signal.throwIfAborted()
     const wasRunning = Boolean(before.process)
     let automaticBackupId: string | null = null
     let stoppedForOperation = false
@@ -1412,6 +1433,7 @@ export class WindowsGameAdapter implements GameAdapter {
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
       await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
+      signal.throwIfAborted()
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1783,14 +1805,13 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #clientMods(): Promise<Mod[]> {
-    const [mods, runtime] = await Promise.all([this.mods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx')])
+    const [mods, runtime] = await Promise.all([this.mods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx').catch(() => null)])
     return withClientRuntime(mods, runtime)
   }
 
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {
     report('正在生成可导入的 r2modman 配置包')
-    const mods = await this.#clientMods()
-    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, mods)
+    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, () => this.#clientMods())
     report(`客户端配置包已生成，共包含 ${item.modCount} 个模组`)
     return { packageId: item.id, fileName: item.name, modCount: item.modCount }
   }

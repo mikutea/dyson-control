@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -87,6 +88,28 @@ function fixtureFetch(packages: ReturnType<typeof packageFixture>[]): typeof fet
   }) as typeof fetch
 }
 
+it('shows the exact transitive package and lock versions while the game is running without downloading archives', async () => {
+  const roots = await fixtureRoot()
+  const dependency = packageFixture({ owner: 'libs', name: 'Shared', version: '2.0.0' })
+  const middle = packageFixture({ owner: 'sdk', name: 'Support', version: '1.0.0', dependencies: ['libs-Shared-2.0.0'] })
+  const feature = packageFixture({ owner: 'mods', name: 'Feature', version: '3.0.0', dependencies: ['sdk-Support-1.0.0'] })
+  const locks = new VersionLockStore(path.join(roots.root, 'locks.json'))
+  await locks.set('libs-Shared', '1.0.0', true)
+  const get = fixtureFetch([dependency, middle, feature])
+  const calls: string[] = []
+  const manager = new GameUpdateManager({ gameRoot: roots.game, workDirectory: roots.work, backupDirectory: roots.backups,
+    catalogUrl: 'https://catalog.test/packages', isGameRunning: async () => true, versionLocks: locks,
+    fetch: async (url, init) => { calls.push(String(url)); return get(url, init) } })
+  const rows = await manager.describePackagePlan('mods-Feature', '3.0.0', new AbortController().signal)
+  expect(rows.map(row => [row.package, row.version, row.lockedVersion, row.downloadBytes])).toEqual([
+    ['libs-Shared', '2.0.0', '1.0.0', dependency.archive.length],
+    ['sdk-Support', '1.0.0', null, middle.archive.length],
+    ['mods-Feature', '3.0.0', null, feature.archive.length],
+  ])
+  expect(rows.every(row => row.installedVersion === null)).toBe(true)
+  expect(calls).toEqual(['https://catalog.test/packages'])
+})
+
 function manager(
   roots: Awaited<ReturnType<typeof fixtureRoot>>,
   packages: ReturnType<typeof packageFixture>[],
@@ -162,6 +185,52 @@ describe('safe ZIP extraction', () => {
 })
 
 describe('Thunderstore updates', () => {
+  it('prepares one exact dependency set while running and installs its recorded bytes without fetching again', async () => {
+    const roots = await fixtureRoot()
+    const dep = packageFixture({ owner: 'lib', name: 'Shared', version: '1.0.0' })
+    const mod = packageFixture({ owner: 'mods', name: 'Feature', version: '2.0.0', dependencies: ['lib-Shared-1.0.0'] })
+    const fetch = fixtureFetch([dep, mod])
+    const calls: string[] = []
+    let running = true
+    const updates = new GameUpdateManager({ gameRoot: roots.game, workDirectory: roots.work, backupDirectory: roots.backups,
+      catalogUrl: 'https://catalog.test/packages', isGameRunning: async () => running, operationId: () => 'one-preparation',
+      fetch: async (input, init) => { expect(running).toBe(true); calls.push(String(input)); return fetch(input, init) } })
+    const signal = new AbortController().signal
+    const report = () => {}
+    const plan = await updates.resolvePackagePlan('mods-Feature', undefined, signal)
+    const result = await updates.withPreparedPackages(plan, 'mod', report, signal, async verified => {
+      expect(calls).toEqual(['https://catalog.test/packages', dep.url, mod.url])
+      expect(await fs.readdir(roots.game)).toEqual([])
+      expect(await fs.readdir(roots.backups)).toEqual([])
+      running = false
+      await expect(updates.installPackage('mods-Other', undefined, 'mod', report, signal, verified)).rejects.toMatchObject({ code: 'UPDATE_PREPARATION_MISMATCH' })
+      const installed = await updates.installPackage('mods-Feature', undefined, 'mod', report, signal, verified)
+      await expect(verified.install()).rejects.toMatchObject({ code: 'UPDATE_PREPARATION_EXPIRED' })
+      return installed
+    })
+    expect(result.installed.map(item => item.sha256)).toEqual([dep, mod].map(pkg => createHash('sha256').update(pkg.archive).digest('hex')))
+    expect(await fs.readFile(path.join(roots.game, 'BepInEx', 'plugins', 'mods-Feature', 'Feature.dll'), 'utf8')).toBe('mods-Feature-2.0.0-binary')
+    expect(await fs.readdir(roots.work)).toEqual([])
+    await expect(updates.rollbackUpdate(result.backupId, report, signal)).resolves.toMatchObject({ historyId: result.backupId })
+  })
+
+  it.each(['payload', 'config', 'bepinex'] as const)('rejects changed prepared %s bytes before promotion', async kind => {
+    const roots = await fixtureRoot()
+    const bep = kind === 'bepinex'
+    const relative = bep ? 'BepInExPack/BepInEx/core/Core.dll' : kind === 'config' ? 'config/setting.cfg' : 'plugins/Feature.dll'
+    const pkg = packageFixture({ owner: bep ? 'xiaoye97' : 'mods', name: bep ? 'BepInEx' : 'Feature', version: '1.0.0', entries: [{ name: relative, data: 'verified bytes' }] })
+    const name = bep ? 'xiaoye97-BepInEx' : 'mods-Feature'
+    const update = manager(roots, [pkg], 'modified-stage')
+    const signal = new AbortController().signal
+    const plan = await update.resolvePackagePlan(name, undefined, signal)
+    await expect(update.withPreparedPackages(plan, bep ? 'bepinex' : 'mod', () => {}, signal, async prepared => {
+      await fs.writeFile(path.join(roots.work, 'modified-stage', 'extracted', name + '-1.0.0', relative), 'tampered bytes')
+      return prepared.install()
+    })).rejects.toMatchObject({ code: 'UPDATE_PREPARED_CHANGED' })
+    expect(await fs.readdir(roots.work)).toEqual([])
+    expect(await fs.readdir(roots.backups)).toEqual([])
+    await expect(fs.lstat(path.join(roots.game, 'BepInEx', '.dyson-control-packages.json'))).rejects.toMatchObject({ code: 'ENOENT' })
+  })
   it('discovers official package metadata while keeping game updates explicitly unconfigured', async () => {
     const roots = await fixtureRoot()
     const bepinex = packageFixture({ owner: 'xiaoye97', name: 'BepInEx', version: '5.4.17' })
