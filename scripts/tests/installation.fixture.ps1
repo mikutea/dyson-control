@@ -331,7 +331,11 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
       [string]$helperStatus.activeVersion -cne $nextVersion -or [string]$helperStatus.installRoot -cne $installRoot -or
       [int]$helperStatus.previousProcessId -ne [int]$first.processId -or -not [bool]$helperStatus.accepting -or
       [string]$helperStatus.status -cne 'succeeded' -or [string]$helperStatus.step -cne 'complete') {
-    throw "The SYSTEM control update helper did not succeed: $([string]$helperStatus.status)"
+    $helperTask = Get-ScheduledTask -TaskName $helperTaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    $taskInfo = Get-ScheduledTaskInfo -TaskName $helperTaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    $taskState = if ($helperTask) { [string]$helperTask.State } else { 'absent' }
+    $taskResult = if ($taskInfo) { [string]$taskInfo.LastTaskResult } else { 'unknown' }
+    throw "The SYSTEM control update helper did not succeed: status=$($helperStatus.status) step=$($helperStatus.step) updated=$($helperStatus.updatedAt) task=$taskState result=$taskResult"
   }
   Wait-FixtureTaskAbsent $helperTaskName 15
 

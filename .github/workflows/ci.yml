@@ -202,10 +202,20 @@ jobs:
           $out = Join-Path $env:RUNNER_TEMP 'dyson-control-release'
           $zip = @(Get-ChildItem -LiteralPath $out -Filter 'dyson-control-v*-windows-panel-only.zip' -File)
           if ($zip.Count -ne 1) { throw 'Expected exactly one panel-only release ZIP.' }
+          # The SYSTEM upgrade task has a different npm cache from the CI runner.
+          # Reuse the locked tarballs fetched by npm ci, including for the SYSTEM task.
+          $npm = (Get-Command npm.cmd).Source
+          $cache = (& $npm config get cache).Trim()
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $cache -PathType Container)) { throw 'Missing CI npm cache.' }
+          $fixtureNpm = Join-Path $env:RUNNER_TEMP 'dyson-fixture-npm.cmd'
+          $commands = @('@echo off', 'setlocal DisableDelayedExpansion',
+            ('set "npm_config_cache={0}"' -f $cache.Replace('%', '%%')),
+            'set "npm_config_offline=true"', ('"{0}" %*' -f $npm.Replace('%', '%%')))
+          [IO.File]::WriteAllLines($fixtureNpm, $commands, [Text.Encoding]::Default)
           .\scripts\tests\installation.fixture.ps1 `
             -ReleaseArchive $zip[0].FullName `
             -NodePath (Get-Command node.exe).Source `
-            -NpmPath (Get-Command npm.cmd).Source `
+            -NpmPath $fixtureNpm `
             -LongPaths
 
       - name: Upload release candidate
