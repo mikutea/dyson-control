@@ -16,6 +16,7 @@ import { RuntimeMonitor, runtimeSettingsSchema } from './runtime.js'
 import { PlayerHistoryStore, playerHistoryQuery } from './player-history.js'
 import { startReadinessMessages } from './game/start-readiness.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
+import { recoverImportStages } from './backup-import.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
 import { openGameLog } from './game/logs.js'
 import { playerIdPattern } from './game/bridge.js'
@@ -104,7 +105,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const store = new JobStore(options.databasePath ?? resolve(options.config.dataDirectory, 'control.sqlite'))
   const recoveredJobs = store.recoverInterruptedJobs()
   const uploads = new BackupUploadStore(options.config.dataDirectory)
-  await uploads.initialize((requestId) => store.findByRequestId(requestId))
+  const protectedImports = await recoverImportStages(options.config, (requestId, uploadId) => {
+    const job = store.findByRequestId(requestId)
+    return job?.action === 'import-backup' && (job.state === 'interrupted' || job.state === 'failed') && store.input(job.id).uploadId === uploadId
+  })
+  if (protectedImports.size) app.log.warn({ count: protectedImports.size }, '保留了仍在使用或无法核实归属的导入暂存记录。')
+  await uploads.initialize((requestId) => store.findByRequestId(requestId), protectedImports)
   const queue = new JobQueue(store, adapter, {
     maxOutstandingJobs: options.maxOutstandingJobs,
     jobTimeoutMs: options.jobTimeoutMs,

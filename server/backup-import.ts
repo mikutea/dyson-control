@@ -1,12 +1,13 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, createWriteStream } from 'node:fs'
 import fs, { type FileHandle } from 'node:fs/promises'
+import os from 'node:os'
 import path from 'node:path'
 import { Readable, Transform, Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { crc32, createInflateRaw } from 'node:zlib'
 import type { ControlConfig, ReportStep } from '../shared/contracts.js'
-import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
+import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES, type BackupUploadMetadata } from './uploads.js'
 
 interface BackupManifest {
   schema: 1
@@ -52,6 +53,133 @@ interface ImportPlan {
   members: Array<{ fileName: string; entry: ZipEntry; expectedSha256?: string }>
 }
 
+interface ImportStageClaim {
+  schema: 1
+  uploadId: string
+  requestId: string
+  token: string
+  host: string
+  pid: number
+  dataRoot: string
+  backupRoot: string
+  saveName: string
+  directoryId: string
+  payloadId: string
+}
+
+const claimSuffix = '.import-claim.json'
+const uuidPattern = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/
+const claimPath = (claim: ImportStageClaim) => path.join(claim.dataRoot, 'uploads', claim.uploadId + claimSuffix)
+const stagePath = (claim: ImportStageClaim) => path.join(claim.backupRoot, '.import-' + claim.uploadId)
+const ownerFile = '.owner'
+
+function maybeStat(file: string) {
+  return fs.lstat(file).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
+}
+
+function directoryId(stat: { dev: bigint; ino: bigint; birthtimeNs: bigint }): string {
+  return `${stat.dev}/${stat.ino}/${stat.birthtimeNs}`
+}
+
+async function reserveStage(config: ControlConfig, metadata: BackupUploadMetadata, saveName: string): Promise<ImportStageClaim> {
+  const backupRoot = await fs.realpath(config.game.backupDirectory)
+  const dataRoot = await fs.realpath(config.dataDirectory)
+  const stage = path.join(backupRoot, '.import-' + metadata.uploadId)
+  const payload = path.join(stage, 'files')
+  const marker = path.join(stage, ownerFile)
+  const token = randomUUID()
+  await fs.mkdir(stage, { mode: 0o700 })
+  let createdPayload = false, createdMarker = false
+  try {
+    await fs.mkdir(payload, { mode: 0o700 }); createdPayload = true
+    await fs.writeFile(marker, token, { flag: 'wx', mode: 0o600 }); createdMarker = true
+    const [rootStat, payloadStat] = await Promise.all([fs.lstat(stage, { bigint: true }), fs.lstat(payload, { bigint: true })])
+    const claim: ImportStageClaim = {
+      schema: 1, uploadId: metadata.uploadId, requestId: metadata.requestId, token,
+      host: os.hostname(), pid: process.pid, dataRoot, backupRoot, saveName,
+      directoryId: directoryId(rootStat), payloadId: directoryId(payloadStat)
+    }
+    await fs.writeFile(claimPath(claim), JSON.stringify(claim), { flag: 'wx', mode: 0o600 })
+    return claim
+  } catch (error) {
+    // An existing name belongs to its creator. No archive bytes are written until reservation succeeds.
+    if (createdPayload) await fs.rmdir(payload)
+    if (createdMarker) await fs.unlink(marker)
+    await fs.rmdir(stage)
+    throw error
+  }
+}
+
+/** Remove only known plain files under the directory that still bears this private claim's nonce. */
+async function removeStage(claim: ImportStageClaim): Promise<boolean> {
+  const stage = stagePath(claim)
+  const root = await fs.lstat(stage, { bigint: true }).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
+  if (root) {
+    if (!root.isDirectory() || root.isSymbolicLink() || claim.directoryId !== directoryId(root)) return false
+    const marker = path.join(stage, ownerFile), markerStat = await maybeStat(marker)
+    const children = await fs.readdir(stage)
+    if (children.some(name => name !== ownerFile && name !== 'files')) return false
+    if (children.length && (!markerStat?.isFile() || markerStat.isSymbolicLink() || markerStat.nlink !== 1 || markerStat.size !== claim.token.length ||
+        await fs.readFile(marker, 'utf8') !== claim.token)) return false
+    if (children.includes('files')) {
+      const payload = path.join(stage, 'files')
+      const dir = await fs.lstat(payload, { bigint: true })
+      if (!dir.isDirectory() || dir.isSymbolicLink() || claim.payloadId !== directoryId(dir)) return false
+      const allowed = new Set(['manifest.json', demoImportArchiveName, ...saveExtensions.map(extension => claim.saveName + extension)])
+      const names = await fs.readdir(payload)
+      for (const name of names) {
+        if (!allowed.has(name)) return false
+        const item = await fs.lstat(path.join(payload, name))
+        if (!item.isFile() || item.isSymbolicLink() || item.nlink !== 1) return false
+      }
+      for (const name of names) await fs.unlink(path.join(payload, name))
+      await fs.rmdir(payload)
+    }
+    if (markerStat) await fs.unlink(marker)
+    await fs.rmdir(stage)
+  }
+  await fs.unlink(claimPath(claim))
+  return true
+}
+
+function ownerMayBeRunning(claim: ImportStageClaim): boolean {
+  if (claim.host !== os.hostname()) return true
+  try { process.kill(claim.pid, 0); return true }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH' }
+}
+
+/** Recovery follows private claims for interrupted jobs. Legacy or foreign directories are never enumerated. */
+export async function recoverImportStages(
+  config: ControlConfig,
+  wasInterrupted: (requestId: string, uploadId: string) => boolean,
+): Promise<Set<string>> {
+  const unresolved = new Set<string>()
+  const receipts = path.resolve(config.dataDirectory, 'uploads')
+  const receiptsStat = await maybeStat(receipts)
+  if (!receiptsStat?.isDirectory() || receiptsStat.isSymbolicLink()) return unresolved
+  const dataRoot = await fs.realpath(config.dataDirectory)
+  const names = await fs.readdir(receipts)
+  for (const name of names) {
+    const id = name.slice(0, -claimSuffix.length)
+    if (!name.endsWith(claimSuffix) || !uuidPattern.test(id)) continue
+    unresolved.add(id)
+    try {
+      const file = path.join(receipts, name), stat = await fs.lstat(file)
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16 * 1024) continue
+      const claim = JSON.parse(await fs.readFile(file, 'utf8')) as ImportStageClaim
+      if (!claim || claim.schema !== 1 || claim.uploadId !== id || claim.dataRoot !== dataRoot ||
+          typeof claim.token !== 'string' || !uuidPattern.test(claim.token) || typeof claim.requestId !== 'string' ||
+          typeof claim.directoryId !== 'string' || typeof claim.payloadId !== 'string' ||
+          !Number.isSafeInteger(claim.pid) || claim.pid < 1 || typeof claim.saveName !== 'string' || !validSaveName(claim.saveName) ||
+          !wasInterrupted(claim.requestId, id) || ownerMayBeRunning(claim)) continue
+      const library = await fs.lstat(config.game.backupDirectory)
+      if (!library.isDirectory() || library.isSymbolicLink() || claim.backupRoot !== await fs.realpath(config.game.backupDirectory)) continue
+      if (await removeStage(claim)) unresolved.delete(id)
+    } catch { /* Leave unavailable, altered or incomplete evidence in place for a later startup. */ }
+  }
+  return unresolved
+}
+
 /** Publishes only complete, checked save sets under the backup library. */
 export async function importUploadedBackup(
   config: ControlConfig,
@@ -63,27 +191,36 @@ export async function importUploadedBackup(
   const uploads = new BackupUploadStore(config.dataDirectory)
   const { metadata, archivePath } = await uploads.require(input.uploadId)
   const backupDirectory = path.resolve(config.game.backupDirectory)
-  let partialRoot: string | null = null
+  let claim: ImportStageClaim | null = null
+  let stageConflict = false
   try {
     signal.throwIfAborted()
     await fs.mkdir(backupDirectory, { recursive: true })
     const rootStat = await fs.lstat(backupDirectory)
     if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) throw importError('BACKUP_PATH_INVALID', '备份目录必须是独立的普通目录。')
-    partialRoot = await fs.mkdtemp(path.join(backupDirectory, '.import-'))
-
     report('正在校验上传文件完整性')
+    const digest = await sha256File(archivePath, signal)
+    if (digest !== metadata.sha256) throw importError('UPLOAD_CHECKSUM_FAILED', '上传文件的 SHA-256 校验失败。')
+
+    const directory = await readZipDirectory(archivePath)
+    const plan = await planImport(archivePath, directory, digest, metadata.createdAt, signal)
+    const finalRoot = inside(backupDirectory, plan.id)
+    await assertDestinationAvailable(finalRoot, plan.id)
+    try { claim = await reserveStage(config, metadata, plan.saveName) }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      stageConflict = true
+      throw importError('IMPORT_STAGE_EXISTS', '此上传已有导入暂存，已保留现有文件。')
+    }
+    const partialRoot = path.join(stagePath(claim), 'files')
     let source = archivePath
     if (config.mode === 'demo') {
       source = path.join(partialRoot, demoImportArchiveName)
-      await pipeline(createReadStream(archivePath), createWriteStream(source, { flags: 'wx' }), { signal })
+      const copiedHash = createHash('sha256')
+      const checkCopy = new Transform({ transform(chunk: Buffer, _encoding, done) { copiedHash.update(chunk); done(null, chunk) } })
+      await pipeline(createReadStream(archivePath), checkCopy, createWriteStream(source, { flags: 'wx' }), { signal })
+      if (copiedHash.digest('hex') !== digest) throw importError('UPLOAD_CHECKSUM_FAILED', '复制上传文件时内容发生变化。')
     }
-    const digest = await sha256File(source, signal)
-    if (digest !== metadata.sha256) throw importError('UPLOAD_CHECKSUM_FAILED', '上传文件的 SHA-256 校验失败。')
-
-    const directory = await readZipDirectory(source)
-    const plan = await planImport(source, directory, digest, metadata.createdAt, signal)
-    const finalRoot = inside(backupDirectory, plan.id)
-    await assertDestinationAvailable(finalRoot, plan.id)
     const manifest: BackupManifest = { schema: 1, id: plan.id, saveName: plan.saveName, createdAt: plan.createdAt, reason: 'imported', members: [] }
     report(`正在导入存档备份 ${plan.saveName}`)
     for (const { fileName, entry, expectedSha256 } of plan.members) {
@@ -97,18 +234,17 @@ export async function importUploadedBackup(
     await fs.writeFile(path.join(partialRoot, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
     await assertDestinationAvailable(finalRoot, plan.id)
     signal.throwIfAborted()
+    report(`正在发布备份 ${plan.id}`)
     await fs.rename(partialRoot, finalRoot)
-    partialRoot = null
-    report('备份已导入并通过完整性校验')
+    report(`备份 ${plan.id} 已导入并通过完整性校验`)
     return {
       backupId: manifest.id, saveName: manifest.saveName, members: manifest.members.map(member => member.fileName),
       bytes: manifest.members.reduce((total, member) => total + member.bytes, 0),
       createdAt: manifest.createdAt, reason: manifest.reason, importedAt: new Date().toISOString(),
     }
   } finally {
-    try {
-      if (partialRoot) await fs.rm(partialRoot, { recursive: true, force: true })
-    } finally { await uploads.remove(input.uploadId) }
+    if (claim && !await removeStage(claim)) throw importError('IMPORT_STAGE_CHANGED', '导入暂存目录的归属或内容已变化，已保留现场。')
+    if (!stageConflict) await uploads.remove(input.uploadId)
   }
 }
 

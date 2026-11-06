@@ -1,7 +1,7 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { execFile } from 'node:child_process'
-import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { link, lstat, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises'
+import { hostname, tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { Readable } from 'node:stream'
 import { buffer } from 'node:stream/consumers'
@@ -9,7 +9,7 @@ import { promisify } from 'node:util'
 import { deflateRawSync } from 'node:zlib'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ControlConfig } from '../shared/contracts.js'
-import { BackupImportError, importUploadedBackup } from './backup-import.js'
+import { BackupImportError, importUploadedBackup, recoverImportStages } from './backup-import.js'
 import { readBackupManifest, verifyBackupFiles } from './game/backup-verification.js'
 import { DemoGameAdapter } from './game/demo.js'
 import { WindowsGameAdapter } from './game/windows.js'
@@ -270,6 +270,103 @@ describe('ordinary save ZIP import', () => {
     await expect(importUploadedBackup(config, input, message => { if (message.startsWith('正在导入')) abort.abort() }, abort.signal)).rejects.toThrow()
     expect(await readdir(config.game.backupDirectory)).toEqual([])
     expect(await readdir(new BackupUploadStore(config.dataDirectory).directory)).toEqual([])
+  })
+})
+
+describe('interrupted backup import staging', () => {
+  async function crashFixture() {
+    const { config } = await createFixture()
+    const uploads = new BackupUploadStore(config.dataDirectory)
+    const upload = await uploads.stage('interrupted-import', Readable.from(['example']), new AbortController().signal)
+    await mkdir(config.game.backupDirectory, { recursive: true })
+    const root = join(config.game.backupDirectory, '.import-' + upload.uploadId)
+    const payload = join(root, 'files')
+    await mkdir(payload, { recursive: true })
+    const stat = await lstat(root, { bigint: true })
+    const payloadStat = await lstat(payload, { bigint: true })
+    const claim = { schema: 1, uploadId: upload.uploadId, requestId: upload.requestId, saveName: 'World', token: randomUUID(),
+      // Real Windows PIDs are multiples of four and POSIX PIDs are below this value.
+      pid: 2147483647, host: hostname(), dataRoot: await realpath(config.dataDirectory), backupRoot: await realpath(config.game.backupDirectory),
+      directoryId: `${stat.dev}/${stat.ino}/${stat.birthtimeNs}`, payloadId: `${payloadStat.dev}/${payloadStat.ino}/${payloadStat.birthtimeNs}` }
+    const claimFile = join(uploads.directory, upload.uploadId + '.import-claim.json')
+    await writeFile(claimFile, JSON.stringify(claim))
+    await writeFile(join(root, '.owner'), claim.token)
+    await writeFile(join(payload, 'World.dsv'), 'incomplete member')
+    const matches = (request: string, id: string) => request === upload.requestId && id === upload.uploadId
+    return { config, uploads, upload, root, payload, claim, claimFile, matches }
+  }
+
+  it('removes only the recorded staging directory, including a retry after a previous partial cleanup', async () => {
+    const f = await crashFixture()
+    const legacy = join(f.config.game.backupDirectory, '.import-KeepMe')
+    const final = join(f.config.game.backupDirectory, 'verified-backup')
+    await mkdir(legacy); await mkdir(final)
+    await writeFile(join(legacy, 'World.dsv'), 'another instance')
+    await writeFile(join(final, 'World.dsv'), 'published bytes')
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set())
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set())
+    expect((await readdir(f.config.game.backupDirectory)).sort()).toEqual(['.import-KeepMe', 'verified-backup'])
+    expect(await readFile(join(legacy, 'World.dsv'), 'utf8')).toBe('another instance')
+    expect(await readFile(join(final, 'World.dsv'), 'utf8')).toBe('published bytes')
+    expect(await readdir(f.uploads.directory)).not.toContain(f.claim.uploadId + '.import-claim.json')
+
+    const empty = await crashFixture()
+    await rm(join(empty.payload, 'World.dsv')); await rm(empty.payload, { recursive: true })
+    await rm(join(empty.root, '.owner'))
+    expect(await recoverImportStages(empty.config, empty.matches)).toEqual(new Set())
+    expect(await readdir(empty.config.game.backupDirectory)).toEqual([])
+  })
+
+  it('requires the matching durable job, local inactive owner, configured roots, nonce and original directory identity', async () => {
+    const f = await crashFixture(), protectedIds = new Set([f.claim.uploadId])
+    expect(await recoverImportStages(f.config, () => false)).toEqual(protectedIds)
+    expect(await recoverImportStages({ ...f.config, dataDirectory: join(f.config.dataDirectory, 'different-instance') }, f.matches)).toEqual(new Set())
+    for (const change of [{ pid: process.pid }, { host: f.claim.host + '-other' }, { directoryId: 'other' },
+      { token: randomUUID() }, { dataRoot: dirname(f.claim.dataRoot) }, { backupRoot: dirname(f.claim.backupRoot) }]) {
+      await writeFile(f.claimFile, JSON.stringify({ ...f.claim, ...change }))
+      expect(await recoverImportStages(f.config, f.matches)).toEqual(protectedIds)
+      expect(await readFile(join(f.payload, 'World.dsv'), 'utf8')).toBe('incomplete member')
+    }
+    await f.uploads.initialize(() => ({ id: 'job', requestId: f.claim.requestId, action: 'import-backup', state: 'interrupted',
+      createdAt: '', startedAt: null, finishedAt: '', message: '', steps: [], result: null }), protectedIds)
+    await expect(f.uploads.require(f.claim.uploadId)).resolves.toHaveProperty('metadata.requestId', f.claim.requestId)
+  })
+
+  it('keeps unexpected contents, reparse directories and linked members untouched', async () => {
+    const f = await crashFixture(), external = join(f.config.dataDirectory, 'external')
+    await mkdir(external)
+    const other = join(external, 'mine')
+    await writeFile(other, 'outside fixture')
+    const member = join(f.payload, 'World.server')
+    await link(other, member)
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set([f.upload.uploadId]))
+    expect((await lstat(other)).nlink).toBe(2)
+    await rm(member)
+    await symlink(external, member, process.platform === 'win32' ? 'junction' : 'dir')
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set([f.upload.uploadId]))
+    expect(await readFile(other, 'utf8')).toBe('outside fixture')
+    expect(await readFile(join(f.payload, 'World.dsv'), 'utf8')).toBe('incomplete member')
+    await unlink(member)
+    await writeFile(join(f.root, 'unrelated'), 'foreign contents')
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set([f.upload.uploadId]))
+    await unlink(join(f.root, 'unrelated'))
+    await rename(f.payload, join(external, 'original-payload'))
+    await mkdir(f.payload); await writeFile(join(f.payload, 'World.dsv'), 'substituted directory')
+    expect(await recoverImportStages(f.config, f.matches)).toEqual(new Set([f.upload.uploadId]))
+    expect(await readFile(join(f.payload, 'World.dsv'), 'utf8')).toBe('substituted directory')
+  })
+
+  it('refuses an existing staging name without consuming its upload or touching the directory', async () => {
+    const { config } = await createFixture(), uploads = new BackupUploadStore(config.dataDirectory)
+    const zip = createBackupArchive('backup-one', 'World')
+    const metadata = await uploads.stage('conflict', Readable.from([zip]), new AbortController().signal)
+    const root = join(config.game.backupDirectory, '.import-' + metadata.uploadId)
+    await mkdir(root, { recursive: true })
+    await writeFile(join(root, 'mine'), 'keep')
+    await expect(importUploadedBackup(config, { uploadId: metadata.uploadId }, () => {}, new AbortController().signal))
+      .rejects.toMatchObject({ code: 'IMPORT_STAGE_EXISTS' })
+    expect(await readFile(join(root, 'mine'), 'utf8')).toBe('keep')
+    await expect(uploads.require(metadata.uploadId)).resolves.toHaveProperty('metadata.uploadId', metadata.uploadId)
   })
 })
 
