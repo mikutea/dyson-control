@@ -4,3 +4,4 @@
 .backup-filters input, .backup-filters select { min-width: 0; max-width: 100%; width: 100%; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 6px; background: #101e2b; color: var(--text); font: inherit; }
 .backup-library-pages { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 8px; padding: 0 16px 12px; }
 .backup-library-pages span { color: var(--muted); font-size: .75rem; }
+.backup-library-list small[id] { white-space: normal; overflow-wrap: anywhere; line-height: 1.55; }

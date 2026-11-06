@@ -45,7 +45,7 @@ export function BackupLibrary({ items, disabled, onRestore, runAction }: {
       {(query || kind !== 'all') && <Button type="button" variant="quiet" onClick={clear}>清除筛选</Button>}
     </div>
     {!rows.length && <EmptyBlock title={snapshot ? '本页备份已移除或不再符合筛选' : '没有匹配的备份'} description={snapshot ? '可以翻页或回到最新备份。' : '调整存档名称或备份种类。'} />}
-    {rows.length > 0 && <div className="file-list">
+    {rows.length > 0 && <div className="file-list backup-library-list">
       {rows.map(backup => <div key={backup.id}>
         <span className="file-icon"><ShieldCheck /></span>
         <div><strong>{backup.saveName}</strong><p>{formatBytes(backup.bytes)} · {backup.members.length} 个文件{backup.retained ? ' · 已保留' : ''}</p>
