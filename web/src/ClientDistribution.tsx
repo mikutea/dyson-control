@@ -78,4 +78,3 @@ export function ClientFileCheck({ digest, bytes }: { digest: string; bytes: numb
     {result && <p role="status">{result}</p>}
   </details>
 }
-
