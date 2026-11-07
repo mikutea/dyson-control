@@ -18,7 +18,7 @@ import { startReadinessMessages } from './game/start-readiness.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
 import { recoverImportStages } from './backup-import.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
-import { openGameLog } from './game/logs.js'
+import { openGameLog, redactGameLogDownload } from './game/logs.js'
 import { playerIdPattern } from './game/bridge.js'
 import { ControlUpdateError, ControlUpdateManager } from './control-updates.js'
 import { SteamAuthManager } from './steam-auth.js'
@@ -736,5 +736,9 @@ async function sendLogDownload(logPath: string, request: FastifyRequest, reply: 
     await log.handle.close()
     return reply.send(Buffer.alloc(0))
   }
-  return reply.send(log.handle.createReadStream({ start, end: size - 1 }))
+  const source = log.handle.createReadStream({ start, end: size - 1 })
+  const output = Readable.from(redactGameLogDownload(source, start > 0))
+  source.on('error', error => output.destroy(error))
+  output.once('close', () => source.destroy())
+  return reply.send(output)
 }

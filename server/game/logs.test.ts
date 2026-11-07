@@ -1,8 +1,11 @@
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { Readable } from 'node:stream'
+import { buffer } from 'node:stream/consumers'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { WindowsGameAdapter } from './windows.js'
+import { redactGameLogDownload } from './logs.js'
 
 const temporaryDirectories: string[] = []
 afterEach(async () => {
@@ -27,6 +30,34 @@ async function fixture(content: string) {
 }
 
 describe('Windows game log tail', () => {
+  it('redacts handshake credentials and Nebula passwords without changing diagnostic lines or the source', async () => {
+    const content = '  Authorization: Basic fixture-credential\r\nProxy-Authorization: Bearer fixture-proxy\r\nCookie: session=fixture-session\r\nSet-Cookie: next=fixture-next\r\n[Info] >> RemoteAccessPassword: fixture-password\r\nNgrokAuthtoken = fixture-token\r\nHTTP/1.1 101 Switching Protocols\r\n[Info] Factory loaded\r\n'
+    const { adapter, logFile } = await fixture(content)
+    const before = await adapter.logs()
+    expect(before.slice(0, 2).map(entry => entry.message)).toEqual(['[Info] Factory loaded', 'HTTP/1.1 101 Switching Protocols'])
+    expect(before.slice(2).every(entry => entry.message.endsWith('[redacted]'))).toBe(true)
+    expect(JSON.stringify(before)).not.toContain('fixture-')
+    expect(await fs.readFile(logFile, 'utf8')).toBe(content)
+    await fs.appendFile(logFile, '[Info] New connection\n')
+    expect((await adapter.logs()).slice(1)).toEqual(before)
+  })
+
+  it('redacts download headers split at every byte while retaining UTF-8 and line endings', async () => {
+    const content = Buffer.from('连接成功\r\n\0AuThOrIzAtIoN: Basic fixture-secret\r\nServerPassword = fixture-password\n尾行')
+    const source = Readable.from(Array.from(content, byte => Buffer.from([byte])))
+    const output = await buffer(Readable.from(redactGameLogDownload(source, false)))
+    expect(output.toString('utf8')).toBe('连接成功\r\nAuThOrIzAtIoN: [redacted]\r\nServerPassword = [redacted]\n尾行')
+    expect(source.destroyed).toBe(true)
+  })
+
+  it('discards a truncated header fragment and closes a canceled download source', async () => {
+    const source = Readable.from([Buffer.from('secret-tail\r\n[Info] Ready\nAuthorization: Basic hidden')])
+    expect((await buffer(Readable.from(redactGameLogDownload(source, true)))).toString()).toBe('[Info] Ready\nAuthorization: [redacted]')
+    const canceled = Readable.from(['[Info] Ready\n', 'Authorization: Basic hidden'])
+    for await (const line of redactGameLogDownload(canceled, false)) { expect(line).toBe('[Info] Ready\n'); break }
+    expect(canceled.destroyed).toBe(true)
+  })
+
   it('returns an empty list during rotation and reads the new log once it exists', async () => {
     const { adapter, logFile } = await fixture('old log\n')
     await adapter.logs()

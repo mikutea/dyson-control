@@ -954,13 +954,13 @@ describe('Dyson Control API', () => {
   it('downloads the configured real log file through an authenticated bounded route', async () => {
     const fixture = await createFixture()
     fixture.adapter.source = 'windows'
-    await writeFile(fixture.config.game.logFile, 'first line\nlast line\n')
+    await writeFile(fixture.config.game.logFile, 'first line\n  Authorization: Basic fixture-header-secret\nlast line\n')
     const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:' })
     await app.ready()
     expect((await app.inject({ method: 'GET', url: '/api/logs/download' })).statusCode).toBe(401)
     const response = await app.inject({ method: 'GET', url: '/api/logs/download', headers: { cookie: await loginCookie(app) } })
     expect(response.statusCode).toBe(200)
-    expect(response.body).toBe('first line\nlast line\n')
+    expect(response.body).toBe('first line\n  Authorization: [redacted]\nlast line\n')
     expect(response.headers['x-log-truncated']).toBe('false')
     await app.close()
   })
@@ -994,7 +994,7 @@ describe('Dyson Control API', () => {
       const recovered = await get('/api/logs/download')
       expect(recovered.statusCode).toBe(200)
       expect(recovered.headers['x-log-truncated']).toBe('true')
-      expect(recovered.rawPayload.equals(content.subarray(-limit))).toBe(true)
+      expect(recovered.body).toBe('[Info] A\n') // Partial first line may be a credential fragment.
     } finally { await app.close() }
   })
 

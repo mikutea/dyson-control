@@ -1,8 +1,41 @@
 import { createHash } from 'node:crypto'
 import { constants, type BigIntStats } from 'node:fs'
 import fs, { type FileHandle } from 'node:fs/promises'
+import type { Readable } from 'node:stream'
+import { StringDecoder } from 'node:string_decoder'
 import type { LogEntry } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
+
+/** Nebula's websocket debug output includes authentication headers verbatim. */
+export function redactGameLogLine(line: string): string {
+  return line.replace(/\0/g, '')
+    .replace(/\b((?:Proxy-)?Authorization|Cookie|Set-Cookie)([ \t]*:[ \t]*)[^\r\n]*/gi, '$1$2[redacted]')
+    .replace(/\b(ServerPassword|LastClientPassword|RemoteAccessPassword|NgrokAuthtoken)([ \t]*[:=][ \t]*)[^\r\n]*/gi, '$1$2[redacted]')
+}
+
+/** Buffer complete lines so a header split across filesystem chunks cannot escape redaction. */
+export async function* redactGameLogDownload(source: Readable, truncated: boolean): AsyncGenerator<string> {
+  const decoder = new StringDecoder('utf8')
+  let pending = '', discardFirst = truncated
+  const complete = function* () {
+    let end: number
+    while ((end = pending.indexOf('\n')) >= 0) {
+      const line = pending.slice(0, end + 1)
+      pending = pending.slice(end + 1)
+      if (discardFirst) discardFirst = false
+      else yield redactGameLogLine(line)
+    }
+  }
+  try {
+    for await (const chunk of source) {
+      pending += decoder.write(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      yield* complete()
+    }
+    pending += decoder.end()
+    yield* complete()
+    if (pending && !discardFirst) yield redactGameLogLine(pending)
+  } finally { source.destroy() }
+}
 
 function recordedTime(line: string): string | null {
   const match = /^\uFEFF?\[?(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)(?=\]|\s|$)/.exec(line)
@@ -73,7 +106,7 @@ export async function readGameLogs(filePath: string): Promise<LogEntry[]> {
         if (line.trim()) {
           const level: LogEntry['level'] = /\b(?:error|fatal|exception)\b/i.test(line) ? 'error' : /\b(?:warn|warning)\b/i.test(line) ? 'warning' : 'info'
           const id = createHash('sha256').update(`${identity}:${position + BigInt(start)}:`).update(raw).digest('hex')
-          entries.push({ id, time: recordedTime(line), level, message: line.slice(0, 2000) })
+          entries.push({ id, time: recordedTime(line), level, message: redactGameLogLine(line).slice(0, 2000) })
         }
       }
       end = newline
