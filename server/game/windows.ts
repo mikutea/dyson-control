@@ -23,7 +23,7 @@ import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { clientPackageDownload, compareClientPackage, displayModName, displayModVersion, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, displayModName, displayModVersion, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage, type ClientPackageMod } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
 import { assertSettingsRollback, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
@@ -42,7 +42,7 @@ interface InspectResult {
   network?: HostNetworkCounterSample | null
 }
 
-interface ModRecord { dto: Mod; location: string; directory: string | null; packageIdentity: string | null; dependencies: string[] }
+interface ModRecord { dto: Mod; location: string; directory: string | null; packageIdentity: string | null; dependencies: string[]; clientDependencies?: unknown }
 
 function uniqueMod(records: ModRecord[], id: unknown): ModRecord | undefined {
   const matches = records.filter(record => record.dto.id === id)
@@ -579,8 +579,12 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async mods(): Promise<Mod[]> {
+    return this.#modsFromRecords(await this.#scanMods())
+  }
+
+  async #modsFromRecords(records: ModRecord[]): Promise<Mod[]> {
     const groups = new Map<string, ModRecord[]>()
-    for (const record of await this.#scanMods()) {
+    for (const record of records) {
       const group = groups.get(record.dto.id)
       if (group) group.push(record)
       else groups.set(record.dto.id, [record])
@@ -1246,7 +1250,7 @@ export class WindowsGameAdapter implements GameAdapter {
             dto: { id, name: importName, version: rawVersion, enabled, required: serverOnly || requiredModPattern.test(importName), description: typeof manifest.description === 'string' ? manifest.description.slice(0, 500) : '', side: 'unknown' },
             location, directory,
             packageIdentity: importName.toLowerCase(),
-            dependencies
+            dependencies, clientDependencies: manifest.dependencies
           })
         } else if (enabled && entry.isFile() && entry.name.toLowerCase().endsWith('.dll')) {
           const name = path.basename(entry.name, path.extname(entry.name))
@@ -1919,9 +1923,12 @@ export class WindowsGameAdapter implements GameAdapter {
     return { ...result, automaticBackupId, wasRunning, restarted, restartRequired: false }
   }
 
-  async #clientMods(): Promise<Mod[]> {
-    const [mods, runtime] = await Promise.all([this.mods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx').catch(() => null)])
-    return withClientRuntime(mods, runtime)
+  async #clientMods(): Promise<ClientPackageMod[]> {
+    const [records, runtime] = await Promise.all([this.#scanMods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx').catch(() => null)])
+    const mods = await this.#modsFromRecords(records)
+    return withClientRuntime(mods.map(mod => ({ ...mod,
+      clientDependencies: records.find(record => record.dto.id === mod.id && record.dto.enabled)?.clientDependencies
+    })), runtime)
   }
 
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {

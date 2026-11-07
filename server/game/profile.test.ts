@@ -40,6 +40,36 @@ describe('r2modman export', () => {
 })
 
 describe('client package creation plan', () => {
+  it('rejects dependencies omitted by server-only or disabled classification', async () => {
+    const feature = { ...mod('Owner-Feature'), clientDependencies: ['Team-Needed-1.2.3', 'Team-Other-2.0.0'] }
+    const plan = await readClientPackagePlan('fixture.test', [feature,
+      mod('Team-Needed', '1.2.3', 'server'), mod('Team-Other', '2.0.0', 'both', false)])
+    expect(plan.ready).toBe(false)
+    expect(plan.blockers).toEqual([{ code: 'CLIENT_DEPENDENCY_MISSING', modName: 'Owner-Feature', version: '1.2.3',
+      message: expect.stringMatching(/Team-Needed.*Team-Other/) }])
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [feature])).toThrow(/依赖未纳入/)
+  })
+
+  it('checks numeric minimum versions case-insensitively and follows transitive requirements', async () => {
+    const feature = { ...mod('Owner-Feature'), clientDependencies: ['TEAM-Needed-1.9.0'] }
+    const dependency = { ...mod('Team-Needed', '1.10.0'), clientDependencies: ['Core-Runtime-2.0.0'] }
+    expect(await readClientPackagePlan('fixture.test', [feature, dependency])).toMatchObject({
+      ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_MISSING', modName: 'Team-Needed' }]
+    })
+    expect(await readClientPackagePlan('fixture.test', [feature, dependency, mod('Core-Runtime', '2.0.0')]))
+      .toMatchObject({ ready: true, blockers: [] })
+    expect(await readClientPackagePlan('fixture.test', [feature, { ...dependency, version: '1.8.9' }, mod('Core-Runtime', '2.0.0')]))
+      .toMatchObject({ ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_VERSION', modName: 'Owner-Feature' }] })
+  })
+
+  it('rejects malformed dependency metadata without echoing supplied paths', async () => {
+    for (const clientDependencies of [null, {}, ['C:\\private-user\\config'], [null], ['Team-Needed-01.2.3'], ['Team-Needed-9007199254740992.0.0']]) {
+      const plan = await readClientPackagePlan('fixture.test', [{ ...mod('Owner-Feature'), clientDependencies }])
+      expect(plan).toMatchObject({ ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_INVALID' }] })
+      expect(JSON.stringify(plan)).not.toContain('private-user')
+    }
+  })
+
   it('keeps unsafe manifest names and supplied file paths out of duplicate-package blockers', async () => {
     const unsafe = 'C:\\fixture-private\\plugins\nspoof'
     const item = { ...mod(unsafe), installations: [

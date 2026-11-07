@@ -2385,6 +2385,38 @@ describe('Windows adapter fixture behavior', () => {
     expect(searchPackages).not.toHaveBeenCalled()
   })
 
+  it('blocks a locally installed client dependency excluded by side and rechecks changed manifests before export', async () => {
+    const fixture = await config('windows')
+    const plugin = async (name: string, dependencies: unknown) => {
+      const directory = path.join(fixture.game.root, 'BepInEx/plugins', name)
+      await fs.mkdir(directory, { recursive: true })
+      await fs.writeFile(path.join(directory, 'manifest.json'), JSON.stringify({
+        name: name.split('-')[1], author_name: name.split('-')[0], version_number: '1.2.3', dependencies
+      }))
+    }
+    await plugin('Owner-Feature', ['Team-Needed-1.2.3'])
+    await plugin('Team-Needed', [])
+    const adapter = new WindowsGameAdapter(fixture, {
+      inspect: async () => { throw new Error('Packaging must not inspect or stop the game') },
+      updates: updateFixture({ installedPackageVersion: async () => '5.4.17' })
+    })
+    const sides = async (name: string, side: string) => {
+      const mod = (await adapter.mods()).find(mod => mod.name === name)!
+      await adapter.run('set-mod-side', { modId: mod.id, expectedVersion: mod.version, side }, () => {}, new AbortController().signal)
+    }
+    await sides('Owner-Feature', 'both'); await sides('Team-Needed', 'server')
+    expect(await adapter.clientPackagePlan()).toMatchObject({ ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_MISSING', modName: 'Owner-Feature' }] })
+    await expect(adapter.run('create-client-package', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'CLIENT_DEPENDENCY_MISSING' })
+    expect(await adapter.clientPackages()).toEqual([])
+    await sides('Team-Needed', 'both')
+    expect(await adapter.clientPackagePlan()).toMatchObject({ ready: true })
+    const created = await adapter.run('create-client-package', {}, () => {}, new AbortController().signal)
+    await plugin('Team-Needed', ['Missing-Transitive-1.0.0'])
+    await expect(adapter.run('create-client-package', {}, () => {}, new AbortController().signal)).rejects.toMatchObject({ code: 'CLIENT_DEPENDENCY_MISSING' })
+    expect(await adapter.clientPackages()).toHaveLength(1)
+    expect(await adapter.clientPackageDetails(String(created.packageId))).toMatchObject({ status: 'unknown', downloadable: true, reason: expect.stringContaining('Missing-Transitive') })
+  })
+
   it('exports only administrator-confirmed mod sides and requires confirmation again after an upgrade', async () => {
     const fixture = await config('windows')
     const plugin = path.join(fixture.game.root, 'BepInEx', 'plugins', 'owner-Feature-1.0.0')

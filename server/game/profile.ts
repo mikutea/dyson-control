@@ -37,7 +37,9 @@ function checkSize(bytes: number): void {
   if (bytes > maxClientArchiveBytes) throw new GameAdapterError('PACKAGE_SIZE_LIMIT', '客户端配置包超过 4 MiB 大小上限。')
 }
 
-export function withClientRuntime(mods: Mod[], bepinexVersion: string | null): Mod[] {
+export type ClientPackageMod = Mod & { clientDependencies?: unknown }
+
+export function withClientRuntime(mods: ClientPackageMod[], bepinexVersion: string | null): ClientPackageMod[] {
   const runtime = mods.find(mod => /^xiaoye97-BepInEx$/i.test(mod.name))
   return [
     { id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion ?? '', enabled: true, required: true, description: 'BepInEx runtime', side: 'both',
@@ -46,7 +48,7 @@ export function withClientRuntime(mods: Mod[], bepinexVersion: string | null): M
   ]
 }
 
-type CurrentMods = Mod[] | (() => Mod[] | Promise<Mod[]>)
+type CurrentMods = ClientPackageMod[] | (() => ClientPackageMod[] | Promise<ClientPackageMod[]>)
 interface PreparedPackage { plan: ClientPackagePlan; bytes: Buffer | null }
 
 export function displayModName(name: string, index?: number): string {
@@ -56,7 +58,7 @@ export function displayModVersion(version: string): string | null {
   return /^[\w.+-]{1,100}$/.test(version) && version !== 'unknown' ? version : null
 }
 
-function preparePackage(profileName: string, address: string, mods: Mod[]): PreparedPackage {
+function preparePackage(profileName: string, address: string, mods: ClientPackageMod[]): PreparedPackage {
   const blockers: ClientPackageBlocker[] = []
   const locks: ClientProfile['mods'] = []
   if (!address || address.length > 255 || /[\s\0]/u.test(address)) {
@@ -84,6 +86,37 @@ function preparePackage(profileName: string, address: string, mods: Mod[]): Prep
     else if (!versionParts(mod.version)) issue('MOD_VERSION_UNSUPPORTED', 'r2modman 需要精确的三段版本号（如 1.2.3），请核对已安装的包版本。')
     if (blockers.length === previous) locks.push({ name: mod.name, version: mod.version })
   }
+  // File imports install the explicit profile list. Do not leave dependency
+  // resolution to the player's importer or silently change administrator sides.
+  const included = new Map(locks.map(mod => [mod.name.toLowerCase(), mod.version]))
+  for (const [index, mod] of candidates.entries()) {
+    if (conflicts.has(mod.id) || mod.clientDependencies === undefined) continue
+    const issue = (code: ClientPackageBlocker['code'], message: string) => blockers.push({
+      code, modName: displayModName(mod.name, index), version: displayModVersion(mod.version), message
+    })
+    const dependencies = mod.clientDependencies
+    if (!Array.isArray(dependencies) || dependencies.length > 256) {
+      issue('CLIENT_DEPENDENCY_INVALID', '依赖清单格式无效，请核对该版本的原始 manifest.json。')
+      continue
+    }
+    const missing = new Set<string>(), outdated = new Set<string>()
+    let invalid = false
+    for (const reference of dependencies) {
+      const match = typeof reference === 'string' && reference.length <= 256
+        ? /^([A-Za-z0-9_]+-[A-Za-z0-9_]+)-(\d+\.\d+\.\d+)$/.exec(reference) : null
+      const minimum = match && versionParts(match[2]!)
+      if (!match || !minimum) { invalid = true; continue }
+      const name = match[1]!, installed = included.get(name.toLowerCase())
+      if (!installed) { missing.add(name); continue }
+      const actual = versionParts(installed)!
+      const before = actual.major !== minimum.major ? actual.major < minimum.major
+        : actual.minor !== minimum.minor ? actual.minor < minimum.minor : actual.patch < minimum.patch
+      if (before) outdated.add(`${name} ≥ ${match[2]}（当前 ${installed}）`)
+    }
+    if (invalid) issue('CLIENT_DEPENDENCY_INVALID', '依赖清单含无法识别的包名或版本，请核对该版本的原始 manifest.json。')
+    if (missing.size) issue('CLIENT_DEPENDENCY_MISSING', `依赖未纳入客户端包：${[...missing].join('、')}。请检查这些模组是否已安装、启用并适用于客户端。`)
+    if (outdated.size) issue('CLIENT_DEPENDENCY_VERSION', `客户端依赖版本不足：${[...outdated].join('、')}。请先核对并更新服务器上的依赖。`)
+  }
   let bytes: Buffer | null = null
   if (!blockers.length) {
     const r2x = { profileName, mods: locks.map(mod => ({ name: mod.name, version: versionParts(mod.version)!, enabled: true })) }
@@ -101,7 +134,7 @@ function preparePackage(profileName: string, address: string, mods: Mod[]): Prep
 }
 
 async function prepareCurrentPackage(profileName: string, address: string, current: CurrentMods): Promise<PreparedPackage> {
-  let mods: Mod[]
+  let mods: ClientPackageMod[]
   try { mods = typeof current === 'function' ? await current() : current }
   catch {
     return { bytes: null, plan: { ready: false, mods: [], blockers: [{
@@ -125,7 +158,7 @@ function requirePackageBytes(prepared: PreparedPackage): Buffer {
   throw new GameAdapterError(prepared.plan.blockers[0]!.code, blockerSummary(prepared.plan))
 }
 
-export function createR2ModmanPackage(profileName: string, address: string, mods: Mod[]): Buffer {
+export function createR2ModmanPackage(profileName: string, address: string, mods: ClientPackageMod[]): Buffer {
   return requirePackageBytes(preparePackage(profileName, address, mods))
 }
 

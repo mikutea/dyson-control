@@ -176,7 +176,8 @@ export type GameDownload = { fileName: string; contentType: string } & (
 export interface ClientProfile { address: string; mods: Array<{ name: string; version: string }> }
 export interface ClientPackageBlocker {
   code: 'INVALID_INPUT' | 'PACKAGE_LOCK_INCOMPLETE' | 'MOD_SIDE_UNCONFIRMED' | 'MOD_PACKAGE_UNIDENTIFIED' |
-    'MOD_VERSION_UNSUPPORTED' | 'MOD_INSTALL_CONFLICT' | 'NO_CLIENT_MODS' | 'PACKAGE_SIZE_LIMIT' | 'CLIENT_MODS_UNAVAILABLE'
+    'MOD_VERSION_UNSUPPORTED' | 'MOD_INSTALL_CONFLICT' | 'NO_CLIENT_MODS' | 'PACKAGE_SIZE_LIMIT' | 'CLIENT_MODS_UNAVAILABLE' |
+    'CLIENT_DEPENDENCY_INVALID' | 'CLIENT_DEPENDENCY_MISSING' | 'CLIENT_DEPENDENCY_VERSION'
   modName: string | null; version: string | null; message: string
 }
 export interface ClientPackagePlan { ready: boolean; mods: ClientProfile['mods']; blockers: ClientPackageBlocker[] }

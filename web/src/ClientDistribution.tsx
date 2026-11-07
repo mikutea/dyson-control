@@ -33,7 +33,9 @@ export function ClientJoinGuide({ item, digest }: { item: ClientPackage; digest:
         '2. 在 PowerShell 运行下面的命令，并按提示输入配置包的完整路径。核对结果与上方 SHA-256 一致。',
         "(Get-FileHash -Algorithm SHA256 -LiteralPath (Read-Host '请输入配置包的完整路径')).Hash", '',
         '3. 在 r2modman 选择 Dyson Sphere Program。在配置选择页点 Import / Update → From file，选择上方 .r2z。在 Packages to be installed 页核对下面列出的版本，点 Import → Import new profile。确认配置名后点 Create，并等待所有模组下载完成。',
-        '4. 从刚导入的配置启动游戏。在 Nebula 多人联机界面输入游戏地址 ' + address + '，进入服务器。', '',
+        '4. 选中刚导入的配置，点击 Start modded。进入 Nebula 多人联机界面，使用游戏地址 ' + address + ' 加入。有密码时向管理员取得，密码不包含在配置包中。',
+        '5. 等待世界和出生星球加载完成。需要重连时，退出联机并返回菜单，再用同一配置和地址加入；连接中断时先确认提示，再重新加入。',
+        '如果提示游戏或模组版本不匹配，先核对服务器当前版本并取得对应配置包。重连时保持原有模组版本。', '',
         '配置包锁定的模组版本', ...mods.map(mod => mod.name + '  ' + mod.version), '',
       ].join('\r\n')
       downloadText(item.name.replace(/\.r2z$/i, '') + '-入服说明.txt', guide)
