@@ -2,6 +2,9 @@ import type { ApiErrorBody, Job } from '../../shared/contracts'
 
 type Envelope<T> = { data: T }
 
+// A response sent with an earlier cookie must not expire a newer login.
+let sessionRevision = 0
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number, readonly code?: string) {
     super(message)
@@ -32,6 +35,7 @@ async function parseError(response: Response): Promise<string> {
 }
 
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const revision = sessionRevision
   const response = await fetch(`/api${path}`, {
     credentials: 'same-origin',
     ...init,
@@ -39,9 +43,14 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!response.ok) {
     const message = await parseError(response)
-    if (response.status === 401 && path !== '/session') window.dispatchEvent(new CustomEvent('dyson-auth-required'))
+    if (response.status === 401 && !(path === '/session' && init?.method === 'POST') &&
+        revision === sessionRevision && !init?.signal?.aborted) {
+      sessionRevision += 1
+      window.dispatchEvent(new CustomEvent('dyson-auth-required'))
+    }
     throw new ApiError(message, response.status)
   }
+  if (path === '/session' && (init?.method === 'POST' || init?.method === 'DELETE')) sessionRevision += 1
   if (response.status === 204) return undefined as T
   const body = (await response.json()) as Envelope<T>
   return body.data
@@ -64,6 +73,7 @@ export function newRequestId(): string {
 }
 
 export function uploadBackup(file: File, requestId: string, signal: AbortSignal, onProgress: (percent: number) => void): Promise<Job> {
+  const revision = sessionRevision
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest()
     const abort = () => request.abort()
@@ -76,7 +86,10 @@ export function uploadBackup(file: File, requestId: string, signal: AbortSignal,
     request.onload = () => {
       try {
         const body = JSON.parse(request.responseText) as Envelope<Job> & Partial<ApiErrorBody>
-        if (request.status === 401) window.dispatchEvent(new CustomEvent('dyson-auth-required'))
+        if (request.status === 401 && revision === sessionRevision && !signal.aborted) {
+          sessionRevision += 1
+          window.dispatchEvent(new CustomEvent('dyson-auth-required'))
+        }
         if (request.status < 200 || request.status >= 300) throw new ApiError(body.error?.message || `上传失败（${request.status}）`, request.status, body.error?.code)
         if (!body.data?.id) throw new Error('未收到导入任务，请重试确认结果。')
         resolve(body.data)

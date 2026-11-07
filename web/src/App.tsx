@@ -45,6 +45,7 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false)
   const [checkingReceipts, setCheckingReceipts] = useState(false)
   const submittingRef = useRef(false)
+  const sessionGeneration = useRef(0)
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'error' } | null>(null)
 
   const loadSession = useCallback(async () => {
@@ -56,11 +57,22 @@ export default function App() {
   }, [])
   useEffect(() => { void loadSession() }, [loadSession])
 
-  useEffect(() => {
-    const expired = () => setSession((current) => ({ authenticated: false, username: 'administrator', source: current?.source || 'demo' }))
-    window.addEventListener('dyson-auth-required', expired)
-    return () => window.removeEventListener('dyson-auth-required', expired)
+  const endSession = useCallback(() => {
+    sessionGeneration.current += 1
+    submittingRef.current = false
+    setSubmitting(false)
+    setCheckingReceipts(false)
+    setPending(null)
+    setToast(null)
+    setOverview(null)
+    setConnectionError(false)
+    setSession(current => ({ authenticated: false, username: 'administrator', source: current?.source || 'demo' }))
   }, [])
+
+  useEffect(() => {
+    window.addEventListener('dyson-auth-required', endSession)
+    return () => window.removeEventListener('dyson-auth-required', endSession)
+  }, [endSession])
 
   useEffect(() => {
     const onHash = () => setPage(pageFromHash())
@@ -177,19 +189,24 @@ export default function App() {
 
   const execute = useCallback(async (action: Action, input: Record<string, unknown>) => {
     if (submittingRef.current) return
+    const generation = sessionGeneration.current
     submittingRef.current = true
     setSubmitting(true)
     try {
       const { recovered } = await submitAction(action, input)
+      if (generation !== sessionGeneration.current) return
       receiveJob()
       setPending(null)
       setToast({ message: recovered ? '已找到之前提交的任务，可在活动中查看结果。' : '操作已提交，可继续使用其他页面', tone: 'success' })
     } catch (reason) {
+      if (generation !== sessionGeneration.current) return
       checkCurrentJob.current()
       setToast({ message: reason instanceof Error ? reason.message : '操作未能开始', tone: 'error' })
     } finally {
-      submittingRef.current = false
-      setSubmitting(false)
+      if (generation === sessionGeneration.current) {
+        submittingRef.current = false
+        setSubmitting(false)
+      }
     }
   }, [receiveJob])
 
@@ -205,19 +222,23 @@ export default function App() {
   }
 
   const logout = async () => {
+    const generation = sessionGeneration.current
     try { await remove<void>('/session') }
-    catch { setToast({ message: '退出未完成，请检查连接后重试', tone: 'error' }); return }
-    setSession((current) => ({ authenticated: false, username: 'administrator', source: current?.source || 'demo' }))
-    setOverview(null)
-    setJob(null)
+    catch {
+      if (generation === sessionGeneration.current) setToast({ message: '退出未完成，请检查连接后重试', tone: 'error' })
+      return
+    }
+    if (generation === sessionGeneration.current) endSession()
   }
 
   const operationActive = submitting || jobsAvailable !== true || unfinished(job)
   const missingReceipts = usePendingReceiptActions()
   const checkReceipts = async () => {
+    const generation = sessionGeneration.current
     setCheckingReceipts(true)
     try {
       const known = await findPendingReceipts()
+      if (generation !== sessionGeneration.current) return
       if (known.length) {
         receiveJob()
         setToast({ message: `已核对 ${known.length} 项操作，可在活动中查看。`, tone: 'success' })
@@ -225,8 +246,10 @@ export default function App() {
         setToast({ message: missingReceipts.includes('import-backup') ? '当前还没有这些请求的任务记录。可返回原入口重试。' :
           '当前还没有这些请求的任务记录。可在原入口使用同一编号重试。', tone: 'success' })
       }
-    } catch { setToast({ message: '暂时无法核对回执，请恢复连接后重试。', tone: 'error' }) }
-    finally { setCheckingReceipts(false) }
+    } catch {
+      if (generation === sessionGeneration.current) setToast({ message: '暂时无法核对回执，请恢复连接后重试。', tone: 'error' })
+    }
+    finally { if (generation === sessionGeneration.current) setCheckingReceipts(false) }
   }
   const pagesProps = useMemo(() => ({ page, refreshToken, overview, onOverview: setOverview, runAction, onJob: receiveJob, operationActive }), [page, refreshToken, overview, runAction, receiveJob, operationActive])
 
