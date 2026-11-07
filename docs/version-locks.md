@@ -62,3 +62,4 @@ await locks.assertPlan([{ package: GAME_VERSION_LOCK_ID, version: resolvedGameVe
 ```
 
 Listing, locking and unlocking are storage operations. Authorization, administrator actions and UI presentation stay in the caller that wires the store into Dyson Control.
+Expand **查看安装包与依赖版本** on a catalog entry or a Nebula/BepInEx version card to see the resolved package order, target versions, recorded installed versions, and any conflicting version locks. A missing installed-version record can mean the package was installed manually. Viewing the plan reads the catalog and local inventory. Installation checks the current resolution and locks again. For Thunderstore packages, the server keeps running while archives are downloaded and verified. The save, protection backup and stop begin after the complete dependency set passes validation.

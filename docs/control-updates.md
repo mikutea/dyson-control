@@ -2,7 +2,7 @@
 
 “版本”页面显示正在运行的面板版本，并可从配置的 GitHub 仓库检查正式 Release。更新源尚未配置、尚无正式发布或下载失败时，界面会明确显示原因，不会把未知状态当作“已是最新”。
 
-在私有 `control.config.json` 顶层添加所信任的公开发布仓库：
+新安装可在 `init-windows` 命令中追加 `--updates-repository 'owner/repository'`，直接将所信任的公开发布仓库写入私有配置。已有配置在 `control.config.json` 顶层添加：
 
 ```json
 "controlUpdates": {

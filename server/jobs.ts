@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events'
 import { mkdirSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
-import type { Action, GameAdapter, Job, JobState } from '../shared/contracts.js'
+import type { Action, GameAdapter, Job, JobHistoryQuery, JobState } from '../shared/contracts.js'
 import { ApiError } from './errors.js'
 
 interface JobRow {
@@ -33,6 +33,7 @@ const DEFAULT_JOB_TIMEOUT_MS = 2 * 60 * 60 * 1000
 export interface JobQueueOptions {
   maxOutstandingJobs?: number
   jobTimeoutMs?: number
+  execute?: GameAdapter['run']
 }
 
 export class JobStore {
@@ -57,26 +58,28 @@ export class JobStore {
         result_json TEXT
       );
       CREATE INDEX IF NOT EXISTS jobs_created_at ON jobs(created_at DESC);
+      CREATE INDEX IF NOT EXISTS jobs_current ON jobs((state = 'running') DESC) WHERE state IN ('running', 'queued');
     `)
   }
 
   recoverInterruptedJobs(): Job[] {
-    const rows = this.#database.prepare("SELECT * FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at ASC").all() as unknown as JobRow[]
     const now = new Date().toISOString()
     const update = this.#database.prepare("UPDATE jobs SET state = 'interrupted', finished_at = ?, message = ?, steps_json = ? WHERE id = ?")
     this.#database.exec('BEGIN IMMEDIATE')
     try {
+      const rows = this.#database.prepare("SELECT * FROM jobs WHERE state IN ('queued', 'running') ORDER BY created_at ASC").all() as unknown as JobRow[]
       for (const row of rows) {
         const steps = parseSteps(row.steps_json)
         const boundedSteps = appendBoundedStep(steps, { time: now, message: '控制服务重启时任务被中断，未自动重试。' })
         update.run(now, '服务重启时中断', JSON.stringify(boundedSteps), row.id)
       }
+      const recovered = rows.map(row => this.require(row.id))
       this.#database.exec('COMMIT')
+      return recovered
     } catch (error) {
       this.#database.exec('ROLLBACK')
       throw error
     }
-    return rows.map((row) => this.get(row.id)!)
   }
 
   create(newJob: NewJob): { job: Job; created: boolean } {
@@ -118,16 +121,41 @@ export class JobStore {
     return row ? rowToJob(row) : null
   }
 
-  list(limit = 200): Job[] {
-    const rows = this.#database.prepare('SELECT * FROM jobs ORDER BY created_at DESC, id DESC LIMIT ?').all(limit) as unknown as JobRow[]
+  current(): Job | null {
+    // rowid follows insertion order even when multiple requests share a timestamp.
+    const row = this.#database.prepare(`
+      SELECT * FROM jobs WHERE state IN ('running', 'queued')
+      ORDER BY (state = 'running') DESC, rowid ASC LIMIT 1
+    `).get() ?? this.#database.prepare('SELECT * FROM jobs ORDER BY rowid DESC LIMIT 1').get()
+    return row ? rowToJob(row as unknown as JobRow) : null
+  }
+
+  list({ action, state, before, limit = 200 }: JobHistoryQuery = {}): Job[] {
+    const conditions: string[] = []
+    const values: string[] = []
+    if (action) { conditions.push('action = ?'); values.push(action) }
+    if (state) { conditions.push('state = ?'); values.push(state) }
+    if (before) {
+      const cursor = this.#database.prepare('SELECT created_at FROM jobs WHERE id = ?').get(before)
+      if (!cursor) throw new ApiError(404, 'job_not_found', '作为分页起点的操作不存在，请返回第一页。')
+      conditions.push('(created_at, id) < (?, ?)')
+      values.push(String(cursor.created_at), before)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = this.#database.prepare(`SELECT * FROM jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).all(...values, limit) as unknown as JobRow[]
     return rows.map(rowToJob)
   }
 
-  start(id: string): Job {
+  claimQueued(id: string): Job | null {
     const now = new Date().toISOString()
     const result = this.#database.prepare("UPDATE jobs SET state = 'running', started_at = ?, message = ? WHERE id = ? AND state = 'queued'").run(now, '正在执行', id)
-    if (result.changes !== 1) throw new Error(`Job ${id} is no longer queued.`)
-    return this.require(id)
+    return result.changes === 1 ? this.require(id) : null
+  }
+
+  start(id: string): Job {
+    const job = this.claimQueued(id)
+    if (!job) throw new Error(`Job ${id} is no longer queued.`)
+    return job
   }
 
   addStep(id: string, message: string): Job {
@@ -148,6 +176,19 @@ export class JobStore {
 
   interruptQueued(id: string, message: string): Job {
     return this.finish(id, 'interrupted', message, null)
+  }
+
+  cancelQueued(id: string): { job: Job; changed: boolean } {
+    const job = this.require(id)
+    const time = new Date().toISOString()
+    const message = '管理员已取消排队任务。'
+    const steps = appendBoundedStep(job.steps, { time, message })
+    const updated = this.#database.prepare(`UPDATE jobs SET state = 'cancelled', finished_at = ?, message = ?, steps_json = ?, result_json = NULL
+      WHERE id = ? AND state = 'queued' AND started_at IS NULL`).run(time, message, JSON.stringify(steps), id)
+    const current = this.require(id)
+    if (current.state === 'cancelled') return { job: current, changed: updated.changes === 1 }
+    if (current.state === 'running') throw new ApiError(409, 'job_already_running', '这项操作已经开始，将继续执行。')
+    throw new ApiError(409, 'job_already_finished', '这项操作已经结束，请查看操作记录中的结果。')
   }
 
   require(id: string): Job {
@@ -174,9 +215,11 @@ export class JobQueue extends EventEmitter {
   #activeAbort: AbortController | null = null
   #activePromise: Promise<void> | null = null
   #accepting = true
+  #acceptanceVersion = 0
   #shuttingDown = false
   readonly #maxOutstandingJobs: number
   readonly #jobTimeoutMs: number
+  readonly #execute: GameAdapter['run']
 
   constructor(
     private readonly store: JobStore,
@@ -186,6 +229,7 @@ export class JobQueue extends EventEmitter {
     super()
     this.#maxOutstandingJobs = positiveInteger(options.maxOutstandingJobs ?? DEFAULT_MAX_OUTSTANDING_JOBS, 'maxOutstandingJobs')
     this.#jobTimeoutMs = positiveInteger(options.jobTimeoutMs ?? DEFAULT_JOB_TIMEOUT_MS, 'jobTimeoutMs')
+    this.#execute = options.execute ?? adapter.run.bind(adapter)
   }
 
   enqueue(request: NewJob): Job {
@@ -203,10 +247,18 @@ export class JobQueue extends EventEmitter {
 
   assertCanEnqueue(): void {
     if (!this.#accepting) throw new ApiError(503, 'shutting_down', '控制服务正在关闭。')
-    const outstanding = this.#pending.length + (this.#activePromise ? 1 : 0)
+    const outstanding = this.#pending.length + (this.#activeAbort ? 1 : 0)
     if (outstanding >= this.#maxOutstandingJobs) {
       throw new ApiError(429, 'queue_full', '待执行操作过多，请等待当前任务完成后重试。', { 'retry-after': '5' })
     }
+  }
+
+  cancelQueued(id: string): Job {
+    const { job, changed } = this.store.cancelQueued(id)
+    const index = this.#pending.indexOf(id)
+    if (index >= 0) this.#pending.splice(index, 1)
+    if (changed) this.emit('job', job)
+    return job
   }
 
   get isIdle(): boolean {
@@ -217,12 +269,15 @@ export class JobQueue extends EventEmitter {
     return this.#accepting
   }
 
+  get acceptanceVersion(): number { return this.#acceptanceVersion }
+
   pauseAccepting(): void {
+    if (this.#accepting) this.#acceptanceVersion++
     this.#accepting = false
   }
 
   resumeAccepting(): void {
-    if (!this.#shuttingDown) this.#accepting = true
+    if (!this.#shuttingDown && !this.#accepting) { this.#acceptanceVersion++; this.#accepting = true }
   }
 
   async shutdown(): Promise<void> {
@@ -231,7 +286,7 @@ export class JobQueue extends EventEmitter {
       return
     }
     this.#shuttingDown = true
-    this.#accepting = false
+    this.pauseAccepting()
     const message = '服务关闭时中断'
     for (const id of this.#pending.splice(0)) {
       const job = this.store.interruptQueued(id, message)
@@ -242,16 +297,20 @@ export class JobQueue extends EventEmitter {
   }
 
   #drain(): void {
-    if (this.#activePromise || this.#shuttingDown) return
-    const id = this.#pending.shift()
-    if (!id) return
-    this.#activePromise = this.#run(id).finally(() => {
+    if (this.#activePromise || this.#shuttingDown || this.#pending.length === 0) return
+    // Reserve the sole worker before publishing a running event, including to synchronous listeners.
+    this.#activePromise = Promise.resolve().then(() => {
+      const id = this.#pending.shift()
+      if (id) return this.#run(id)
+    }).finally(() => {
       this.#activePromise = null
       this.#drain()
     })
   }
 
   async #run(id: string): Promise<void> {
+    const claimed = this.store.claimQueued(id)
+    if (!claimed) return
     this.#activeAbort = new AbortController()
     const controller = this.#activeAbort
     let timedOut = false
@@ -260,10 +319,10 @@ export class JobQueue extends EventEmitter {
       controller.abort(new Error('操作超时'))
     }, this.#jobTimeoutMs)
     timeout.unref()
-    let job = this.store.start(id)
+    let job = claimed
     this.emit('job', job)
     try {
-      const result = await this.adapter.run(
+      const result = await this.#execute(
         job.action,
         this.store.input(id),
         (message) => {

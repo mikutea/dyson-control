@@ -5,7 +5,7 @@ Dyson Control 的程序版本、私有配置和运行数据必须分开保存。
 ```text
 C:\Program Files\Dyson Control\
   install-state.json
-  versions\0.1.0\
+  versions\0.1.10\
   rollback\...
 C:\ProgramData\Dyson Control\
   control.config.json
@@ -14,9 +14,13 @@ C:\ProgramData\Dyson Control\
 
 计划任务以 `SYSTEM` 身份在 Windows 启动时运行编译后的 `dist/server/index.js`。配置文件路径由安装程序写进该版本的固定启动器，不放进版本目录或公开发布包。游戏、存档和备份仍保留在配置指定的持久化目录。
 
+每个运行中的面板独占其配置的 `dataDirectory`。同一数据目录中的第二个面板即使使用其他端口，也会在恢复任务前退出。在一台主机上运行多套服务器时，请给每套服务器使用独立的游戏目录、数据目录、计划任务和监听端口。面板关闭或进程意外退出时，系统会释放 `panel-owner.sqlite` 的文件锁。请将这个文件保留在数据目录中。
+
+从尚未使用此锁的旧版本升级时，请先停止旧面板进程，再启动新版本。面板会在恢复任务前试绑定配置的固定监听地址和端口，地址已占用时直接退出，正式启动时再次绑定。旧版若在其他端口使用同一数据目录，仍需先停止旧进程。安装程序和 `npm start` 均通过 `startServer` 取得所有权。直接调用底层 `buildApp` 的程序需自行隔离数据目录。
+
 ## 要求与边界
 
-- Windows 10、Windows Server 2019 或更新版本，Windows PowerShell 5.1。
+- Windows 10 1809、Windows Server 2019 或更新版本，Windows PowerShell 5.1。
 - 全局安装 Node.js 24 或更新版本，并可使用配套的 `npm.cmd`。
 - 安装、升级和卸载计划任务时使用管理员 PowerShell。准备发布包和配置无需管理员权限。
 - 默认配置必须监听 `127.0.0.1`。远程管理应在回环监听前配置独立的 HTTPS 反向代理。`-AllowNonLoopback` 只用于部署者明确接受直接监听风险的环境。
@@ -58,10 +62,22 @@ CI 使用 `--panel-only`，因为公共构建机没有受控的游戏/Nebula 引
 
 工具通过显式允许列表收集文件，并拒绝测试、临时目录、真实配置、数据库、日志、备份、私钥、常见令牌格式和已知私有部署路径。它不会收录 `node_modules`、`control.config.json`、`.data` 或 `state`。
 
+准备可供发布的同一提交产物时，先提交已审查的源码，在干净的 Git 工作区运行：
+
+```powershell
+node .\scripts\prepare-release.mjs `
+  --bridge-dir .\dist\bridge `
+  --out-dir .\dist\release-candidate
+```
+
+此命令依次生成完整包、仅面板包及各自的 `.sha256`，复读 ZIP 校验文件内容，并逐文件确认两种包的共用内容完全一致，再生成 `SHA256SUMS`、`RELEASE_NOTES.md` 和 `release-evidence.json`。Bridge 身份从归档内读取；证据文件仅记录公开版本、源码提交、文件数、构建身份和产物散列，不包含主机路径。输出目录必须不存在，源码有未提交变更时会拒绝打包；命令不创建 Git 标签、不上传或发布 Release。
+
+发布时使用该提交通过检查后的两个 ZIP 和对应校验文件。完整包服务首次安装，面板更新器使用仅面板包。先确认发布说明与实际验证一致，再创建公开版本；具体步骤见[发布准备](releasing.md)。
+
 分发前在发布目录验证校验值：
 
 ```powershell
-$zip = Resolve-Path .\dyson-control-v0.1.0-windows.zip # 面板包使用 *-windows-panel-only.zip
+$zip = Resolve-Path .\dyson-control-v0.1.10-windows.zip # 替换为下载的版本；面板包使用 *-windows-panel-only.zip
 $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
 $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw 'SHA-256 mismatch.' }
@@ -75,34 +91,42 @@ Get-ChildItem 'C:\Temp\dyson-control-release\scripts\windows\*.ps1' | Unblock-Fi
 
 ## 准备私有配置
 
-先将发布 ZIP 解压到临时目录。创建独立配置和数据目录：
+先将发布 ZIP 解压到临时目录。准备新服务器时，可以直接生成配置，无需手工编辑 JSON 或粘贴密码散列。在 PowerShell 中运行：
 
 ```powershell
 $release = 'C:\Temp\dyson-control-release'
 $privateRoot = 'C:\ProgramData\Dyson Control'
 New-Item -ItemType Directory -Path $privateRoot -Force | Out-Null
-Copy-Item "$release\control.config.example.json" "$privateRoot\control.config.json"
-```
-
-编辑 `control.config.json`：
-
-- `host` 保持 `127.0.0.1`；
-- `dataDirectory` 使用版本目录之外的绝对路径，例如 `C:/ProgramData/Dyson Control/data`；
-- 将游戏、存档、备份、日志、Bridge 和游戏计划任务路径改为本机的绝对路径；
-- 示例域名只能替换为部署者自己的游戏连接地址；
-- `adminPasswordHash` 必须换成真实密码的 scrypt 散列。
-
-发布包不含依赖，因此可先在解压目录安装生产依赖并生成散列：
-
-```powershell
 Push-Location $release
 npm ci --omit=dev --ignore-scripts --no-audit --no-fund
-node .\dist\server\admin.js hash-password
+node .\dist\server\admin.js check-runtime
+node .\dist\server\admin.js init-windows "$privateRoot\control.config.json" `
+  --server-root 'D:\Dyson' `
+  --address 'game.example.com:8469' `
+  --name 'Dyson Server'
 node .\dist\server\admin.js validate-config "$privateRoot\control.config.json"
 Pop-Location
 ```
 
-密码输入不会回显。不要把密码、散列后的私有配置、Bridge 密钥或真实服务器路径提交到仓库或重新打进 ZIP。配置确认后可用本地化无关的 SID 限制读取权限：
+将 `D:\Dyson` 换成自己的持久化存储目录，示例域名换成自己的游戏地址。按提示输入并确认至少 12 字符的管理员密码，输入不会回显，配置中只保存 scrypt 散列。不要在命令参数中传密码。
+
+生成的配置默认保持回环监听；可用 `--port 13021` 更改面板端口。省略 `--address` 时，游戏地址默认为本机 `127.0.0.1:8469`，适合先完成本机配置，之后再修改为实际分享地址。
+
+希望从面板检查自身更新时，在初始化命令中追加 `--updates-repository 'mikutea/dyson-control'`；使用其他分发仓库时替换为自己信任的 `owner/repository`。此选项只保存明确选择的更新来源，不下载或安装更新。省略时不配置更新源，已有配置可按[面板自身更新](control-updates.md)调整。仓库尚无正式 Release 时，页面会说明暂无可验证版本。
+
+| 内容 | 上述示例的路径 |
+| --- | --- |
+| 私有配置 | `C:\ProgramData\Dyson Control\control.config.json` |
+| 面板数据 | `C:\ProgramData\Dyson Control\data` |
+| 游戏文件 | `D:\Dyson\game` |
+| 存档与备份 | `D:\Dyson\userdata\Save`、`D:\Dyson\backups` |
+| Bridge 通信与密钥 | `D:\Dyson\bridge`、`D:\Dyson\private\bridge-secret` |
+
+初始化只创建这一份配置；已有同名文件会被保留，命令不会下载或启动游戏，也不注册 Windows 任务。游戏与数据目录会由后续安装流程按需准备。
+
+接入已有游戏或使用其他目录布局时，仍可复制 `control.config.example.json` 后自行调整：各目录应使用版本目录之外的绝对路径，`host` 保持回环监听。使用 `node .\dist\server\admin.js hash-password` 生成管理员散列，随后通过 `validate-config` 检查配置。
+
+不要把密码、散列后的私有配置、Bridge 密钥或真实服务器路径提交到仓库或重新打进 ZIP。配置确认后可用本地化无关的 SID 限制读取权限：
 
 ```powershell
 icacls "$privateRoot\control.config.json" /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
@@ -122,7 +146,9 @@ $config = 'C:\ProgramData\Dyson Control\control.config.json'
   -TaskName 'Dyson-Control'
 ```
 
-安装程序会验证 Node.js 24、发布目录、`release-manifest.json`、绝对配置路径、回环监听和数据目录隔离；复制到 `versions/<package-version>`；安装锁定的生产依赖；调用编译后的管理 CLI 验证配置；注册唯一的开机计划任务；启动服务并检查 `/healthz`。只有产品名、包版本、进程 PID、实际 Node 命令中的版本根目录都匹配，且服务明确返回 `accepting: true` 时才写入安装状态。
+安装程序会验证 Node.js 24、发布目录、`release-manifest.json`、绝对配置路径、回环监听和数据目录隔离；安装锁定的生产依赖；在暂存目录实际打开内存 SQLite，并启动隐藏的原生控制台子进程，再验证配置。通过后复制到 `versions/<package-version>`、注册唯一的开机计划任务、启动服务并检查 `/healthz`。只有产品名、包版本、进程 PID、实际 Node 命令中的版本根目录都匹配，且服务明确返回 `accepting: true` 时才写入安装状态。
+
+`check-runtime` 不访问 Steam、不启动游戏、不修改配置；可在解压并安装生产依赖后手工运行。自检失败时检查 Windows 与 Node 版本，并从锁定文件重新安装依赖；不要从其他 Node 版本的目录复制 `node_modules`。升级也会在暂停旧面板之前完成相同自检。
 
 完整包安装成功后，输出会明确显示 `Release: complete`、Bridge 候选目录和已核验的 SHA-256；候选文件保留在 `versions\<package-version>\dist\bridge`，安装程序不会直接替换游戏中的插件。面板包会明确显示 `Release: panel-only`，版本目录中没有 Bridge 候选文件，也不会更改游戏目录。
 
@@ -132,9 +158,11 @@ npm 的嵌套依赖可能使文件路径超过 260 字符。安装与升级统�
 
 若 Node.js 或 npm 不在 PATH 中，可显式传入 `-NodePath` 和 `-NpmPath`。`-TaskName` 只接受字母、数字、空格、点、下划线和连字符，安装状态会记录精确名称供升级和卸载核对。
 
-服务首次安装后，再按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`。完整包可直接把版本目录中的 `dist\bridge` 作为候选；面板包需要另行构建并提供候选目录。先运行 `-PrepareOnly` 审查计划和待部署文件；真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。脚本默认不启动游戏，也不迁移存档。
+服务首次安装后，完整包用户可打开[安装与授权](server-setup.md)，在空游戏目录中一键安装服务器。现有游戏接入仍按 [Windows 游戏与 Bridge 接入](game-configuration.md) 使用当前安装版本的 `configure-game.ps1`：先运行 `-PrepareOnly` 审查计划，真正应用要求游戏已停止、管理员 PowerShell 和显式 `-ConfirmStopped`。面板包可修复 Steam 授权，但首次安装服务器需要完整包。两个接入流程都不自动启动游戏或迁移存档。
 
 ## 升级与自动回退
+
+跨版本升级前，先给面板数据留一份可读的回退副本。若采用文件复制，在维护窗口等待队列排空、确认旧面板进程已正常退出后，再复制私有配置和完整 `dataDirectory`，并保留旧版本目录与安装状态。游戏存档按整组另行备份。需要演练时，用隔离的游戏、存档、备份目录和任务名称启动数据副本，检查原有任务回执、玩家记录、存档下载和客户端包。验证旧版回退时使用升级前的数据副本。
 
 验证并解压新发布包后，在管理员 PowerShell 中运行新包里的升级脚本：
 
@@ -165,14 +193,14 @@ Invoke-RestMethod 'http://127.0.0.1:13020/healthz'
 Invoke-RestMethod 'http://127.0.0.1:13020/api/session'
 ```
 
-先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后仍需单独验证 HTTPS 入口、登录、Windows 游戏任务、Bridge 保存、存档恢复、重启恢复以及真实外部客户端加入。
+先调用 `Invoke-RestMethod 'http://127.0.0.1:13020/healthz'`，确认 `product`、`version`、`processId`、`accepting: true` 和 `maintenanceToken: null`；再检查 `/api/session`。未登录 session 响应应为 HTTP 200，且 `data.authenticated` 为 `false`。运行日志位于私有 `dataDirectory` 下的 `control.stdout.log` 和 `control.stderr.log`。随后检查自己的管理员登录、Windows 游戏任务、Bridge 保存和存档恢复；需要远程管理或外网联机时，按[连接自己的服务器](networking.md)配置并检查相应入口。游戏重启恢复的限制见 [README](../README.md#已知限制)。
 
 ## 卸载计划任务
 
 卸载脚本只停止并删除安装状态中精确匹配、描述也属于 Dyson Control 的计划任务。若服务正在运行，它会执行与升级相同的 token 回认和持久化排空，确认精确版本/PID 已暂停接单后才停止；卸载失败且任务仍存在时会恢复原服务并释放自己的 marker：
 
 ```powershell
-& 'C:\Program Files\Dyson Control\versions\0.1.0\scripts\windows\uninstall-control.ps1' `
+& 'C:\Program Files\Dyson Control\versions\0.1.10\scripts\windows\uninstall-control.ps1' `
   -InstallRoot 'C:\Program Files\Dyson Control' `
   -TaskName 'Dyson-Control'
 ```

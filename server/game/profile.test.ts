@@ -1,9 +1,11 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createHash } from 'node:crypto'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import type { Mod } from '../../shared/contracts.js'
-import { createR2ModmanPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, createR2ModmanPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { extractZipBuffer } from './updates.js'
 
 const mod = (name: string, version = '1.2.3', side: Mod['side'] = 'both', enabled = true): Mod => ({
@@ -29,10 +31,250 @@ describe('r2modman export', () => {
 
   it('rejects unidentifiable packages and versions instead of exporting a different version', () => {
     expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', '1.0.0', 'unknown')])).toThrow(/适用端/)
-    expect(() => createR2ModmanPackage('Profile', 'game.test\nRemoteAccessEnabled = true', [mod('Owner-Package')])).toThrow(/address/)
-    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('StandalonePlugin')])).toThrow(/identity/)
+    expect(() => createR2ModmanPackage('Profile', 'game.test\nRemoteAccessEnabled = true', [mod('Owner-Package')])).toThrow(/连接地址/)
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('StandalonePlugin')])).toThrow(/Thunderstore 作者名和包名/)
     for (const version of ['1.2.3-preview', '1.2.3.4', 'unknown']) {
-      expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', version)])).toThrow(/version/)
+      expect(() => createR2ModmanPackage('Profile', 'fixture.test', [mod('Owner-Package', version)])).toThrow(/三段版本号/)
     }
+  })
+})
+
+describe('client package creation plan', () => {
+  it('rejects dependencies omitted by server-only or disabled classification', async () => {
+    const feature = { ...mod('Owner-Feature'), clientDependencies: ['Team-Needed-1.2.3', 'Team-Other-2.0.0'] }
+    const plan = await readClientPackagePlan('fixture.test', [feature,
+      mod('Team-Needed', '1.2.3', 'server'), mod('Team-Other', '2.0.0', 'both', false)])
+    expect(plan.ready).toBe(false)
+    expect(plan.blockers).toEqual([{ code: 'CLIENT_DEPENDENCY_MISSING', modName: 'Owner-Feature', version: '1.2.3',
+      message: expect.stringMatching(/Team-Needed.*Team-Other/) }])
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [feature])).toThrow(/依赖未纳入/)
+  })
+
+  it('checks numeric minimum versions case-insensitively and follows transitive requirements', async () => {
+    const feature = { ...mod('Owner-Feature'), clientDependencies: ['TEAM-Needed-1.9.0'] }
+    const dependency = { ...mod('Team-Needed', '1.10.0'), clientDependencies: ['Core-Runtime-2.0.0'] }
+    expect(await readClientPackagePlan('fixture.test', [feature, dependency])).toMatchObject({
+      ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_MISSING', modName: 'Team-Needed' }]
+    })
+    expect(await readClientPackagePlan('fixture.test', [feature, dependency, mod('Core-Runtime', '2.0.0')]))
+      .toMatchObject({ ready: true, blockers: [] })
+    expect(await readClientPackagePlan('fixture.test', [feature, { ...dependency, version: '1.8.9' }, mod('Core-Runtime', '2.0.0')]))
+      .toMatchObject({ ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_VERSION', modName: 'Owner-Feature' }] })
+  })
+
+  it('rejects malformed dependency metadata without echoing supplied paths', async () => {
+    for (const clientDependencies of [null, {}, ['C:\\private-user\\config'], [null], ['Team-Needed-01.2.3'], ['Team-Needed-9007199254740992.0.0']]) {
+      const plan = await readClientPackagePlan('fixture.test', [{ ...mod('Owner-Feature'), clientDependencies }])
+      expect(plan).toMatchObject({ ready: false, blockers: [{ code: 'CLIENT_DEPENDENCY_INVALID' }] })
+      expect(JSON.stringify(plan)).not.toContain('private-user')
+    }
+  })
+
+  it('keeps unsafe manifest names and supplied file paths out of duplicate-package blockers', async () => {
+    const unsafe = 'C:\\fixture-private\\plugins\nspoof'
+    const item = { ...mod(unsafe), installations: [
+      { path: 'C:\\fixture-private\\one', version: '1.2.3', enabled: true },
+      { path: '\\nforged path', version: '2.0.0', enabled: true },
+    ] }
+    const plan = await readClientPackagePlan('fixture.example.test', [item])
+    expect(plan.blockers).toEqual([{ code: 'MOD_INSTALL_CONFLICT', modName: '未识别模组 1', version: null,
+      message: '多个启用副本，请到模组页核对各副本的安装位置和版本。' }])
+    expect(() => createR2ModmanPackage('Fixture', 'fixture.example.test', [item])).toThrow('未识别模组 1')
+  })
+
+  it('collects all actionable issues in one read and lists only the exact included packages', async () => {
+    const current = withClientRuntime([
+      mod('Owner-Ready', '1.2.3', 'client'), mod('Owner-NeedsSide', '0.2.0', 'unknown'),
+      mod('Unidentified', '1.2.3-preview', 'unknown'), mod('Ignored-Server', 'unsupported', 'server'),
+      mod('Ignored-Disabled', 'unsupported', 'unknown', false),
+    ], null)
+    const read = vi.fn(async () => current)
+    const plan = await readClientPackagePlan('fixture.example.test', read)
+    expect(read).toHaveBeenCalledTimes(1)
+    expect(plan.ready).toBe(false)
+    expect(plan.mods).toEqual([{ name: 'Owner-Ready', version: '1.2.3' }])
+    expect(plan.blockers.map(issue => [issue.modName, issue.code])).toEqual([
+      ['xiaoye97-BepInEx', 'PACKAGE_LOCK_INCOMPLETE'], ['Owner-NeedsSide', 'MOD_SIDE_UNCONFIRMED'],
+      ['Unidentified', 'MOD_SIDE_UNCONFIRMED'], ['Unidentified', 'MOD_PACKAGE_UNIDENTIFIED'], ['Unidentified', 'MOD_VERSION_UNSUPPORTED'],
+    ])
+    expect(await readClientPackagePlan('fixture.test', [mod('Only-Server', '0.0.1', 'server')])).toMatchObject({ ready: false, mods: [], blockers: [{ code: 'NO_CLIENT_MODS' }] })
+  })
+
+  it('keeps unsafe display fields and inventory exceptions out of the read-only plan and job message', async () => {
+    const value = 'C:\\private-folder\\private-user\\token=value'
+    const privateMod = { ...mod(value, value, 'unknown'), id: value, description: value }
+    const plan = await readClientPackagePlan('bad endpoint ' + value, [privateMod])
+    expect(JSON.stringify(plan)).not.toContain('private-')
+    expect(plan.blockers.map(issue => issue.code)).toEqual(['INVALID_INPUT', 'MOD_SIDE_UNCONFIRMED', 'MOD_PACKAGE_UNIDENTIFIED', 'MOD_VERSION_UNSUPPORTED'])
+    expect(plan.blockers[1]).toMatchObject({ modName: '未识别模组 1', version: null })
+    expect(() => createR2ModmanPackage('Profile', 'fixture.test', [privateMod])).toThrow('未识别模组 1')
+    try { createR2ModmanPackage('Profile', 'fixture.test', [privateMod]) } catch (error) { expect(String(error)).not.toContain('private-') }
+    const unreadable = await readClientPackagePlan('fixture.test', async () => { throw new Error(value) })
+    expect(unreadable).toMatchObject({ ready: false, mods: [], blockers: [{ code: 'CLIENT_MODS_UNAVAILABLE' }] })
+    expect(JSON.stringify(unreadable)).not.toContain('private-')
+  })
+
+  it('reruns the same check when creating, preserves earlier downloads when blocked, and exports the cleared plan', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-client-plan-'))
+    try {
+      const address = 'fixture.example.test:8469'
+      let mods = [mod('Owner-Alpha'), mod('Owner-Beta')]
+      const read = vi.fn(async () => mods)
+      const original = await writeClientPackage(root, address, read)
+      const before = await readClientPackagePlan(address, read)
+      expect(before).toMatchObject({ ready: true, blockers: [] })
+      mods = [mod('Owner-Alpha', '1.2.3', 'unknown'), mod('Owner-Beta', '1.3.2-preview')]
+      await expect(writeClientPackage(root, address, read)).rejects.toMatchObject({ message: expect.stringMatching(/Owner-Alpha.*Owner-Beta/) })
+      expect(await listClientPackages(root)).toEqual([original])
+      expect((await clientPackageDownload(root, original.id)).verifiedBytes).toBeDefined()
+      mods = [mod('Owner-Alpha', '1.2.3', 'server'), mod('Owner-Beta', '1.3.2', 'client')]
+      const plan = await readClientPackagePlan(address, read)
+      expect(plan).toEqual({ ready: true, blockers: [], mods: [{ name: 'Owner-Beta', version: '1.3.2' }] })
+      const item = await writeClientPackage(root, address, read)
+      const download = await clientPackageDownload(root, item.id)
+      const extracted = path.join(root, 'readback')
+      await extractZipBuffer(Buffer.from(download.verifiedBytes!), extracted)
+      const profile = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8'))
+      expect(profile.mods).toEqual([{ name: 'Owner-Beta', version: { major: 1, minor: 3, patch: 2 }, enabled: true }])
+      expect(await fs.readFile(path.join(extracted, 'config/nebula.cfg'), 'utf8')).toContain('LastIP = ' + address + '\n')
+      expect(read).toHaveBeenCalledTimes(5)
+    } finally { await fs.rm(root, { recursive: true, force: true }) }
+  })
+})
+
+describe('client package details', () => {
+  let root: string
+  const address = 'game.example.test:8469'
+  const mods = [mod('Owner-Tools'), mod('Team-Plugin', '0.5.2'), mod('Local-Bridge', '2.0.0', 'server'), mod('Other-Disabled', '2.0.0', 'client', false)]
+
+  beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'dyson-client-record-')) })
+  afterEach(async () => { await fs.rm(root, { recursive: true, force: true }) })
+
+  it('compares the selected file and its actual locks, independent of display order, casing or other exports', async () => {
+    const first = await writeClientPackage(root, address, mods)
+    const nextAddress = 'other.example.test:8470'
+    const nextMods = [mod('Owner-Tools', '1.2.4'), mod('More-Features', '1.0.0')]
+    const second = await writeClientPackage(root, nextAddress, nextMods)
+    expect(second.name).not.toBe(first.name)
+    expect(await listClientPackages(root)).toEqual(expect.arrayContaining([first, second]))
+    const original = await compareClientPackage(root, first.id, address, () => [
+      mod('TEAM-Plugin', '0.5.2'), mod('Owner-Tools'), mod('Local-Bridge', '3.0.0', 'server')
+    ])
+    expect(original).toMatchObject({ status: 'current', downloadable: true, profile: { address, mods: [
+      { name: 'Owner-Tools', version: '1.2.3' }, { name: 'Team-Plugin', version: '0.5.2' }
+    ] } })
+    const archive = await clientPackageDownload(root, first.id)
+    const bytes = Buffer.from(archive.verifiedBytes!)
+    expect(original.sha256).toBe(createHash('sha256').update(bytes).digest('hex'))
+    const extracted = path.join(root, 'extracted')
+    await extractZipBuffer(bytes, extracted)
+    const r2x = JSON.parse(await fs.readFile(path.join(extracted, 'export.r2x'), 'utf8'))
+    expect(r2x.mods).toEqual(original.profile!.mods.map(({ name, version }) => {
+      const [major, minor, patch] = version.split('.').map(Number)
+      return { name, version: { major, minor, patch }, enabled: true }
+    }))
+    expect(await fs.readFile(path.join(extracted, 'config', 'nebula.cfg'), 'utf8')).toContain(`LastIP = ${original.profile!.address}\n`)
+    const old = await compareClientPackage(root, first.id, nextAddress, () => nextMods)
+    expect(old).toMatchObject({ status: 'outdated', currentAddress: nextAddress, profile: original.profile, currentMods: [
+      { name: 'Owner-Tools', version: '1.2.4' }, { name: 'More-Features', version: '1.0.0' }
+    ] })
+    expect((await compareClientPackage(root, second.id, nextAddress, () => nextMods)).status).toBe('current')
+  })
+
+  it('reports incomplete current requirements while preserving confirmed address drift and the original profile', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const read = () => [mod('Unknown-Feature', '2.0.0', 'unknown')]
+    expect(await compareClientPackage(root, item.id, address, read)).toMatchObject({
+      status: 'unknown', currentMods: null, downloadable: true, reason: expect.stringContaining('Unknown-Feature'), profile: { address }
+    })
+    expect(await compareClientPackage(root, item.id, 'new.example.test', read)).toMatchObject({ status: 'outdated', currentMods: null })
+    await expect(writeClientPackage(root, address, read())).rejects.toMatchObject({ code: 'MOD_SIDE_UNCONFIRMED' })
+    expect(await listClientPackages(root)).toEqual([item])
+  })
+
+  it('keeps legacy artifacts downloadable with explicit unknown contents; an incomplete newer record fails closed', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const file = path.join(root, `${item.id}.json`)
+    const { fileName } = JSON.parse(await fs.readFile(file, 'utf8'))
+    await fs.writeFile(file, JSON.stringify({ fileName, item }))
+    const read = vi.fn(() => mods)
+    expect(await listClientPackages(root)).toEqual([item])
+    expect(await compareClientPackage(root, item.id, address, read)).toMatchObject({ profile: null, status: 'unknown', downloadable: true, sha256: null, reason: expect.stringContaining('旧包') })
+    expect(read).not.toHaveBeenCalled()
+    const download = await clientPackageDownload(root, item.id)
+    expect(download).toMatchObject({ fileName: item.name, length: item.bytes })
+    expect((await buffer(download.stream!)).length).toBe(item.bytes)
+    await fs.writeFile(file, JSON.stringify({ schema: 1, fileName, item }))
+    expect(await compareClientPackage(root, item.id, address, read)).toMatchObject({ status: 'unknown', downloadable: false })
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_MANIFEST_INVALID' })
+  })
+
+  it('rejects same-size archive damage, altered profile metadata, and missing files in details and direct downloads', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const file = path.join(root, `${item.id}.json`)
+    const manifest = JSON.parse(await fs.readFile(file, 'utf8'))
+    const archive = path.join(root, manifest.fileName)
+    const bytes = await fs.readFile(archive)
+    const damaged = Buffer.from(bytes)
+    damaged[50] = damaged[50]! ^ 1
+    await fs.writeFile(archive, damaged)
+    const check = async (code: string) => {
+      expect(await compareClientPackage(root, item.id, address, () => mods)).toMatchObject({ profile: null, status: 'unknown', downloadable: false, sha256: null })
+      await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code })
+    }
+    await check('PACKAGE_CHECKSUM_FAILED')
+    await fs.writeFile(archive, bytes)
+    manifest.profile.address = 'edited.example.test'
+    await fs.writeFile(file, JSON.stringify(manifest))
+    await check('PACKAGE_CHECKSUM_FAILED')
+    await fs.unlink(archive)
+    await check('DOWNLOAD_NOT_FOUND')
+    expect(await listClientPackages(root)).toEqual([])
+  })
+
+  it('bounds reads of new packages while legacy downloads still use the archived file', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const file = path.join(root, `${item.id}.json`)
+    const manifest = JSON.parse(await fs.readFile(file, 'utf8'))
+    manifest.item.bytes = 4 * 1024 * 1024 + 1
+    await fs.truncate(path.join(root, manifest.fileName), manifest.item.bytes)
+    await fs.writeFile(file, JSON.stringify(manifest))
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_SIZE_LIMIT' })
+    expect(await compareClientPackage(root, item.id, address, () => mods)).toMatchObject({ status: 'unknown', downloadable: false })
+    await fs.writeFile(file, JSON.stringify({ item: manifest.item, fileName: manifest.fileName }))
+    const legacy = await clientPackageDownload(root, item.id)
+    expect(legacy.verifiedBytes).toBeUndefined()
+    legacy.stream!.destroy()
+  })
+
+  it('streams only the original ordinary archive selected by a legacy receipt', async () => {
+    const item = await writeClientPackage(root, address, mods)
+    const receipt = path.join(root, `${item.id}.json`)
+    const { fileName } = JSON.parse(await fs.readFile(receipt, 'utf8'))
+    await fs.writeFile(receipt, JSON.stringify({ item, fileName }))
+    const archive = path.join(root, fileName)
+    const original = await fs.readFile(archive)
+    const unrelated = path.join(root, 'unrelated.bin')
+    const otherBytes = Buffer.alloc(item.bytes, 71)
+    await fs.writeFile(unrelated, otherBytes)
+
+    const selected = await clientPackageDownload(root, item.id)
+    await fs.rename(archive, archive + '.original')
+    await fs.link(unrelated, archive)
+    expect(await buffer(selected.stream!)).toEqual(original)
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'DOWNLOAD_NOT_FOUND' })
+    expect(await compareClientPackage(root, item.id, address, () => mods)).toMatchObject({ status: 'unknown', downloadable: false })
+    expect(await fs.readFile(unrelated)).toEqual(otherBytes)
+
+    await fs.writeFile(receipt, JSON.stringify({ item, fileName: 'different.r2z' }))
+    await expect(clientPackageDownload(root, item.id)).rejects.toMatchObject({ code: 'PACKAGE_MANIFEST_INVALID' })
+  })
+
+  it('does not publish a package when the generation record cannot be committed', async () => {
+    const rename = vi.spyOn(fs, 'rename').mockRejectedValueOnce(new Error('fixture: disk full'))
+    try { await expect(writeClientPackage(root, address, mods)).rejects.toThrow('disk full') }
+    finally { rename.mockRestore() }
+    expect(await listClientPackages(root)).toEqual([])
+    expect(await fs.readdir(root)).toEqual([])
   })
 })

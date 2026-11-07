@@ -12,6 +12,7 @@ export type {
   ControlUpdateOperationState, ControlUpdatePrepareResult, ControlUpdateStep,
 } from '../shared/contracts.js'
 import { extractZipBuffer } from './game/updates.js'
+import { writeAtomicJson } from './atomic-json.js'
 
 const versionPattern = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/
 const repositoryPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/
@@ -104,6 +105,7 @@ export class ControlUpdateManager {
   readonly #preparations = new Map<string, { controller: AbortController; promise: Promise<void> }>()
   readonly #pendingControllers = new Set<AbortController>()
   readonly #writeTails = new Map<string, Promise<void>>()
+  readonly #unrecordedFailures = new Set<string>()
   #serial: Promise<unknown> = Promise.resolve()
   #closed = false
 
@@ -216,6 +218,7 @@ export class ControlUpdateManager {
       }
       await this.#write(record)
       const promise = this.#runPreparation(record, candidate, controller.signal)
+        .catch(() => { this.#unrecordedFailures.add(id) })
         .finally(() => this.#preparations.delete(id))
       this.#preparations.set(id, { controller, promise })
       return { statusCode: 202 as const, operation: publicOperation(record), receiptToken }
@@ -266,7 +269,7 @@ export class ControlUpdateManager {
         sourcePath: record.sourcePath, sourceFingerprint: record.sourceFingerprint,
         upgradeScriptPath: capability.upgradePath, statusPath: helperStatusPath, createdAt: this.#now(),
       }
-      await atomicJson(operationFile, handoff)
+      await writeAtomicJson(operationFile, handoff)
       record.applyRequestId = input.requestId
       record.state = 'scheduled'
       record.step = 'handoff'
@@ -373,6 +376,12 @@ export class ControlUpdateManager {
       await this.#write(record)
     } catch (error) {
       const interrupted = signal.aborted || this.#closed
+      if (!interrupted && !(error instanceof ControlUpdateError)) {
+        const io = error as NodeJS.ErrnoException | null
+        console.error('Control update preparation failed.', {
+          code: io?.code, syscall: io?.syscall, file: typeof io?.path === 'string' ? path.basename(io.path) : null, step: record.step,
+        })
+      }
       await this.#cleanupCandidate(record)
       await this.#finish(record, 'failed', 'complete', interrupted ? '更新准备已中断。' : preparationMessage(error))
     }
@@ -481,12 +490,23 @@ export class ControlUpdateManager {
   }
 
   async #require(id: string): Promise<StoredOperation> {
-    try { return validateStored(JSON.parse(await fs.readFile(path.join(this.#operationsRoot, id, 'operation.json'), 'utf8')), path.join(this.#operationsRoot, id)) }
+    // A polling reader can wait for our own pending replacement. A failed write leaves the previous file intact.
+    await this.#writeTails.get(id)?.catch(() => undefined)
+    let record: StoredOperation
+    try { record = validateStored(JSON.parse(await fs.readFile(path.join(this.#operationsRoot, id, 'operation.json'), 'utf8')), path.join(this.#operationsRoot, id)) }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new ControlUpdateError('UPDATE_NOT_FOUND', '找不到该面板更新操作。')
       if (error instanceof ControlUpdateError) throw error
       throw new ControlUpdateError('UPDATE_HISTORY_INVALID', '面板更新历史无法读取。')
     }
+    if (this.#unrecordedFailures.has(id)) {
+      if (record.state === 'preparing') {
+        try { await this.#finish(record, 'failed', 'complete', '更新准备失败，先前无法写入操作记录。请检查存储权限和文件占用后重新准备。') }
+        catch { throw new ControlUpdateError('UPDATE_RECEIPT_UNAVAILABLE', '更新准备已停止，暂时无法写入操作记录。请检查存储权限和文件占用后刷新。') }
+      }
+      this.#unrecordedFailures.delete(id)
+    }
+    return record
   }
 
   async #loadAll(): Promise<StoredOperation[]> {
@@ -502,7 +522,7 @@ export class ControlUpdateManager {
   async #write(record: StoredOperation): Promise<void> {
     const previous = this.#writeTails.get(record.id) ?? Promise.resolve()
     const snapshot = structuredClone(record)
-    const write = previous.catch(() => undefined).then(() => atomicJson(path.join(record.operationRoot, 'operation.json'), snapshot))
+    const write = previous.catch(() => undefined).then(() => writeAtomicJson(path.join(record.operationRoot, 'operation.json'), snapshot))
     this.#writeTails.set(record.id, write)
     try { await write } finally { if (this.#writeTails.get(record.id) === write) this.#writeTails.delete(record.id) }
   }
@@ -729,20 +749,6 @@ async function scheduleWithPowerShell(helperPath: string, operationFile: string)
   })
 }
 
-async function atomicJson(filePath: string, value: unknown): Promise<void> {
-  const temporary = `${filePath}.partial-${randomUUID()}`
-  try {
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    for (let attempt = 0; ; attempt += 1) {
-      try { await fs.rename(temporary, filePath); break }
-      catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (attempt >= 4 || (code !== 'EPERM' && code !== 'EBUSY')) throw error
-        await new Promise(resolve => setTimeout(resolve, 10 * (attempt + 1)))
-      }
-    }
-  } finally { await fs.rm(temporary, { force: true }).catch(() => undefined) }
-}
 
 async function assertPlainFile(filePath: string): Promise<void> {
   const stat = await fs.lstat(filePath)
@@ -800,5 +806,10 @@ function isObject(value: unknown): value is Record<string, unknown> { return typ
 function safeError(error: unknown): string { return error instanceof Error ? error.message.slice(0, 500) : 'Unknown update helper error.' }
 function preparationMessage(error: unknown): string {
   if (error instanceof ControlUpdateError) return error.message
+  const code = (error as NodeJS.ErrnoException | null)?.code
+  if (code === 'ENOSPC') return '准备面板更新时磁盘空间不足，请释放空间后重试。更新尚未应用。'
+  if (code === 'EACCES' || code === 'EPERM' || code === 'EBUSY') {
+    return `无法写入或替换更新文件（${code}），请检查目录权限与文件占用后重试。更新尚未应用。`
+  }
   return '面板更新包准备失败。'
 }

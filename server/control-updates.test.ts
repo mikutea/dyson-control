@@ -84,6 +84,12 @@ async function waitForTerminal(manager: ControlUpdateManager, id: string): Promi
   throw new Error('operation did not settle')
 }
 
+async function waitForReady(manager: ControlUpdateManager, id: string): Promise<ControlUpdateOperation> {
+  const operation = await waitForTerminal(manager, id)
+  expect(operation.state, operation.message).toBe('ready')
+  return operation
+}
+
 async function installedLayout(root: string, version: string, taskName = 'Dyson-Control-Fixture'): Promise<{ installRoot: string; versionRoot: string }> {
   const installRoot = path.join(root, 'installed')
   const versionRoot = path.join(installRoot, 'versions', version)
@@ -137,13 +143,42 @@ describe('control update discovery and preparation', () => {
     await manager.close()
   })
 
+  it.each([['ENOSPC', '磁盘空间不足'], ['EPERM', '目录权限与文件占用']])(
+    'explains %s during preparation without exposing private filesystem details', async (code, message) => {
+      const root = await fixtureRoot()
+      const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+      await manager.initialize()
+      const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const writeFile = fs.writeFile.bind(fs)
+      const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith('-windows-panel-only.zip')) {
+          throw Object.assign(new Error('private deployment filesystem detail'), { code })
+        }
+        return writeFile(...args)
+      })
+      try {
+        const started = await manager.prepare({ requestId: `io-failure-${code}`, expectedVersion: '0.2.0' })
+        const operation = await waitForTerminal(manager, started.operation.id)
+        expect(operation).toMatchObject({ state: 'failed', message: expect.stringContaining(message) })
+        expect(operation.message).not.toContain('private deployment filesystem detail')
+        expect(diagnostic).toHaveBeenCalledWith('Control update preparation failed.', expect.objectContaining({ code }))
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(root)
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('private deployment filesystem detail')
+      } finally {
+        spy.mockRestore()
+        diagnostic.mockRestore()
+        await manager.close()
+      }
+    },
+  )
+
   it('expires an unapplied ready candidate after 24 hours and removes staged files', async () => {
     const root = await fixtureRoot()
     let now = Date.parse('2026-10-17T00:00:00.000Z')
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0'), clock: () => now })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'expire-ready', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     now += 24 * 60 * 60 * 1000 + 1
     await expect(manager.read(started.operation.id)).resolves.toMatchObject({ state: 'failed', message: expect.stringContaining('24 小时') })
     await expect(fs.stat(path.join(root, 'data', 'control-updates', 'operations', started.operation.id, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -184,12 +219,77 @@ describe('control update discovery and preparation', () => {
 })
 
 describe('control update application evidence', () => {
+  it('keeps the last receipt readable until a temporarily occupied update receipt can be replaced', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    const rename = fs.rename.bind(fs)
+    const held: string[] = []
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (String(to).endsWith('operation.json') && held.length < 5 &&
+        JSON.parse(await fs.readFile(from, 'utf8')).step === 'verifying') {
+        expect(JSON.parse(await fs.readFile(to, 'utf8')).step).toBe('downloading')
+        held.push(String(from))
+        throw Object.assign(new Error('fixture sharing violation'), { code: 'EPERM', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'transient-receipt-lock', expectedVersion: '0.2.0' })
+      const ready = await waitForReady(manager, prepared.operation.id)
+      expect(ready.sha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(held).toHaveLength(5)
+      expect(new Set(held).size).toBe(1)
+      expect(await fs.readdir(path.dirname(held[0]))).not.toContain(path.basename(held[0]))
+    } finally {
+      spy.mockRestore()
+      await manager.close()
+    }
+  })
+
+  it('reports a failed preparation when even its failure receipt cannot yet be written', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    let deny = true
+    let attemptedFailure!: () => void
+    const failureWrite = new Promise<void>(resolve => { attemptedFailure = resolve })
+    const rename = fs.rename.bind(fs)
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (deny && String(to).endsWith('operation.json')) {
+        const record = JSON.parse(await fs.readFile(from, 'utf8'))
+        if (record.state === 'failed') attemptedFailure()
+        if (record.step !== 'downloading') throw Object.assign(new Error('fixture denied write'), { code: 'EACCES', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'held-failure-receipt', expectedVersion: '0.2.0' })
+      await failureWrite
+      // Closing drains the preparation, including cleanup, before we inspect the receipt.
+      await manager.close()
+      await expect(manager.read(prepared.operation.id)).rejects.toMatchObject({ code: 'UPDATE_RECEIPT_UNAVAILABLE' })
+      deny = false
+      expect(await manager.read(prepared.operation.id)).toMatchObject({ state: 'failed', step: 'complete' })
+      const reopened = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0' })
+      await reopened.initialize()
+      expect(await reopened.read(prepared.operation.id)).toMatchObject({ state: 'failed' })
+      await reopened.close()
+    } finally {
+      deny = false
+      spy.mockRestore()
+      diagnostic.mockRestore()
+      await manager.close()
+    }
+  })
+
   it('rejects apply in source/demo mode after allowing preparation', async () => {
     const root = await fixtureRoot()
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-demo', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-demo' }))
       .rejects.toMatchObject({ code: 'UPDATE_EXECUTION_UNAVAILABLE' } satisfies Partial<ControlUpdateError>)
     await manager.close()
@@ -207,7 +307,7 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-real', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     const applied = await manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })
     expect(applied.operation.state).toBe('scheduled')
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })).resolves.toMatchObject({ operation: { id: started.operation.id, state: 'scheduled' } })
@@ -242,7 +342,7 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-rollback', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await manager.apply({ operationId: started.operation.id, requestId: 'apply-rollback' })
     const handoff = JSON.parse(await fs.readFile(handoffPath, 'utf8')) as { statusPath: string; installRoot: string }
     await fs.writeFile(handoff.statusPath, JSON.stringify({

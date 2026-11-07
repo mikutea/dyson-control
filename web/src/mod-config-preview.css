@@ -1,0 +1,9 @@
+.mod-rollback-preview { text-align: left; overflow-wrap: anywhere; margin-bottom: 1rem; }
+.dialog .mod-rollback-preview p { margin: .55rem 0; }
+.rollback-line-endings { display: flex; align-items: center; gap: .4rem; margin: .6rem 0; color: var(--muted); font-size: .75rem; }
+.rollback-lines { max-height: 38dvh; overflow-y: auto; border: 1px solid var(--line); border-radius: .5rem; }
+.rollback-lines section { padding: .6rem .8rem; border-inline-start: 3px solid var(--amber); }
+.rollback-lines section + section { border-top: 1px solid var(--line); }
+.rollback-lines .rollback-restored { border-inline-start-color: var(--green); }
+.rollback-lines h3 { margin: 0 0 .25rem; font-size: .72rem; color: var(--muted); }
+.rollback-lines pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: .76rem/1.6 ui-monospace, Consolas, monospace; }

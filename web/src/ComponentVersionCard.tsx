@@ -4,6 +4,7 @@ import type { RunAction } from './App'
 import { Button } from './components'
 import { formatDate } from './format'
 import { VersionLockButton } from './VersionLockButton'
+import { ModInstallPlan } from './ModInstallPlan'
 
 export function ComponentVersionCard({ component, locks, runAction }: {
   component: ComponentVersion; locks: VersionLock[] | null; runAction: RunAction
@@ -27,6 +28,7 @@ export function ComponentVersionCard({ component, locks, runAction }: {
         <div><dt>更新通道</dt><dd>{component.channel}</dd></div>
         <div><dt>检查时间</dt><dd>{formatDate(component.checkedAt)}</dd></div>
       </dl>
+      {component.id !== 'game' && component.latest && <ModInstallPlan packageName={packageId} version={component.latest} />}
     </div>
     <div className="version-action">
       <VersionLockButton packageId={packageId} component={component.id} currentVersion={component.current} locks={locks}
@@ -35,7 +37,7 @@ export function ComponentVersionCard({ component, locks, runAction }: {
         component: component.id, version: component.latest
       }, {
         title: `${installLabel}：${component.name}？`,
-        description: `${knownPackage ? '' : '尚未核实已安装的包版本。'}安装期间服务器可能会重新启动，在线玩家会暂时断开。`,
+        description: `${knownPackage ? '' : '尚未核实已安装的包版本。'}${component.id === 'game' ? '安装期间服务器可能会重新启动，在线玩家会暂时断开。' : '先下载并校验所有依赖。通过后，运行中的游戏会保存、备份并停服安装，完成后重新启动。'}`,
         label: installLabel, danger: true
       })}>{installLabel}</Button>}
     </div>

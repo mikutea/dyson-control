@@ -173,6 +173,26 @@ try {
   Assert-True (@($firstPlan.pathPolicy.globalSmbEligible) -contains 'game.saveDirectory') 'Plan does not identify game.saveDirectory as global-SMB eligible.'
   Assert-True ([string]$firstPlan.pathPolicy.globalSmbRequirement -like '*Get-SmbGlobalMapping*no mapping or credentials*') 'Plan does not state the existing-global-mapping boundary.'
   Assert-True ([string]$firstPlan.pathPolicy.applyProbe -like '*SYSTEM*Interactive GameUser*create/write/read/rename/delete*') 'Plan does not state both apply-time probes.'
+  Assert-True (-not $plannedAccess.ContainsKey('managed game document directory')) 'A linked game document directory must not receive an inheritable ACL grant.'
+
+  # A custom save-directory name links only Save, leaving options.xml, Blueprint
+  # and other game documents in a separate plain directory owned by the installer.
+  $customSaves = Join-Path $fixture 'isolated-saves'
+  New-Item -ItemType Directory -Path $customSaves | Out-Null
+  $customConfiguration = ($configuration | ConvertTo-Json -Depth 5) | ConvertFrom-Json
+  $customConfiguration.game.saveDirectory = $customSaves
+  $customConfigPath = Join-Path $fixture 'custom-save.config.json'
+  [IO.File]::WriteAllText($customConfigPath, ($customConfiguration | ConvertTo-Json -Depth 5), $utf8NoBom)
+  $customPlan = Invoke-Prepare $customConfigPath $build $sourceHash (Join-Path $fixture 'prepared-custom-saves')
+  $customAccess = @{}
+  foreach ($change in @($customPlan.access.changes)) { $customAccess[[string]$change.label] = $change }
+  $documents = Join-Path $data 'dyson-control-documents\Dyson Sphere Program'
+  Assert-True ([string]$customAccess['managed game document directory'].path -ceq $documents) 'Custom saves do not grant access to the separate game document directory.'
+  Assert-True ([string]$customAccess['managed game document directory'].rights -ceq 'Modify') 'The game cannot create options.xml or Blueprint with a custom save-directory name.'
+  Assert-True ([string]$customAccess['managed game document directory'].inheritance -ceq 'children') 'New game documents do not inherit the GameUser write grant.'
+  Assert-True ([string]$customAccess['game user-data root'].path -ceq $customSaves -and [string]$customAccess['game user-data root'].rights -ceq 'Modify') 'The custom save target lost its own write grant.'
+  Assert-True ([string]$customAccess['dataDirectory'].rights -ceq 'ReadAndExecute' -and [string]$customAccess['dataDirectory'].inheritance -ceq 'none') 'Custom saves expanded write access to private control data.'
+  Assert-True ([string]$customAccess['managed game-data link'].inheritance -ceq 'none') 'The custom Save link received an inheritable grant.'
   $parseErrors = $null
   $tokens = [Management.Automation.PSParser]::Tokenize([string]$firstPlan.task.arguments, [ref]$parseErrors)
   Assert-True ($null -eq $parseErrors -or $parseErrors.Count -eq 0) 'Task arguments do not parse.'

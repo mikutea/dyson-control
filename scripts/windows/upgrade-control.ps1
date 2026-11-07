@@ -248,6 +248,8 @@ function Install-ProductionDependencies([string]$VersionRoot, [string]$NpmExecut
 }
 
 function Assert-RuntimeConfig([string]$VersionRoot, [string]$NodeExecutable, [string]$PrivateConfigPath) {
+  & $NodeExecutable (Join-Path $VersionRoot 'dist\server\admin.js') check-runtime
+  if ($LASTEXITCODE -ne 0) { throw 'The staged Windows runtime failed its SQLite and native console check.' }
   & $NodeExecutable (Join-Path $VersionRoot 'dist\server\admin.js') validate-config $PrivateConfigPath
   if ($LASTEXITCODE -ne 0) { throw "Dyson Control rejected the configuration at $PrivateConfigPath." }
 }

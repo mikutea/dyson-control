@@ -1,30 +1,38 @@
 import { createHash, randomUUID } from 'node:crypto'
-import { createReadStream } from 'node:fs'
+import type { RecoveryStartReadiness, SettingsRollbackPreview } from '../../shared/contracts.js'
 import fs from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { buffer } from 'node:stream/consumers'
 import type {
-  Action, Backup, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameSettings, GameSettingsHistoryEntry,
-  LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
+  Action, Backup, BackupRestorePreview, ClientPackage, ComponentVersion, ControlConfig, GameAdapter, GameDownload, GameSettings, GameSettingsHistoryEntry,
+  LogEntry, Mod, ModCatalogEntry, ModConfigFile, ModConfigHistoryEntry, ModConfigRollbackPreview, ModRemovalHistoryEntry, Overview, Player, PlayerEventBatch, ReportStep, Save, UpdateHistoryEntry
 } from '../../shared/contracts.js'
 import { importUploadedBackup } from '../backup-import.js'
+import { exportBackup } from './backup-export.js'
+import { BackupRetention } from './backup-retention.js'
+import { hashBackupMember as sha256, readBackupManifest, runBackupVerification, verifyBackupFiles, type BackupManifest } from './backup-verification.js'
 import {
-  assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeTelemetry,
+  assertBridgeReady, playerIdPattern, readBridgePlayerActionCapability, readBridgePlayerEvents, readBridgePlayers, readBridgeRoster, readBridgeTelemetry,
   readBridgeVersions, requestBridgeKickPlayer, requestBridgeSave, requestBridgeStop, type BridgeTelemetry, type BridgeVersions, type SaveReceipt
 } from './bridge.js'
 import { GameAdapterError, invalidInput, unsupported } from './errors.js'
+import { prepareFirstWorld } from './first-world.js'
 import { readGameLogs } from './logs.js'
 import { ModConfigManager, type ModConfigMutationResult } from './mod-config.js'
 import { ModRemovalManager, type ModRemovalMutationResult } from './mod-removal.js'
 import { ModSideStore } from './mod-sides.js'
 import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network-metrics.js'
-import { createR2ModmanPackage } from './profile.js'
+import { clientPackageDownload, compareClientPackage, displayModName, displayModVersion, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage, type ClientPackageMod } from './profile.js'
+import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
-import { SettingsHistoryManager } from './settings-history.js'
+import { assertSettingsRollback, assertSettingsUnchanged, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
 import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, timestampId } from './system.js'
-import { GameUpdateManager } from './updates.js'
+import { GameUpdateManager, installedPackageName, packageIdentityFromVersionedReference } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
 import { SteamGameUpdateBackend } from './steam-update.js'
+import { steamExecutable } from '../steam-auth.js'
+import { acquireSteamProcess } from './steam-process.js'
 
 interface InspectResult {
   sampledAtUnixMs?: number
@@ -34,21 +42,56 @@ interface InspectResult {
   network?: HostNetworkCounterSample | null
 }
 
-interface BackupManifest {
-  schema: 1; id: string; saveName: string; createdAt: string; reason: string
-  members: Array<{ fileName: string; bytes: number; sha256: string }>
-}
+interface ModRecord { dto: Mod; location: string; directory: string | null; packageIdentity: string | null; dependencies: string[]; clientDependencies?: unknown }
 
-interface ModRecord { dto: Mod; directory: string | null; packageIdentity: string | null; dependencies: string[] }
-interface ClientManifest { item: ClientPackage; fileName: string }
+function uniqueMod(records: ModRecord[], id: unknown): ModRecord | undefined {
+  const matches = records.filter(record => record.dto.id === id)
+  if (matches.length > 1) throw new GameAdapterError('MOD_INSTALL_CONFLICT',
+    `${displayModName(matches[0]!.dto.name)} 有多个安装位置，请先核对目录：${matches.map(record => record.location).join('、')}`)
+  return matches[0]
+}
 interface StoredSettings { schema: 1; serverName: string; backupKeep: number; address: string }
 interface StartupSettings { schema: 1; targetUps: number; saveName: string | null }
+interface SettingsFile { bytes: Buffer; sha256: string }
+interface RollbackSettingsState {
+  inspection: InspectResult; stored: StoredSettings; startup: StartupSettings; current: GameSettings; entry: GameSettingsHistoryEntry
+  panelFile: SettingsFile | null; startupFile: SettingsFile; preview: SettingsRollbackPreview
+}
+
+async function readSettingsFile(file: string): Promise<SettingsFile | null> {
+  try {
+    const directory = await fs.lstat(path.dirname(file))
+    if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('Invalid settings directory')
+    const stat = await fs.lstat(file).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (!stat) return null
+    if (!plainRestoreFile(stat) || stat.size > 64 * 1024) throw new Error('Invalid settings file')
+    const handle = await fs.open(file, 'r')
+    try {
+      const opened = await handle.stat()
+      if (!plainRestoreFile(opened) || stat.dev !== opened.dev || stat.ino !== opened.ino) throw new Error('Settings file changed')
+      const bytes = await buffer(handle.createReadStream({ end: stat.size }))
+      const after = await fs.lstat(file)
+      if (bytes.length !== stat.size || !plainRestoreFile(after) || stat.dev !== after.dev || stat.ino !== after.ino ||
+        stat.size !== after.size || stat.ctimeMs !== after.ctimeMs) throw new Error('Settings file changed')
+      return { bytes, sha256: createHash('sha256').update(bytes).digest('hex') }
+    } finally { await handle.close() }
+  } catch (cause) { throw new GameAdapterError('SETTINGS_PREVIEW_INVALID', '无法核对当前设置文件，请检查文件类型、权限和内容后重试。', { cause }) }
+}
+
+async function assertSettingsFile(file: string, expected: string | null) {
+  if (((await readSettingsFile(file))?.sha256 ?? null) !== expected) {
+    throw new GameAdapterError('SETTINGS_ROLLBACK_CHANGED', '设置文件已变化，请重新预览后恢复。')
+  }
+}
 type WindowsScriptRunner = <T>(name: string, input: unknown, signal?: AbortSignal, timeoutMs?: number) => Promise<T>
 interface WindowsAdapterOptions {
   inspect?: () => Promise<InspectResult>
   updates?: Pick<GameUpdateManager,
-    'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
-    'installedPackageVersion' | 'searchPackages' | 'updateHistory' | 'recoverInterrupted'>
+    'versions' | 'resolvePackagePlan' | 'withPreparedPackages' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
+    'installedPackageVersion' | 'searchPackages' | 'describePackagePlan' | 'updateHistory' | 'recoverInterrupted'>
   runScript?: WindowsScriptRunner
   logicalProcessorCount?: number
   clock?: () => number
@@ -57,7 +100,6 @@ interface WindowsAdapterOptions {
   pollIntervalMs?: number
 }
 
-const saveExtensions = ['.dsv', '.server', '.moddsv'] as const
 const requiredModPattern = /(?:^|[-_.])(nebula(?:multiplayermod)?|bepinex|dspmodsave|dysoncontrolbridge)(?:$|[-_.])/i
 const componentPackageIds = { nebula: 'nebula-NebulaMultiplayerMod', bepinex: 'xiaoye97-BepInEx' } as const
 const incompleteUpdateRecoveryCodes = new Set(['UPDATE_ROLLBACK_FAILED', 'STEAM_UPDATE_ROLLBACK_FAILED', 'STEAM_ROLLBACK_RECOVERY_FAILED', 'MOD_TOGGLE_ROLLBACK_FAILED'])
@@ -72,25 +114,11 @@ function saveNameFromId(id: string): string {
 function validSaveName(name: string): boolean {
   return name.length > 0 && name.length <= 120 && name !== '.' && name !== '..' && !/[\\/:*?"<>|\u0000-\u001f]/u.test(name)
 }
-function packageIdentityFromVersionedReference(reference: string): string | null {
-  const match = /^(.+)-(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)(?:[-+][A-Za-z0-9.-]+)?$/.exec(reference.trim())
-  return match?.[1] ?? null
-}
 function dependencyPackageIdentity(reference: string): string | null {
   return packageIdentityFromVersionedReference(reference)?.toLowerCase() ?? null
 }
 function modId(name: string): string { return createHash('sha256').update(name.toLowerCase()).digest('hex').slice(0, 20) }
 function now(): string { return new Date().toISOString() }
-
-async function sha256(filePath: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const digest = createHash('sha256')
-    const stream = createReadStream(filePath)
-    stream.on('data', (chunk) => digest.update(chunk))
-    stream.on('error', reject)
-    stream.on('end', () => resolve(digest.digest('hex')))
-  })
-}
 
 function validateSettings(value: unknown): Omit<GameSettings, 'readOnlyFields'> {
   if (!value || typeof value !== 'object') invalidInput('settings is required.')
@@ -134,10 +162,11 @@ export class WindowsGameAdapter implements GameAdapter {
   readonly #startupSettingsPath: string
   readonly #packageDirectory: string
   readonly #downloadDirectory: string
+  readonly #retention: BackupRetention
   readonly #inspectOverride: WindowsAdapterOptions['inspect']
   readonly #updates: Pick<GameUpdateManager,
-    'versions' | 'resolvePackagePlan' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
-    'installedPackageVersion' | 'searchPackages' | 'updateHistory' | 'recoverInterrupted'>
+    'versions' | 'resolvePackagePlan' | 'withPreparedPackages' | 'installComponent' | 'installPackage' | 'rollbackUpdate' |
+    'installedPackageVersion' | 'searchPackages' | 'describePackagePlan' | 'updateHistory' | 'recoverInterrupted'>
   readonly #updateOverrideConfigured: boolean
   readonly #runScript: WindowsScriptRunner
   readonly #modConfig: ModConfigManager
@@ -181,6 +210,7 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#startupSettingsPath = path.join(config.dataDirectory, 'game-startup', 'settings.json')
     this.#packageDirectory = path.join(config.dataDirectory, 'client-packages')
     this.#downloadDirectory = path.join(config.dataDirectory, 'downloads')
+    this.#retention = new BackupRetention(config.game.backupDirectory, config.dataDirectory, this.#downloadDirectory)
     this.#modConfig = new ModConfigManager({
       gameRoot: config.game.root,
       historyDirectory: path.join(config.dataDirectory, 'mod-config-history')
@@ -200,9 +230,9 @@ export class WindowsGameAdapter implements GameAdapter {
     })
     this.#versionLocks = new VersionLockStore(path.join(config.dataDirectory, 'version-locks.json'))
     this.#updateOverrideConfigured = options.updates !== undefined
-    this.#steamUpdates = config.game.steam ? new SteamGameUpdateBackend({
-      steamCmdPath: config.game.steam.executable,
-      accountName: config.game.steam.accountName,
+    this.#steamUpdates = new SteamGameUpdateBackend({
+      steamCmdPath: steamExecutable(config),
+      accountName: () => config.game.steam?.accountName ?? '',
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'steam-updates', 'work'),
       backupDirectory: path.join(config.dataDirectory, 'steam-updates', 'backups'),
@@ -211,7 +241,7 @@ export class WindowsGameAdapter implements GameAdapter {
         if ((await this.#inspect(true)).process) throw new GameAdapterError('GAME_RUNNING', 'Stop the game before replacing Steam files.')
       },
       versionLocks: this.#versionLocks,
-    }) : null
+    })
     this.#updates = options.updates ?? new GameUpdateManager({
       gameRoot: config.game.root,
       workDirectory: path.join(config.dataDirectory, 'updates', 'work'),
@@ -245,55 +275,48 @@ export class WindowsGameAdapter implements GameAdapter {
     await this.#enforceAutomaticBackupRetention()
   }
 
-  async #replaceJsonFile(filePath: string, value: unknown): Promise<void> {
+  async #replaceJsonFile(filePath: string, value: unknown, expected?: string | null): Promise<void> {
     const existing = await fs.lstat(filePath).catch(() => null)
     if (existing && (!existing.isFile() || existing.isSymbolicLink())) {
       throw new GameAdapterError('SETTINGS_PATH_INVALID', `Settings path is not a plain file: ${filePath}`)
     }
     const temporary = `${filePath}.partial-${randomUUID()}`
-    await fs.writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
-    try { await fs.rename(temporary, filePath) } catch (error) {
+    await fs.writeFile(temporary, Buffer.isBuffer(value) ? value : `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    try {
+      if (expected !== undefined) await assertSettingsFile(filePath, expected)
+      await fs.rename(temporary, filePath)
+    } catch (error) {
       await fs.rm(temporary, { force: true }).catch(() => undefined)
       throw error
     }
   }
 
-  async #enforceAutomaticBackupRetention(report?: ReportStep, pinned = new Set<string>()): Promise<number> {
-    const entries = await fs.readdir(this.#config.game.backupDirectory, { withFileTypes: true })
-    const automatic: BackupManifest[] = []
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(entry.name)) continue
-      const manifest = await this.#readBackupManifest(entry.name).catch(() => null)
-      if (manifest?.reason.startsWith('automatic-')) automatic.push(manifest)
-    }
-    automatic.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id))
-    const retained = new Set(automatic.slice(0, this.#settings.backupKeep).map(manifest => manifest.id))
-    for (const id of pinned) retained.add(id)
-    const expired = automatic.filter(manifest => !retained.has(manifest.id))
-    for (const manifest of expired) {
-      const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, manifest.id))
-      const stat = await fs.lstat(root).catch(() => null)
-      if (!stat?.isDirectory() || stat.isSymbolicLink()) throw new GameAdapterError('BACKUP_RETENTION_INVALID', `Refusing to remove abnormal backup path: ${manifest.id}`)
-      await fs.rm(root, { recursive: true, force: false })
-      await fs.rm(path.join(this.#downloadDirectory, `${manifest.id}.zip`), { force: true })
-    }
-    if (expired.length > 0) report?.(`已按保留策略清理 ${expired.length} 个旧自动备份`)
-    return expired.length
+  async #enforceAutomaticBackupRetention(report?: ReportStep, protectedIds = new Set<string>()): Promise<number> {
+    return this.#retention.prune(this.#settings.backupKeep, protectedIds, report)
   }
 
-  async #inspect(fresh = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
+  #inspectionInput() {
+    return {
+      gameRoot: this.#config.game.root, saveDirectory: this.#config.game.saveDirectory, logFile: this.#config.game.logFile,
+      managedStartScript: resolveWindowsScript('start-game.ps1'), startupSettingsPath: this.#startupSettingsPath,
+      startTaskName: this.#config.game.startTaskName,
+    }
+  }
+  async recoveryStartReadiness(): Promise<RecoveryStartReadiness> {
+    const result = await this.#runScript<{ state?: unknown }>('inspect-game.ps1', {
+      ...this.#inspectionInput(), checkRecoveryStart: true, requireProcessIdentity: true,
+    }).catch(() => null)
+    switch (result?.state) {
+      case 'ready': case 'game-present': case 'task-unavailable': case 'steam-missing': case 'steam-other-user': case 'session-ambiguous': return result.state
+      default: return 'unknown'
+    }
+  }
+  async #inspect(fresh = false, requireProcessIdentity = false): Promise<InspectResult & { sampledAtUnixMs: number }> {
     await this.#initialization
     if (!fresh && this.#inspectCache && this.#clock() - this.#inspectCache.at < 2_000) return this.#inspectCache.value
     const value = this.#inspectOverride
       ? await this.#inspectOverride()
-      : await this.#runScript<InspectResult>('inspect-game.ps1', {
-          gameRoot: this.#config.game.root,
-          saveDirectory: this.#config.game.saveDirectory,
-          logFile: this.#config.game.logFile,
-          managedStartScript: resolveWindowsScript('start-game.ps1'),
-          startupSettingsPath: this.#startupSettingsPath,
-          startTaskName: this.#config.game.startTaskName
-        })
+      : await this.#runScript<InspectResult>('inspect-game.ps1', { ...this.#inspectionInput(), requireProcessIdentity })
     const snapshot = { ...value, sampledAtUnixMs: value.sampledAtUnixMs ?? this.#clock() }
     this.#inspectCache = { at: this.#clock(), value: snapshot }
     return snapshot
@@ -305,7 +328,7 @@ export class WindowsGameAdapter implements GameAdapter {
       this.saves(), fs.statfs(this.#config.game.saveDirectory).catch(() => null)
     ])
     const process = inspection.process
-    let players: Player[] = []
+    let roster: Awaited<ReturnType<typeof readBridgeRoster>> | null = null
     let playerStatus: Overview['playerStatus'] = 'available'
     let bridgeReady = false
     let playerActions = false
@@ -313,7 +336,7 @@ export class WindowsGameAdapter implements GameAdapter {
     let runtimeVersions: BridgeVersions | null = null
     if (process) {
       try {
-        players = await readBridgePlayers(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, process.pid)
+        roster = await readBridgeRoster(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, process.pid)
         bridgeReady = true
       } catch {
         playerStatus = 'unavailable'
@@ -363,7 +386,11 @@ export class WindowsGameAdapter implements GameAdapter {
       name: this.#settings.serverName, source: 'windows', state: process ? 'running' : 'stopped', sampledAt: now(),
       address: this.#settings.address, pid: process?.pid ?? null,
       uptimeSeconds: process ? Math.max(0, Math.floor((this.#clock() - Date.parse(process.startedAt)) / 1000)) : 0,
-      playerCount: playerStatus === 'available' ? players.length : null, playerStatus, maxPlayers: null,
+      playerCount: playerStatus === 'available' ? roster?.players.length ?? 0 : null, playerStatus, maxPlayers: null,
+      worldClock: process && telemetry && roster && Date.parse(process.startedAt) <= telemetry.bridgeStartedAt && telemetry.bridgeStartedAt === roster.bridgeStartedAt ? {
+        gameTick: telemetry.gameTick, sessionId: telemetry.sessionId, writtenAt: Date.parse(telemetry.sampledAt),
+        rosterSessionId: roster.sessionId, rosterWrittenAt: roster.writtenAt, rosterSequence: roster.sequence
+      } : null,
       versions: {
         game: runtimeVersions?.game ?? 'unknown',
         nebula: runtimeVersions?.nebula ?? 'unknown',
@@ -400,13 +427,13 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async versions(): Promise<ComponentVersion[]> {
-    const inspected = await this.#inspect()
+    const [inspected, records] = await Promise.all([this.#inspect(), this.#scanMods()])
     const [runtime, nebula, bepinex] = await Promise.all([
       inspected.process
         ? readBridgeVersions(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, inspected.process.pid).catch(() => null)
         : Promise.resolve(null),
-      this.#installedComponentPackageVersion('nebula'),
-      this.#installedComponentPackageVersion('bepinex')
+      this.#installedComponentPackageVersion('nebula', records),
+      this.#installedComponentPackageVersion('bepinex', records)
     ])
     const versions = await this.#updates.versions({
       game: runtime?.game ?? 'unknown',
@@ -421,12 +448,16 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async versionLocks() { return this.#versionLocks.list() }
 
-  async #installedComponentPackageVersion(component: 'nebula' | 'bepinex'): Promise<string | null> {
+  async #installedComponentPackageVersion(component: 'nebula' | 'bepinex', records: ModRecord[]): Promise<string | null> {
     const packageId = componentPackageIds[component]
+    const matches = records.filter(record => record.packageIdentity === packageId.toLowerCase())
+    if (matches.length > 1) {
+      const active = matches.filter(record => record.dto.enabled)
+      return active.length === 1 ? displayModVersion(active[0]!.dto.version) : null
+    }
     const recorded = await this.#updates.installedPackageVersion(packageId)
     if (recorded) return recorded
-    const installed = (await this.#scanMods()).find(record =>
-      record.dto.enabled && record.packageIdentity?.toLowerCase() === packageId.toLowerCase())
+    const installed = matches.find(record => record.dto.enabled)
     return installed && installed.dto.version !== 'unknown' ? installed.dto.version : null
   }
 
@@ -438,13 +469,15 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!['game', 'nebula', 'bepinex'].includes(String(input.component))) invalidInput('Unknown component.')
       const component = input.component as 'game' | 'nebula' | 'bepinex'
       packageId = component === 'game' ? GAME_VERSION_LOCK_ID : component === 'nebula' ? 'nebula-NebulaMultiplayerMod' : 'xiaoye97-BepInEx'
+      const records = component === 'game' ? [] : await this.#scanMods()
+      if (component !== 'game') uniqueMod(records, modId(packageId))
       if (input.locked) {
         currentVersion = component === 'game'
           ? await this.#steamUpdates?.currentBuild() ?? null
-          : await this.#installedComponentPackageVersion(component)
+          : await this.#installedComponentPackageVersion(component, records)
       }
     } else {
-      const record = (await this.#scanMods()).find(item => item.dto.id === input.modId)
+      const record = uniqueMod(await this.#scanMods(), input.modId)
       if (!record?.packageIdentity) throw new GameAdapterError('MOD_NOT_FOUND', 'A known installed package is required to lock its version.')
       packageId = record.packageIdentity
       currentVersion = record.dto.version
@@ -482,15 +515,7 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async backups(): Promise<Backup[]> {
     await this.#initialization
-    const entries = await fs.readdir(this.#config.game.backupDirectory, { withFileTypes: true })
-    const results: Backup[] = []
-    for (const entry of entries) {
-      if (!entry.isDirectory() || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(entry.name)) continue
-      const manifest = await this.#readBackupManifest(entry.name).catch(() => null)
-      if (!manifest) continue
-      results.push({ id: manifest.id, saveName: manifest.saveName, createdAt: manifest.createdAt, bytes: manifest.members.reduce((sum, member) => sum + member.bytes, 0), members: manifest.members.map((member) => member.fileName), reason: manifest.reason })
-    }
-    return results.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+    return this.#retention.list()
   }
 
   async settings(): Promise<GameSettings> {
@@ -498,15 +523,15 @@ export class WindowsGameAdapter implements GameAdapter {
     return this.#settingsForInspection(await this.#inspect())
   }
 
-  #settingsForInspection(inspection: InspectResult): GameSettings {
-    const fallbackTarget = inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? this.#startupSettings.targetUps
+  #settingsForInspection(inspection: InspectResult, stored = this.#settings, startup = this.#startupSettings): GameSettings {
+    const fallbackTarget = inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? startup.targetUps
     return {
-      serverName: this.#settings.serverName,
+      serverName: stored.serverName,
       maxPlayers: null,
-      targetUps: inspection.tasks.startManaged ? this.#startupSettings.targetUps : fallbackTarget,
+      targetUps: inspection.tasks.startManaged ? startup.targetUps : fallbackTarget,
       autosaveMinutes: null,
-      backupKeep: this.#settings.backupKeep,
-      address: this.#settings.address,
+      backupKeep: stored.backupKeep,
+      address: stored.address,
       readOnlyFields: inspection.tasks.startManaged ? ['maxPlayers', 'autosaveMinutes'] : ['maxPlayers', 'targetUps', 'autosaveMinutes']
     }
   }
@@ -516,27 +541,75 @@ export class WindowsGameAdapter implements GameAdapter {
     return this.#settingsHistory.history()
   }
 
-  async clientPackages(): Promise<ClientPackage[]> {
-    await this.#initialization
-    const entries = await fs.readdir(this.#packageDirectory, { withFileTypes: true })
-    const results: ClientPackage[] = []
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue
-      try {
-        const manifest = JSON.parse(await fs.readFile(path.join(this.#packageDirectory, entry.name), 'utf8')) as ClientManifest
-        const archive = path.join(this.#packageDirectory, manifest.fileName)
-        const stat = await fs.lstat(archive)
-        if (stat.isFile() && !stat.isSymbolicLink() && stat.size === manifest.item.bytes) results.push(manifest.item)
-      } catch { /* Ignore incomplete package metadata. */ }
-    }
-    return results.sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+  async #rollbackSettingsState(entry: GameSettingsHistoryEntry): Promise<RollbackSettingsState> {
+    const [inspection, panelFile, startupFile] = await Promise.all([
+      this.#inspect(true), readSettingsFile(this.#settingsPath), readSettingsFile(this.#startupSettingsPath)
+    ])
+    try {
+      if (typeof inspection.tasks?.start !== 'boolean' || typeof inspection.tasks.startManaged !== 'boolean' ||
+        (inspection.tasks.startManaged && !inspection.tasks.start)) throw new Error('Unknown startup task capability')
+      if (!startupFile) throw new Error('Missing startup settings')
+      const stored = panelFile ? validateStoredSettings(JSON.parse(panelFile.bytes.toString('utf8'))) :
+        { schema: 1 as const, serverName: this.#config.game.serverName, backupKeep: 20, address: this.#config.game.address }
+      const startup = validateStartupSettings(JSON.parse(startupFile.bytes.toString('utf8')))
+      const current = this.#settingsForInspection(inspection, stored, startup)
+      return { inspection, stored, startup, current, entry, panelFile, startupFile,
+        preview: describeSettingsRollback(entry, current, 'windows', [panelFile?.sha256 ?? null, startupFile.sha256]) }
+    } catch (cause) { throw new GameAdapterError('SETTINGS_PREVIEW_INVALID', '当前面板或启动设置无效，请检查后重新预览。', { cause }) }
   }
 
-  async mods(): Promise<Mod[]> { return this.#modSides.apply((await this.#scanMods()).map((record) => record.dto)) }
+  async settingsRollbackPreview(historyId: string) {
+    await this.#initialization
+    return (await this.#rollbackSettingsState(await this.#settingsHistory.selected(historyId))).preview
+  }
+
+  async clientPackages(): Promise<ClientPackage[]> {
+    await this.#initialization
+    return listClientPackages(this.#packageDirectory)
+  }
+
+  async clientPackagePlan() {
+    await this.#initialization
+    return readClientPackagePlan(this.#settings.address, () => this.#clientMods())
+  }
+
+  async clientPackageDetails(id: string) {
+    await this.#initialization
+    return compareClientPackage(this.#packageDirectory, id, this.#settings.address, () => this.#clientMods())
+  }
+
+  async mods(): Promise<Mod[]> {
+    return this.#modsFromRecords(await this.#scanMods())
+  }
+
+  async #modsFromRecords(records: ModRecord[]): Promise<Mod[]> {
+    const groups = new Map<string, ModRecord[]>()
+    for (const record of records) {
+      const group = groups.get(record.dto.id)
+      if (group) group.push(record)
+      else groups.set(record.dto.id, [record])
+    }
+    const mods = Array.from(groups.values(), (group, index) => {
+      const first = group[0]!.dto
+      if (group.length === 1) return first
+      const active = group.filter(record => record.dto.enabled)
+      const effective = active.length === 1 ? active[0]!.dto : null
+      return { ...(effective ?? first), name: displayModName((effective ?? first).name, index), enabled: active.length > 0,
+        version: effective && displayModVersion(effective.version) || 'unknown',
+        required: group.some(record => record.dto.required), description: '',
+        installations: group.map(({ dto, location }) => ({ path: location, version: displayModVersion(dto.version) ?? 'unknown', enabled: dto.enabled })) }
+    })
+    return this.#modSides.apply(mods)
+  }
 
   async modCatalog(search: string): Promise<ModCatalogEntry[]> {
     await this.#initialization
     return this.#updates.searchPackages(search)
+  }
+
+  async modInstallPlan(packageName: string, version: string) {
+    await this.#initialization
+    return this.#updates.describePackagePlan(packageName, version, AbortSignal.timeout(30_000))
   }
 
   async modConfigs(): Promise<ModConfigFile[]> {
@@ -547,6 +620,11 @@ export class WindowsGameAdapter implements GameAdapter {
   async modConfigHistory(configId?: string): Promise<ModConfigHistoryEntry[]> {
     await this.#initialization
     return this.#modConfig.history(configId)
+  }
+
+  async modConfigRollbackPreview(historyId: string): Promise<ModConfigRollbackPreview> {
+    await this.#initialization
+    return this.#modConfig.previewRollback(historyId)
   }
 
   async modRemovalHistory(): Promise<ModRemovalHistoryEntry[]> {
@@ -564,6 +642,10 @@ export class WindowsGameAdapter implements GameAdapter {
     signal.throwIfAborted()
     switch (action) {
       case 'start': return this.#start(report, signal)
+      case 'prepare-first-world': return this.#prepareFirstWorld(report, signal)
+      case 'load-save': return this.#loadSave(input, report, signal)
+      case 'set-backup-retained': return this.#retention.set(input, report)
+      case 'verify-backup': return runBackupVerification(this.#config.game.backupDirectory, input, report, signal)
       case 'save': return this.#save(report, signal)
       case 'stop': return this.#stop(report, signal, true)
       case 'restart': {
@@ -603,31 +685,12 @@ export class WindowsGameAdapter implements GameAdapter {
     unsupported(action, 'the Windows adapter does not implement this action')
   }
 
-  async download(kind: 'backup' | 'client', id: string): Promise<{ path: string; fileName: string; contentType: string }> {
+  async download(kind: 'backup' | 'client', id: string, signal?: AbortSignal): Promise<GameDownload> {
     await this.#initialization
     safeId(id, `${kind} id`)
-    if (kind === 'client') {
-      const manifestPath = path.join(this.#packageDirectory, `${id}.json`)
-      let manifest: ClientManifest
-      try { manifest = JSON.parse(await fs.readFile(manifestPath, 'utf8')) as ClientManifest } catch { throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested client package does not exist.') }
-      if (manifest.item.id !== id || path.basename(manifest.fileName) !== manifest.fileName) throw new GameAdapterError('PACKAGE_MANIFEST_INVALID', 'Client package metadata is invalid.')
-      const filePath = ensureInside(this.#packageDirectory, path.join(this.#packageDirectory, manifest.fileName))
-      const stat = await fs.lstat(filePath).catch(() => null)
-      if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== manifest.item.bytes) throw new GameAdapterError('DOWNLOAD_NOT_FOUND', 'The requested client package does not exist.')
-      return { path: filePath, fileName: manifest.item.name, contentType: 'application/zip' }
-    }
+    if (kind === 'client') return clientPackageDownload(this.#packageDirectory, id, signal)
 
-    const manifest = await this.#readBackupManifest(id)
-    const backupRoot = await this.#verifyBackup(manifest)
-    const archivePath = path.join(this.#downloadDirectory, `${id}.zip`)
-    if (!(await pathExists(archivePath))) {
-      const entries = [
-        { sourcePath: path.join(backupRoot, 'manifest.json'), entryName: 'manifest.json' },
-        ...manifest.members.map((member) => ({ sourcePath: path.join(backupRoot, member.fileName), entryName: member.fileName }))
-      ]
-      await this.#runScript('archive-files.ps1', { outputPath: archivePath, entries }, undefined, 5 * 60_000)
-    }
-    return { path: archivePath, fileName: `${id}.zip`, contentType: 'application/zip' }
+    return exportBackup(this.#config.game.backupDirectory, id, signal)
   }
 
   async #save(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
@@ -669,10 +732,94 @@ export class WindowsGameAdapter implements GameAdapter {
     return { playerId, kicked: true }
   }
 
-  async #start(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
-    if ((await this.#inspect(true)).process) return { alreadyRunning: true, state: 'running' }
+  async #loadSave(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    if (typeof input.saveId !== 'string') invalidInput('saveId is required.')
+    const name = saveNameFromId(input.saveId)
+    const inspection = await this.#inspect(true)
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('LOAD_SAVE_START_UNSUPPORTED', '加载指定存档需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      if (inspection.process) throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '请先停止游戏并完成中断的存档恢复。')
+      await this.#recoverInterruptedSaveRestore(report)
+    }
+    await this.#existingSaveMemberCount(name)
+    const selected = (await this.saves()).find(save => save.name === name)
+    if (!selected) throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档不存在或缺少完整的 .dsv / .server 文件，请刷新列表。')
+    const wasRunning = Boolean(inspection.process)
+    const protectedBackups: string[] = []
+    if (wasRunning) {
+      await this.#save(report, signal)
+      const receipt = this.#lastSaveReceipt!
+      protectedBackups.push((await this.#createBackup(receipt.saveName, 'automatic-before-load-save', report, receipt)).id)
+    }
+    if (!wasRunning || this.#lastSaveReceipt!.saveName !== name) {
+      protectedBackups.push((await this.#createBackup(name, 'automatic-before-load-save', report)).id)
+    }
+    for (const id of protectedBackups) report(`切换前保护备份：${id}`)
+    signal.throwIfAborted()
+    if (wasRunning) {
+      if ((await this.#inspect(true)).process?.pid !== inspection.process!.pid) {
+        throw new GameAdapterError('LOAD_SAVE_PROCESS_CHANGED', '游戏进程在切换前发生变化，未修改启动存档。')
+      }
+      await this.#stop(report, signal, false)
+    }
+    // Recheck after stopping: a disappeared save must never turn into load-latest.
+    if ((await this.#inspect(true)).process) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '游戏仍在运行，未修改启动存档。')
+    await this.#existingSaveMemberCount(name)
+    if (!(await this.saves()).some(save => save.name === name)) {
+      throw new GameAdapterError('SAVE_NOT_FOUND', '所选存档在切换前已变化；服务器未切换，请检查存档。')
+    }
+    signal.throwIfAborted()
+    const nextStartup = { ...this.#startupSettings, saveName: name }
+    await this.#replaceJsonFile(this.#startupSettingsPath, nextStartup)
+    this.#startupSettings = nextStartup
+    this.#currentSave = null
+    report(`已将启动存档设为 ${name}`)
+    try {
+      const start = await this.#start(report, signal)
+      if (start.alreadyRunning === true) throw new GameAdapterError('LOAD_SAVE_PROCESS_PRESENT', '启动前出现了其他游戏进程。')
+      const started = (await this.#inspect(true)).process
+      if (!started || started.pid !== start.pid || started.selectedSave !== name) {
+        throw new GameAdapterError('LOAD_SAVE_SELECTION_UNCONFIRMED', '新进程没有使用所选存档的启动参数。')
+      }
+    } catch (error) {
+      throw new GameAdapterError('LOAD_SAVE_START_FAILED', `启动存档已设为 ${name}，但未确认加载完成。切换前备份已保留，请检查服务器状态后重试启动或恢复备份。`, { cause: error })
+    }
+    this.#currentSave = { name, savedAt: (await this.saves()).find(save => save.name === name)?.modifiedAt ?? selected.modifiedAt }
+    return { saveName: name, automaticBackups: protectedBackups, wasRunning, state: 'running', bridgeReady: true }
+  }
+
+  async #prepareFirstWorld(report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
+    let inspection: InspectResult
+    try { inspection = await this.#inspect(true) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STATE_UNKNOWN', '未能确认服务器已经停止，请检查服务器状态后重试。', { cause: error }) }
+    if (inspection.process) throw new GameAdapterError('FIRST_WORLD_GAME_RUNNING', '请先停止服务器，再准备首次世界许可。')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('FIRST_WORLD_TASK_REQUIRED', '准备首次世界许可需要 Dyson Control 管理的启动任务，请先完成游戏接入。')
+    }
+    let startup: StartupSettings
+    try { startup = validateStartupSettings(JSON.parse(await fs.readFile(this.#startupSettingsPath, 'utf8'))) }
+    catch (error) { throw new GameAdapterError('FIRST_WORLD_STARTUP_INVALID', '无法读取有效的启动存档设置，未准备首次世界许可。', { cause: error }) }
+    if (startup.saveName !== null) {
+      throw new GameAdapterError('FIRST_WORLD_SAVE_SELECTED', '已选择启动存档，请继续加载或恢复该存档；未准备新世界。')
+    }
+    if (await this.#saveRestore.hasPending()) {
+      throw new GameAdapterError('FIRST_WORLD_RESTORE_PENDING', '存在尚未完成的存档恢复，请先检查并完成恢复；未准备新世界。')
+    }
+    report('正在恢复原始首装许可')
+    const result = await prepareFirstWorld(this.#config, signal)
+    report('首次世界许可已准备好。游戏保持停止，请前往概览手动启动。')
+    return result
+  }
+
+  async #start(report: ReportStep, signal: AbortSignal, afterRestore = false): Promise<Record<string, unknown>> {
+    if (afterRestore) {
+      await this.#requireStoppedForRestore()
+      if (await this.#saveRestore.hasPending()) throw new GameAdapterError('SAVE_RESTORE_PENDING', '存在尚未完成的存档恢复，请检查任务记录并保持停服。')
+    } else if ((await this.#inspect(true)).process) return { alreadyRunning: true, state: 'running' }
     if (!this.#config.game.startTaskName) unsupported('start', 'no start scheduled task is configured')
-    await this.#recoverInterruptedSaveRestore(report)
+    if (!afterRestore) await this.#recoverInterruptedSaveRestore(report)
     await this.#updates.recoverInterrupted(report, signal)
     await this.#steamUpdates?.recoverInterrupted(report, signal)
     report('正在启动服务器')
@@ -682,19 +829,22 @@ export class WindowsGameAdapter implements GameAdapter {
     return { state: 'running', pid: processId, bridgeReady: true }
   }
 
-  async #startWithTimeout(report: ReportStep): Promise<Record<string, unknown>> {
+  async #startWithTimeout(report: ReportStep, afterRestore = false): Promise<Record<string, unknown>> {
     // Completing a mutation or recovering an interrupted operation must allow
     // the same cold-start interval as a direct start, plus task setup time.
-    return this.#start(report, AbortSignal.timeout(this.#startupTimeoutMs + this.#lifecycleTimeoutMs))
+    return this.#start(report, AbortSignal.timeout(this.#startupTimeoutMs + this.#lifecycleTimeoutMs), afterRestore)
   }
 
-  async #stop(report: ReportStep, signal: AbortSignal, saveFirst: boolean): Promise<Record<string, unknown>> {
-    const before = await this.#inspect(true)
+  async #stop(report: ReportStep, signal: AbortSignal, saveFirst: boolean, savedProcessId?: number): Promise<Record<string, unknown>> {
+    const before = savedProcessId === undefined ? await this.#inspect(true) : await this.#inspectForRestore()
     if (!before.process) return { alreadyStopped: true, state: 'stopped' }
     const expectedProcessId = before.process.pid
+    if (savedProcessId !== undefined && expectedProcessId !== savedProcessId) {
+      throw new GameAdapterError('GAME_STOP_PROCESS_CHANGED', '保存后游戏进程已变化，未停止新进程。请重新检查恢复预览。')
+    }
     let saveResult: Record<string, unknown> | null = null
     if (saveFirst) saveResult = await this.#save(report, signal)
-    const current = await this.#inspect(true)
+    const current = savedProcessId === undefined ? await this.#inspect(true) : await this.#inspectForRestore()
     if (!current.process) return { state: 'stopped', save: saveResult }
     if (current.process.pid !== expectedProcessId) {
       throw new GameAdapterError('GAME_STOP_PROCESS_CHANGED', 'The DSP process changed before the Bridge stop request could be sent.')
@@ -763,9 +913,9 @@ export class WindowsGameAdapter implements GameAdapter {
       await this.#wait(signal)
     }
     if (expectedProcessId === null) {
-      throw new GameAdapterError('GAME_START_TIMEOUT', 'The scheduled task did not start the exact DSP process before the timeout.')
+      throw new GameAdapterError('GAME_START_TIMEOUT', '计划任务已触发，但等待期间没有检测到配置的 DSP 游戏进程。请在服务器页点击“检查启动条件”，核对任务和桌面 Steam 会话。')
     }
-    throw new GameAdapterError('GAME_START_BRIDGE_TIMEOUT', 'DSPGAME.exe started, but its signed Bridge heartbeat did not become ready before the timeout.', {
+    throw new GameAdapterError('GAME_START_BRIDGE_TIMEOUT', 'DSP 游戏进程已启动，但该进程的签名 Bridge 心跳未就绪。请检查游戏日志和已安装的 Bridge 版本。', {
       cause: lastBridgeError ?? undefined
     })
   }
@@ -782,34 +932,28 @@ export class WindowsGameAdapter implements GameAdapter {
   async #selectBackupDefault(): Promise<string> {
     const saves = await this.saves()
     if (this.#currentSave && saves.some((save) => save.name === this.#currentSave!.name)) return this.#currentSave.name
-    if (saves.length === 0) throw new GameAdapterError('SAVE_NOT_FOUND', 'No complete save set exists.')
+    if (saves.length === 0) throw new GameAdapterError('SAVE_NOT_FOUND', '没有可备份的完整存档。首次开服请先保存游戏；已有存档请检查同名的 .dsv 和 .server 文件。')
     return saves[0]!.name
   }
 
   async #existingSaveMemberCount(name: string): Promise<number> {
-    let count = 0
-    for (const extension of saveExtensions) {
-      const fileName = `${name}${extension}`
-      const memberPath = ensureInside(this.#config.game.saveDirectory, path.join(this.#config.game.saveDirectory, fileName))
-      const stat = await fs.lstat(memberPath).catch(() => null)
-      if (!stat) continue
-      if (!stat.isFile() || stat.isSymbolicLink()) throw new GameAdapterError('SAVE_MEMBER_INVALID', `Cannot replace abnormal save member: ${fileName}`)
-      count++
-    }
-    return count
+    const members = await readSaveMembers(this.#config.game.saveDirectory, name)
+    const unsafe = members.find(member => !member.stat.isFile() || member.stat.isSymbolicLink())
+    if (unsafe) throw new GameAdapterError('SAVE_MEMBER_INVALID', `存档成员 ${unsafe.fileName} 不是普通文件。`)
+    return members.length
   }
 
   async #createBackup(name: string, reason: string, report: ReportStep, expectedReceipt: SaveReceipt | null = null): Promise<BackupManifest> {
     if (!validSaveName(name)) invalidInput('The save name is invalid.')
-    const sourceMembers: Array<{ fileName: string; sourcePath: string; stat: Awaited<ReturnType<typeof fs.lstat>> }> = []
-    for (const extension of saveExtensions) {
-      const fileName = `${name}${extension}`
-      const sourcePath = ensureInside(this.#config.game.saveDirectory, path.join(this.#config.game.saveDirectory, fileName))
-      const stat = await fs.lstat(sourcePath).catch(() => null)
-      if (stat?.isFile() && !stat.isSymbolicLink()) sourceMembers.push({ fileName, sourcePath, stat })
+    const sourceMembers = await readSaveMembers(this.#config.game.saveDirectory, name)
+    if (reason === 'automatic-before-restore') {
+      const blockers = targetMemberBlockers(sourceMembers)
+      if (blockers.length) throw new GameAdapterError('SAVE_MEMBER_INVALID', blockers.join(' '))
     }
+    const unsafe = sourceMembers.find(member => !member.stat.isFile() || member.stat.isSymbolicLink())
+    if (unsafe) throw new GameAdapterError('SAVE_MEMBER_INVALID', `存档成员 ${unsafe.fileName} 不是普通文件，无法完整备份。`)
     if (!sourceMembers.some((member) => member.fileName.endsWith('.dsv')) || !sourceMembers.some((member) => member.fileName.endsWith('.server'))) {
-      throw new GameAdapterError('SAVE_SET_INCOMPLETE', `${name} does not have both .dsv and .server files.`)
+      throw new GameAdapterError('SAVE_SET_INCOMPLETE', `存档 ${name} 缺少同名的 .dsv 或 .server，无法建立完整备份。请检查存档后重试。`)
     }
     if (expectedReceipt) {
       const expected = new Map<string, { bytes: number; ticks: bigint }>([
@@ -846,9 +990,12 @@ export class WindowsGameAdapter implements GameAdapter {
         }
         members.push({ fileName: source.fileName, bytes: copied.size, sha256: await sha256(destination) })
       }
+      const finalMembers = await readSaveMembers(this.#config.game.saveDirectory, name)
+      if (finalMembers.length !== sourceMembers.length) throw new GameAdapterError('BACKUP_SOURCE_CHANGED', '创建备份期间存档成员数量发生变化，请重试。')
       for (const source of sourceMembers) {
-        const sourceAfterSet = await fs.lstat(source.sourcePath).catch(() => null)
-        if (!sourceAfterSet?.isFile() || sourceAfterSet.isSymbolicLink() || sourceAfterSet.size !== source.stat.size || sourceAfterSet.mtimeMs !== source.stat.mtimeMs) {
+        const sourceAfterSet = finalMembers.find(member => member.fileName === source.fileName)?.stat
+        if (!sourceAfterSet?.isFile() || sourceAfterSet.isSymbolicLink() || sourceAfterSet.nlink !== source.stat.nlink ||
+            sourceAfterSet.size !== source.stat.size || sourceAfterSet.mtimeMs !== source.stat.mtimeMs) {
           throw new GameAdapterError('BACKUP_SOURCE_CHANGED', `The save set changed while it was being backed up: ${source.fileName}`)
         }
       }
@@ -864,53 +1011,84 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #readBackupManifest(id: string): Promise<BackupManifest> {
-    safeId(id, 'backupId')
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, id))
-    const rootStat = await fs.lstat(root).catch(() => null)
-    if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) throw new GameAdapterError('BACKUP_NOT_FOUND', 'The requested backup does not exist.')
-    let manifest: BackupManifest
-    try { manifest = JSON.parse(await fs.readFile(path.join(root, 'manifest.json'), 'utf8')) as BackupManifest } catch (error) { throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.', { cause: error }) }
-    if (manifest.schema !== 1 || manifest.id !== id || !validSaveName(manifest.saveName) ||
-        typeof manifest.createdAt !== 'string' || !Number.isFinite(Date.parse(manifest.createdAt)) ||
-        typeof manifest.reason !== 'string' || manifest.reason.length < 1 || manifest.reason.length > 100 ||
-        !Array.isArray(manifest.members) || manifest.members.length < 2 || manifest.members.length > 3 ||
-        new Set(manifest.members.map((member) => member.fileName)).size !== manifest.members.length ||
-        !manifest.members.some((member) => member.fileName === `${manifest.saveName}.dsv`) || !manifest.members.some((member) => member.fileName === `${manifest.saveName}.server`)) {
-      throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-    }
-    for (const member of manifest.members) {
-      if (!saveExtensions.some((extension) => member.fileName === `${manifest.saveName}${extension}`) || !Number.isSafeInteger(member.bytes) || member.bytes < 0 || !/^[0-9a-f]{64}$/.test(member.sha256)) {
-        throw new GameAdapterError('BACKUP_MANIFEST_INVALID', 'Backup metadata is invalid.')
-      }
-    }
-    return manifest
+    return readBackupManifest(this.#config.game.backupDirectory, id)
   }
 
-  async #verifyBackup(manifest: BackupManifest): Promise<string> {
-    const root = ensureInside(this.#config.game.backupDirectory, path.join(this.#config.game.backupDirectory, manifest.id))
-    for (const member of manifest.members) {
-      const memberPath = ensureInside(root, path.join(root, member.fileName))
-      const stat = await fs.lstat(memberPath).catch(() => null)
-      if (!stat?.isFile() || stat.isSymbolicLink() || stat.size !== member.bytes || await sha256(memberPath) !== member.sha256) {
-        throw new GameAdapterError('BACKUP_VERIFICATION_FAILED', `Backup member failed verification: ${member.fileName}`)
-      }
+  async #verifyBackup(manifest: BackupManifest, signal?: AbortSignal): Promise<string> {
+    return verifyBackupFiles(this.#config.game.backupDirectory, manifest, signal)
+  }
+
+  async #inspectForRestore(): Promise<InspectResult> {
+    try {
+      const inspection = await this.#inspect(true, true)
+      if (typeof inspection.tasks?.start !== 'boolean' || typeof inspection.tasks.startManaged !== 'boolean' ||
+          !(inspection.process === null || (Number.isSafeInteger(inspection.process?.pid) && inspection.process.pid > 0 &&
+            Number.isFinite(Date.parse(inspection.process.startedAt))))) throw new Error('Invalid process or task inspection')
+      return inspection
+    } catch (cause) {
+      throw new GameAdapterError('RESTORE_STATE_UNKNOWN', '无法确认游戏进程和启动任务。请检查主机状态及进程读取权限后重试。', { cause })
     }
-    return root
+  }
+
+  async #readRestoreStartup(): Promise<{ settings: StartupSettings; sha256: string }> {
+    try {
+      const stat = await fs.lstat(this.#startupSettingsPath)
+      if (!plainRestoreFile(stat) || stat.size > 64 * 1024) throw new Error('Invalid startup settings file')
+      const contents = await fs.readFile(this.#startupSettingsPath)
+      return { settings: validateStartupSettings(JSON.parse(contents.toString('utf8'))), sha256: createHash('sha256').update(contents).digest('hex') }
+    } catch (cause) {
+      throw new GameAdapterError('RESTORE_STARTUP_INVALID', '无法确认现有启动存档设置。请检查启动配置后重试。', { cause })
+    }
+  }
+
+  async #requireStoppedForRestore(): Promise<void> {
+    const inspection = await this.#inspectForRestore()
+    if (inspection.process) throw new GameAdapterError('RESTORE_GAME_RESTARTED', '检测到游戏进程，请检查服务器状态后重新预览。')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', '无法确认 Dyson Control 管理的启动任务。请检查游戏接入后重新预览。')
+    }
+  }
+
+  async #describeRestore(manifest: BackupManifest, inspection: InspectResult): Promise<BackupRestorePreview> {
+    const [target, startup, blockers, pending, bridgeReady] = await Promise.all([
+      readSaveMembers(this.#config.game.saveDirectory, manifest.saveName), this.#readRestoreStartup(),
+      backupMemberBlockers(this.#config.game.backupDirectory, manifest), this.#saveRestore.hasPending(),
+      inspection.process
+        ? assertBridgeReady(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, inspection.process.pid).then(() => true, () => false)
+        : true
+    ])
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) blockers.push('请选择 Dyson Control 管理的启动任务，恢复后才能指定启动存档。')
+    if (pending) blockers.push('上次存档恢复尚未完成。请在停服后使用“启动”让控制服务先处理上次恢复，查看任务记录后重新预览。')
+    if (!bridgeReady) blockers.push('当前游戏进程的 Bridge 尚未就绪，无法确认保存和停服。请检查 Bridge 后重新预览。')
+    return describeRestore(manifest, {
+      existing: target.map(member => member.fileName), targetBlockers: targetMemberBlockers(target),
+      runningIdentity: inspection.process ? `${inspection.process.pid}/${inspection.process.startedAt}` : null,
+      previousStartupSaveName: startup.settings.saveName, blockers
+    })
+  }
+
+  async restorePreview(backupId: string): Promise<BackupRestorePreview> {
+    const manifest = await this.#readBackupManifest(backupId)
+    return this.#describeRestore(manifest, await this.#inspectForRestore())
   }
 
   async #restore(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.backupId !== 'string') invalidInput('backupId is required.')
     const manifest = await this.#readBackupManifest(input.backupId)
     report('正在校验待恢复的存档备份')
-    const backupRoot = await this.#verifyBackup(manifest)
-    const inspection = await this.#inspect(true)
+    const backupRoot = await this.#verifyBackup(manifest, signal)
+    const inspection = await this.#inspectForRestore()
     const wasRunning = Boolean(inspection.process)
-    if (!inspection.tasks.startManaged) {
-      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', 'The configured start task does not use Dyson Control start-game.ps1, so the restored save cannot be selected safely for restart.')
+    if (!inspection.tasks.start || !inspection.tasks.startManaged) {
+      throw new GameAdapterError('RESTORE_START_UNSUPPORTED', '无法确认 Dyson Control 管理的启动任务。请检查游戏接入后重新预览。')
     }
-    if (wasRunning && await this.#saveRestore.hasPending()) {
-      throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', 'An interrupted save restore can only be recovered while the game is stopped.')
+    if (input.previewKey === undefined && await this.#saveRestore.hasPending()) {
+      if (wasRunning) throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '恢复上次中断的事务需要先停服。请查看任务记录后重试。')
+      await this.#recoverInterruptedSaveRestore(report)
     }
+    const preview = await this.#describeRestore(manifest, inspection)
+    assertRestoreImpact(preview, input.previewKey)
+    signal.throwIfAborted()
     let saved: SaveReceipt | null = null
     let stoppedForRestore = false
     if (inspection.process) {
@@ -918,19 +1096,23 @@ export class WindowsGameAdapter implements GameAdapter {
       saved = await requestBridgeSave(this.#config.game.bridgeDirectory, this.#config.game.bridgeSecretFile, signal, 45_000, inspection.process.pid)
       if (saved.state !== 'succeeded') throw new GameAdapterError('BRIDGE_SAVE_FAILED', `The pre-restore save failed: ${saved.errorCode}`)
       this.#lastSaveReceipt = saved
+      if (input.previewKey !== undefined) {
+        // The signed save itself may have created an optional target member. Recheck before disconnecting players.
+        assertRestoreImpact(await this.#describeRestore(manifest, await this.#inspectForRestore()), input.previewKey)
+      }
       try {
-        await this.#stop(report, signal, false)
+        await this.#stop(report, signal, false, inspection.process.pid)
         stoppedForRestore = true
       } catch (error) {
         let stopped: boolean
-        try { stopped = !(await this.#inspect(true)).process } catch (inspectionError) {
+        try { stopped = !(await this.#inspectForRestore()).process } catch (inspectionError) {
           throw new GameAdapterError('RESTORE_STOP_STATE_UNKNOWN', 'Stopping for restore failed and the current game state could not be verified.', {
             cause: new AggregateError([error, inspectionError])
           })
         }
         if (stopped) {
           report('恢复尚未开始，正在恢复服务器运行状态')
-          try { await this.#startWithTimeout(report) } catch (restartError) {
+          try { await this.#startWithTimeout(report, true) } catch (restartError) {
             throw new GameAdapterError('RESTORE_STOP_RECOVERY_START_FAILED', 'Stopping for restore failed after the server exited, and the server could not be restarted.', {
               cause: new AggregateError([error, restartError])
             })
@@ -940,16 +1122,25 @@ export class WindowsGameAdapter implements GameAdapter {
       }
     }
 
-    await this.#recoverInterruptedSaveRestore(report)
     const protectedBackups: string[] = []
     const startupSelectionApplied = true
-    const nextStartup = { ...this.#startupSettings, saveName: manifest.saveName }
+    let transactionPrepared = false
     try {
+      await this.#requireStoppedForRestore()
+      const startup = await this.#readRestoreStartup()
+      const nextStartup = { ...startup.settings, saveName: manifest.saveName }
+      const target = await readSaveMembers(this.#config.game.saveDirectory, manifest.saveName)
+      if (input.previewKey !== undefined) assertReviewedTarget(preview, target.map(member => member.fileName), startup.settings.saveName)
+      let targetProtection: BackupManifest['members'] = []
       for (const name of new Set([manifest.saveName, saved?.saveName].filter((value): value is string => Boolean(value)))) {
-        if (await this.#existingSaveMemberCount(name) > 0) {
-          protectedBackups.push((await this.#createBackup(name, 'automatic-before-restore', report)).id)
+        // A successful Bridge save must have a restorable set after stop, even when it is distinct from the target.
+        if (name === saved?.saveName || target.length > 0) {
+          const protection = await this.#createBackup(name, 'automatic-before-restore', report)
+          protectedBackups.push(protection.id)
+          if (name === manifest.saveName) targetProtection = protection.members
         }
       }
+      if (input.previewKey !== undefined) assertReviewedTarget(preview, targetProtection.map(member => member.fileName), startup.settings.saveName)
       report(`正在恢复存档 ${manifest.saveName}`)
       await this.#saveRestore.replace({
         saveName: manifest.saveName,
@@ -958,22 +1149,26 @@ export class WindowsGameAdapter implements GameAdapter {
           sourcePath: path.join(backupRoot, member.fileName),
           sha256: member.sha256
         })),
-        startupSettings: nextStartup
+        startupSettings: nextStartup, protection: { members: targetProtection, startupSha256: startup.sha256 }
       }, async () => {
-        if ((await this.#inspect(true)).process) {
-          throw new GameAdapterError('RESTORE_GAME_RESTARTED', 'The game started after the restore transaction was prepared; no save members were replaced.')
-        }
+        transactionPrepared = true
+        await this.#requireStoppedForRestore()
       }, signal)
       this.#startupSettings = nextStartup
     } catch (error) {
-      try { await this.#recoverInterruptedSaveRestore(report) } catch (rollbackError) {
-        throw new GameAdapterError('RESTORE_ROLLBACK_FAILED', 'Restore failed and the previous save set could not be recovered completely.', {
+      try {
+        if (await this.#saveRestore.hasPending()) {
+          if (!transactionPrepared) throw new GameAdapterError('SAVE_RESTORE_PENDING', '检测到其他未完成的存档恢复事务，请先检查任务记录。')
+          await this.#recoverInterruptedSaveRestore(report)
+        }
+      } catch (rollbackError) {
+        throw new GameAdapterError('RESTORE_ROLLBACK_FAILED', '无法确认中断的存档事务已恢复。请保持停服、检查任务记录和保护备份，再处理上次恢复。', {
           cause: new AggregateError([error, rollbackError])
         })
       }
       if (stoppedForRestore && (!(error instanceof GameAdapterError) || error.code !== 'RESTORE_ROLLBACK_FAILED')) {
         report('恢复未完成，正在恢复服务器运行状态')
-        try { await this.#startWithTimeout(report) } catch (restartError) {
+        try { await this.#startWithTimeout(report, true) } catch (restartError) {
           throw new GameAdapterError('RESTORE_RECOVERY_START_FAILED', 'Restore failed and the previously running server could not be restarted.', {
             cause: new AggregateError([error, restartError])
           })
@@ -985,7 +1180,7 @@ export class WindowsGameAdapter implements GameAdapter {
     this.#currentSave = startupSelectionApplied && restoredSave ? { name: manifest.saveName, savedAt: restoredSave.modifiedAt } : null
     let restarted = false
     if (wasRunning) {
-      try { await this.#startWithTimeout(report); restarted = true } catch (error) {
+      try { await this.#startWithTimeout(report, true); restarted = true } catch (error) {
         throw new GameAdapterError('RESTORE_START_FAILED', 'The backup was restored, but the server could not be restarted.', { cause: error })
       }
     }
@@ -1001,6 +1196,10 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #recoverInterruptedSaveRestore(report: ReportStep): Promise<void> {
+    if (!await this.#saveRestore.hasPending()) return
+    if ((await this.#inspectForRestore()).process) {
+      throw new GameAdapterError('SAVE_RESTORE_RECOVERY_REQUIRES_STOP', '请先停止游戏，再恢复中断的事务。')
+    }
     const recovery = await this.#saveRestore.recoverInterrupted()
     if (recovery === 'none') return
     try {
@@ -1015,11 +1214,11 @@ export class WindowsGameAdapter implements GameAdapter {
     const enabledRoot = path.join(this.#config.game.root, 'BepInEx', 'plugins')
     const disabledRoot = path.join(this.#config.game.root, 'BepInEx', 'disabled-plugins')
     const results: ModRecord[] = []
-    const seen = new Set<string>()
     for (const [root, enabled] of [[enabledRoot, true], [disabledRoot, false]] as const) {
       const entries = await fs.readdir(root, { withFileTypes: true }).catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? [] : Promise.reject(error))
       for (const entry of entries) {
         if (entry.name.startsWith('.')) continue
+        const location = `BepInEx/${enabled ? 'plugins' : 'disabled-plugins'}/${entry.name}`
         if (entry.isDirectory()) {
           const directory = ensureInside(root, path.join(root, entry.name))
           const manifestPath = path.join(directory, 'manifest.json')
@@ -1032,58 +1231,45 @@ export class WindowsGameAdapter implements GameAdapter {
             const exactBridge = dlls.some(candidate => candidate.name.toLowerCase() === 'dysoncontrolbridge.dll')
             const name = exactBridge ? 'DysonControlBridge' : entry.name
             const id = modId(name)
-            if (seen.has(id)) continue
-            seen.add(id)
             results.push({
               dto: { id, name, version: 'unknown', enabled, required: true, description: 'Unmanaged plugin directory without package metadata; package changes are unavailable.', side: 'unknown' },
-              directory: null,
+              location, directory: null,
               packageIdentity: null,
               dependencies: []
             })
             continue
           }
           const rawVersion = typeof manifest.version_number === 'string' ? manifest.version_number : /-(\d+\.\d+\.\d+(?:[-+][\w.-]+)?)$/.exec(entry.name)?.[1] ?? 'unknown'
-          const rawName = typeof manifest.name === 'string' ? manifest.name : entry.name.replace(/-\d+\.\d+\.\d+(?:[-+][\w.-]+)?$/, '')
-          const author = typeof manifest.author_name === 'string' ? manifest.author_name : ''
-          const directoryIdentity = packageIdentityFromVersionedReference(entry.name)
-          const importName = author && !rawName.startsWith(`${author}-`)
-            ? `${author}-${rawName}`
-            : entry.name === rawName || entry.name.endsWith(`-${rawName}`) ? entry.name
-              : directoryIdentity?.endsWith(`-${rawName}`) ? directoryIdentity : rawName
+          const importName = installedPackageName(entry.name, manifest)
           const id = modId(importName)
-          if (seen.has(id)) continue
-          seen.add(id)
           const serverOnly = importName.toLowerCase() === 'dysoncontrolbridge'
           const dependencies = Array.isArray(manifest.dependencies)
             ? manifest.dependencies.filter((value): value is string => typeof value === 'string').map(dependencyPackageIdentity).filter((value): value is string => value !== null)
             : []
           results.push({
             dto: { id, name: importName, version: rawVersion, enabled, required: serverOnly || requiredModPattern.test(importName), description: typeof manifest.description === 'string' ? manifest.description.slice(0, 500) : '', side: 'unknown' },
-            directory,
+            location, directory,
             packageIdentity: importName.toLowerCase(),
-            dependencies
+            dependencies, clientDependencies: manifest.dependencies
           })
         } else if (enabled && entry.isFile() && entry.name.toLowerCase().endsWith('.dll')) {
           const name = path.basename(entry.name, path.extname(entry.name))
           const id = modId(name)
-          if (!seen.has(id)) {
-            seen.add(id)
-            results.push({
-              dto: { id, name, version: 'unknown', enabled: true, required: true, description: 'Standalone plugin; package toggle is unavailable.', side: 'unknown' },
-              directory: null, packageIdentity: null, dependencies: []
-            })
-          }
+          results.push({
+            dto: { id, name, version: 'unknown', enabled: true, required: true, description: 'Standalone plugin; package toggle is unavailable.', side: 'unknown' },
+            location, directory: null, packageIdentity: null, dependencies: []
+          })
         }
       }
     }
-    return results.sort((left, right) => left.dto.name.localeCompare(right.dto.name))
+    return results.sort((left, right) => left.dto.name.localeCompare(right.dto.name) || left.location.localeCompare(right.location))
   }
 
   async #toggleMod(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     if (typeof input.modId !== 'string' || typeof input.enabled !== 'boolean') invalidInput('modId and enabled are required.')
     const enabled = input.enabled
     const records = await this.#scanMods()
-    const record = records.find((item) => item.dto.id === input.modId)
+    const record = uniqueMod(records, input.modId)
     if (!record) invalidInput('The selected mod does not exist.')
     if (record.dto.required && !enabled) throw new GameAdapterError('REQUIRED_MOD', `${record.dto.name} is required and cannot be disabled.`)
     if (record.dto.enabled === enabled) return { modId: record.dto.id, enabled: record.dto.enabled, unchanged: true }
@@ -1110,7 +1296,7 @@ export class WindowsGameAdapter implements GameAdapter {
 
   async #setModSide(input: Record<string, unknown>): Promise<Record<string, unknown>> {
     if (typeof input.modId !== 'string') invalidInput('modId is required.')
-    const mod = (await this.mods()).find(item => item.id === input.modId)
+    const mod = uniqueMod(await this.#scanMods(), input.modId)?.dto
     if (!mod) throw new GameAdapterError('MOD_NOT_FOUND', 'The selected mod does not exist.')
     await this.#modSides.set(mod, input.expectedVersion, input.side)
     return { modId: mod.id, version: mod.version, side: input.side }
@@ -1138,7 +1324,7 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #moveModPackage(modIdValue: string, fromEnabled: boolean, toEnabled: boolean, report: ReportStep): Promise<Record<string, unknown>> {
-    const record = (await this.#scanMods()).find(item => item.dto.id === modIdValue)
+    const record = uniqueMod(await this.#scanMods(), modIdValue)
     if (!record || record.dto.enabled !== fromEnabled) throw new GameAdapterError('MOD_CHANGED', 'The selected mod changed before its files could be moved.')
     const paths = await this.#validateModTogglePaths(record, toEnabled)
     await fs.mkdir(path.dirname(paths.destination), { recursive: true })
@@ -1172,44 +1358,72 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #writeSettings(input: Record<string, unknown>, report: ReportStep): Promise<Record<string, unknown>> {
-    return this.#applySettings(input.settings, 'write', report)
+    return this.#applySettings(input.settings, 'write', report, undefined, input.expectedSettings)
   }
 
   async #rollbackSettings(input: Record<string, unknown>, report: ReportStep): Promise<Record<string, unknown>> {
+    report('正在恢复历史服务器设置')
     const selected = await this.#settingsHistory.selected(input.historyId)
-    return this.#applySettings(selected.settings, 'rollback', report, selected.id)
+    const state = await this.#rollbackSettingsState(selected)
+    assertSettingsRollback(state.preview, input.expectedRevision)
+    const target = { ...selected.settings }
+    // Reviewed restores can apply the writable fields while leaving an unmanaged UPS alone.
+    // Older callers keep their all-or-nothing behavior.
+    if (input.expectedRevision !== undefined && !state.inspection.tasks.startManaged) target.targetUps = state.current.targetUps
+    return this.#applySettings(target, 'rollback', report, state)
   }
 
   async #applySettings(
     value: unknown,
     operation: GameSettingsHistoryEntry['operation'],
     report: ReportStep,
-    restoredFromHistoryId?: string
+    rollback?: RollbackSettingsState,
+    expectedSettings?: unknown
   ): Promise<Record<string, unknown>> {
     const settings = validateSettings(value)
-    const inspection = await this.#inspect(true)
+    const inspection = rollback?.inspection ?? await this.#inspect(true)
+    const previousStartup = rollback?.startup ?? this.#startupSettings
     const currentTarget = inspection.tasks.startManaged
-      ? this.#startupSettings.targetUps
-      : inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? this.#startupSettings.targetUps
+      ? previousStartup.targetUps
+      : inspection.process?.targetUps ?? inspection.tasks.configuredTargetUps ?? previousStartup.targetUps
     if (!inspection.tasks.startManaged && settings.targetUps !== currentTarget) {
       throw new GameAdapterError('UNSUPPORTED_SETTING', 'targetUps cannot be changed because the configured start task does not use Dyson Control start-game.ps1.')
     }
-    const previousStored = structuredClone(this.#settings)
+    const previousStored = rollback?.stored ?? this.#settings
     const nextStored: StoredSettings = {
       schema: 1, serverName: settings.serverName, backupKeep: settings.backupKeep, address: settings.address
     }
-    const previousStartup = structuredClone(this.#startupSettings)
-    const nextStartup: StartupSettings = { ...this.#startupSettings, targetUps: settings.targetUps }
-    const previousPublic = this.#settingsForInspection(inspection)
+    const nextStartup: StartupSettings = { ...previousStartup, targetUps: settings.targetUps }
+    const previousPublic = rollback?.current ?? this.#settingsForInspection(inspection)
+    assertSettingsUnchanged(previousPublic, expectedSettings)
+    const panelChanged = !rollback || settings.serverName !== previousStored.serverName || settings.address !== previousStored.address || settings.backupKeep !== previousStored.backupKeep
+    const startupChanged = inspection.tasks.startManaged && (!rollback || settings.targetUps !== previousStartup.targetUps)
+    const panelPayload = rollback?.panelFile ? { ...JSON.parse(rollback.panelFile.bytes.toString('utf8')), ...nextStored } : nextStored
+    if (!rollback) report('正在保存服务器设置')
     const history = await this.#settingsHistory.snapshot(previousPublic, operation)
-    report(operation === 'rollback' ? '正在恢复历史服务器设置' : '正在保存服务器设置')
     let storedWritten = false
     try {
-      await this.#replaceJsonFile(this.#settingsPath, nextStored)
-      storedWritten = true
-      if (inspection.tasks.startManaged) await this.#replaceJsonFile(this.#startupSettingsPath, nextStartup)
+      if (rollback) {
+        // Creating the protective snapshot may rotate out the selected oldest entry.
+        const beforeWrite = await this.#rollbackSettingsState(rollback.entry)
+        assertSettingsRollback(beforeWrite.preview, rollback.preview.expectedRevision)
+      }
+      if (panelChanged) {
+        await this.#replaceJsonFile(this.#settingsPath, panelPayload, rollback ? rollback.panelFile?.sha256 ?? null : undefined)
+        storedWritten = true
+      }
+      if (startupChanged) {
+        const payload = rollback ? { ...JSON.parse(rollback.startupFile.bytes.toString('utf8')), ...nextStartup } : nextStartup
+        await this.#replaceJsonFile(this.#startupSettingsPath, payload, rollback?.startupFile.sha256)
+      }
     } catch (error) {
-      if (storedWritten) try { await this.#replaceJsonFile(this.#settingsPath, previousStored) } catch (rollbackError) {
+      if (storedWritten) try {
+        const expected = rollback ? createHash('sha256').update(JSON.stringify(panelPayload, null, 2) + '\n').digest('hex') : undefined
+        if (rollback && !rollback.panelFile) {
+          await assertSettingsFile(this.#settingsPath, expected!)
+          await fs.unlink(this.#settingsPath)
+        } else await this.#replaceJsonFile(this.#settingsPath, rollback?.panelFile?.bytes ?? previousStored, expected)
+      } catch (rollbackError) {
         throw new GameAdapterError('SETTINGS_ROLLBACK_FAILED', 'Startup settings failed and the previous dashboard settings could not be restored.', {
           cause: new AggregateError([error, rollbackError])
         })
@@ -1223,11 +1437,12 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     this.#settings = nextStored
     if (inspection.tasks.startManaged) this.#startupSettings = nextStartup
+    else if (rollback) this.#startupSettings = previousStartup
     const removedBackups = await this.#enforceAutomaticBackupRetention(report)
     const applied = await this.settings()
     return {
       historyId: history.id,
-      ...(restoredFromHistoryId ? { restoredFromHistoryId } : {}),
+      ...(rollback ? { restoredFromHistoryId: rollback.entry.id } : {}),
       settings: applied,
       appliedScope: [
         'dashboard identity', 'address used by client packages', 'automatic backup retention',
@@ -1247,14 +1462,13 @@ export class WindowsGameAdapter implements GameAdapter {
     const component = input.component
     const version = typeof input.version === 'string' ? input.version.trim() : undefined
     if (component === 'game') {
-      if (!this.#steamUpdates && !this.#updateOverrideConfigured) {
+      if (!this.#config.game.steam && !this.#updateOverrideConfigured) {
         throw new GameAdapterError('UPDATE_BACKEND_REQUIRED', 'Game updates require an explicitly configured and authorized Steam update backend.')
       }
+      // Fail before saving/stopping players when login or a version query already owns SteamCMD.
+      const release = acquireSteamProcess(steamExecutable(this.#config)); release()
       if (version) await this.#versionLocks.assertPlan([{ package: GAME_VERSION_LOCK_ID, version }])
-    } else {
-      const plan = await this.#updates.resolvePackagePlan(componentPackageIds[component], version, signal)
-      await this.#versionLocks.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
-    }
+    } else return this.#installThunderstorePackage(componentPackageIds[component], version, component, report, signal)
     return this.#runOfflinePackageOperation(
       () => this.#updates.installComponent(component, version, report, signal),
       'automatic-before-update', '更新', report, signal,
@@ -1271,17 +1485,38 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     const packageName = input.package
     const version = typeof input.version === 'string' ? input.version.trim() : undefined
+    return this.#installThunderstorePackage(packageName, version, 'mod', report, signal)
+  }
+
+  async #installThunderstorePackage(
+    packageName: string, version: string | undefined, component: 'nebula' | 'bepinex' | 'mod', report: ReportStep, signal: AbortSignal
+  ): Promise<Record<string, unknown>> {
+    uniqueMod(await this.#scanMods(), modId(packageName))
     const plan = await this.#updates.resolvePackagePlan(packageName, version, signal)
-    await this.#versionLocks.assertPlan(plan.map(item => ({ package: item.packageFullName, version: item.version })))
-    return this.#runOfflinePackageOperation(
-      () => this.#updates.installPackage(packageName, version, 'mod', report, signal),
-      'automatic-before-mod-install', '模组安装', report, signal,
-      result => this.#rollbackInstalledPackage(result, report)
-    )
+    const versions = plan.map(item => ({ package: item.packageFullName, version: item.version }))
+    await this.#versionLocks.assertPlan(versions)
+    return this.#updates.withPreparedPackages(plan, component, report, signal, async prepared => {
+      const records = await this.#scanMods()
+      for (const item of plan) uniqueMod(records, modId(item.packageFullName))
+      await this.#versionLocks.assertPlan(versions)
+      signal.throwIfAborted()
+      return this.#runOfflinePackageOperation(
+        () => component === 'mod' ? this.#updates.installPackage(packageName, version, component, report, signal, prepared)
+          : this.#updates.installComponent(component, version, report, signal, prepared),
+        component === 'mod' ? 'automatic-before-mod-install' : 'automatic-before-update',
+        component === 'mod' ? '模组安装' : '更新', report, signal,
+        result => this.#rollbackInstalledPackage(result, report)
+      )
+    })
   }
 
   async #rollbackUpdate(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     const historyId = safeId(input.historyId, 'historyId')
+    const history = (await this.#updates.updateHistory()).find(entry => entry.id === historyId)
+    if (history?.packages.length) {
+      const records = await this.#scanMods()
+      for (const item of history.packages) uniqueMod(records, modId(item.package))
+    }
     return this.#runOfflinePackageOperation(
       () => this.#updates.rollbackUpdate(historyId, report, signal),
       'automatic-before-update-rollback', '更新回滚', report, signal
@@ -1297,6 +1532,7 @@ export class WindowsGameAdapter implements GameAdapter {
     recoverInstalled?: (result: Record<string, unknown>) => Promise<void>
   ): Promise<Record<string, unknown>> {
     const before = await this.#inspect(true)
+    signal.throwIfAborted()
     const wasRunning = Boolean(before.process)
     let automaticBackupId: string | null = null
     let stoppedForOperation = false
@@ -1307,7 +1543,8 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!receipt) throw new GameAdapterError('UPDATE_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
+      signal.throwIfAborted()
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1440,7 +1677,7 @@ export class WindowsGameAdapter implements GameAdapter {
       invalidInput('modId and expectedVersion are required.')
     }
     const records = await this.#scanMods()
-    const record = records.find(item => item.dto.id === input.modId)
+    const record = uniqueMod(records, input.modId)
     if (!record) throw new GameAdapterError('MOD_NOT_FOUND', 'The selected mod does not exist.')
     if (record.dto.version !== input.expectedVersion) {
       throw new GameAdapterError('MOD_VERSION_CHANGED', 'The installed mod version changed after it was loaded. Refresh it and try again.')
@@ -1480,9 +1717,14 @@ export class WindowsGameAdapter implements GameAdapter {
     const selected = (await this.#modRemoval.history()).find(entry => entry.id === historyId)
     if (!selected) throw new GameAdapterError('MOD_REMOVAL_HISTORY_NOT_FOUND', 'The selected mod removal history entry does not exist.')
     if (!selected.canRestore) throw new GameAdapterError('MOD_REMOVAL_DESTINATION_EXISTS', 'The removed mod cannot be restored because its destination is occupied or its recovery copy is invalid.')
+    const checkDestination = async () => {
+      if (uniqueMod(await this.#scanMods(), selected.modId)) throw new GameAdapterError('MOD_INSTALL_CONFLICT',
+        `${displayModName(selected.name)} 已安装在另一个位置，请先核对模组目录。`)
+    }
+    await checkDestination()
     if (/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/.test(selected.name)) await this.#versionLocks.assertPlan([{ package: selected.name, version: selected.version }])
     return this.#runModRemovalOperation(
-      () => this.#modRemoval.restore(historyId),
+      async () => { await checkDestination(); return this.#modRemoval.restore(historyId) },
       result => this.#modRemoval.recoverRestore(result.historyId),
       'automatic-before-mod-restore', '模组恢复', report, signal
     )
@@ -1507,7 +1749,7 @@ export class WindowsGameAdapter implements GameAdapter {
       if (!receipt) throw new GameAdapterError('MOD_REMOVAL_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1588,7 +1830,8 @@ export class WindowsGameAdapter implements GameAdapter {
   async #rollbackModConfig(input: Record<string, unknown>, report: ReportStep, signal: AbortSignal): Promise<Record<string, unknown>> {
     return this.#runModConfigOperation(
       () => this.#modConfig.rollback(input.historyId, input.expectedRevision),
-      'automatic-before-mod-config-rollback', '模组配置回滚', report, signal
+      'automatic-before-mod-config-rollback', '模组配置回滚', report, signal,
+      () => this.#modConfig.checkRollback(input.historyId, input.expectedRevision)
     )
   }
 
@@ -1597,7 +1840,8 @@ export class WindowsGameAdapter implements GameAdapter {
     backupReason: string,
     operationLabel: string,
     report: ReportStep,
-    signal: AbortSignal
+    signal: AbortSignal,
+    checkRollback?: () => Promise<void>
   ): Promise<Record<string, unknown>> {
     const before = await this.#inspect(true)
     const wasRunning = Boolean(before.process)
@@ -1605,12 +1849,15 @@ export class WindowsGameAdapter implements GameAdapter {
     let stoppedForOperation = false
 
     if (wasRunning) {
+      await checkRollback?.()
       await this.#save(report, signal)
       const receipt = this.#lastSaveReceipt
       if (!receipt) throw new GameAdapterError('MOD_CONFIG_SAVE_RECEIPT_MISSING', `The pre-${operationLabel} save did not produce a verifiable receipt.`)
       const protection = await this.#createBackup(receipt.saveName, backupReason, report, receipt)
       automaticBackupId = protection.id
-      await this.#enforceAutomaticBackupRetention(report)
+      await this.#enforceAutomaticBackupRetention(report, new Set([protection.id]))
+      // A file may also change while saving the world. Reject it while players are still connected.
+      await checkRollback?.()
       try {
         await this.#stop(report, signal, false)
         stoppedForOperation = true
@@ -1678,28 +1925,18 @@ export class WindowsGameAdapter implements GameAdapter {
     return { ...result, automaticBackupId, wasRunning, restarted, restartRequired: false }
   }
 
+  async #clientMods(): Promise<ClientPackageMod[]> {
+    const [records, runtime] = await Promise.all([this.#scanMods(), this.#updates.installedPackageVersion('xiaoye97-BepInEx').catch(() => null)])
+    const mods = await this.#modsFromRecords(records)
+    return withClientRuntime(mods.map(mod => ({ ...mod,
+      clientDependencies: records.find(record => record.dto.id === mod.id && record.dto.enabled)?.clientDependencies
+    })), runtime)
+  }
+
   async #createClientPackage(report: ReportStep): Promise<Record<string, unknown>> {
-    const mods = (await this.mods()).filter((mod) => !/^xiaoye97-BepInEx$/i.test(mod.name))
-    const bepinexVersion = await this.#updates.installedPackageVersion('xiaoye97-BepInEx')
-    if (!bepinexVersion) {
-      throw new GameAdapterError('PACKAGE_LOCK_INCOMPLETE', 'The installed BepInEx Thunderstore version is not recorded, so an exact client package cannot be generated.')
-    }
-    mods.unshift({ id: 'bepinex-runtime', name: 'xiaoye97-BepInEx', version: bepinexVersion, enabled: true, required: true, description: 'BepInEx runtime', side: 'both' })
     report('正在生成可导入的 r2modman 配置包')
-    const id = `client-${timestampId()}-${randomUUID()}`
-    const profileName = `Dyson-Control-${timestampId().slice(0, 8)}`
-    const bytes = createR2ModmanPackage(profileName, this.#settings.address, mods)
-    const archiveName = `${id}.r2z`
-    const archivePath = path.join(this.#packageDirectory, archiveName)
-    await fs.writeFile(archivePath, bytes, { flag: 'wx' })
-    const item: ClientPackage = {
-      id, name: `${profileName}.r2z`, createdAt: now(), bytes: bytes.length,
-      modCount: mods.filter((mod) => mod.enabled && mod.side !== 'server').length,
-      downloadUrl: `/api/client-packages/${id}/download`
-    }
-    const manifest: ClientManifest = { item, fileName: archiveName }
-    await fs.writeFile(path.join(this.#packageDirectory, `${id}.json`), `${JSON.stringify(manifest, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' })
+    const item = await writeClientPackage(this.#packageDirectory, this.#settings.address, () => this.#clientMods())
     report(`客户端配置包已生成，共包含 ${item.modCount} 个模组`)
-    return { packageId: id, fileName: item.name, modCount: item.modCount }
+    return { packageId: item.id, fileName: item.name, modCount: item.modCount }
   }
 }

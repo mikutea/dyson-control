@@ -1,0 +1,124 @@
+import { useState } from 'react'
+import { Box, ClipboardCheck, Download, FileArchive, RefreshCw } from 'lucide-react'
+import type { ClientPackage, ClientPackageBlocker, ClientPackageDetails, ClientPackagePlan } from '../../shared/contracts'
+import type { RunAction } from './App'
+import { Button, EmptyBlock, ErrorBlock, LoadingBlock, PageHeader, Panel } from './components'
+import { formatBytes, formatFullDate } from './format'
+import { useResource } from './hooks'
+import { ClientFileCheck, ClientJoinGuide } from './ClientDistribution'
+import './clients.css'
+
+export function ClientsPage({ refreshToken, runAction, operationActive }: { refreshToken: number; runAction: RunAction; operationActive: boolean }) {
+  const [selection, setSelection] = useState('')
+  const [manualRefresh, setManualRefresh] = useState(0)
+  const revision = refreshToken + manualRefresh
+  const packages = useResource<ClientPackage[]>('/client-packages', revision)
+  const selected = packages.data?.find(item => item.id === selection) ?? packages.data?.[0]
+  return <>
+    <PageHeader title="客户端" description="检查新包的模组清单，或核对已生成的配置包再分发。"
+      actions={<Button icon={<RefreshCw />} onClick={() => setManualRefresh(value => value + 1)}>刷新</Button>} />
+    <CreationPlan key={revision} operationActive={operationActive} create={() => { setSelection(''); runAction('create-client-package') }} />
+    <Panel title="已生成的客户端包" icon={<FileArchive />}>
+      {packages.error ? <ErrorBlock message={packages.error} retry={packages.reload} />
+        : packages.loading ? <LoadingBlock />
+        : !selected ? <EmptyBlock title="还没有客户端包" description="创建后即可核对配置并下载给玩家。" />
+        : <>
+          <div className="client-picker">
+            <label>选择配置包<select value={selected.id} onChange={event => setSelection(event.target.value)}>
+              {packages.data!.map(item => <option key={item.id} value={item.id}>{item.name} · {formatFullDate(item.createdAt)}</option>)}
+            </select></label>
+            <span>创建于 {formatFullDate(selected.createdAt)} · {selected.modCount} 个模组 · {formatBytes(selected.bytes)}</span>
+          </div>
+          <PackageDetails key={`${selected.id}-${revision}`} item={selected} />
+        </>}
+    </Panel>
+    <p className="client-import-note">在 r2modman 配置选择页点 <b>Import / Update → From file</b>，选择 .r2z，核对模组后点 <b>Import → Import new profile → Create</b>。下载完成后从该配置启动游戏。</p>
+  </>
+}
+
+function CreationPlan({ operationActive, create }: { operationActive: boolean; create: () => void }) {
+  const resource = useResource<ClientPackagePlan>('/client-package-plan')
+  const plan = resource.data
+  const groups = new Map<string, ClientPackageBlocker[]>()
+  for (const issue of plan?.blockers ?? []) {
+    const key = issue.modName ? issue.modName + ' ' + (issue.version ?? '') : issue.code
+    const group = groups.get(key)
+    if (group) group.push(issue)
+    else groups.set(key, [issue])
+  }
+  return <Panel title="创建前检查" icon={<ClipboardCheck />} action={
+    <Button variant="primary" icon={<Box />} disabled={operationActive || resource.loading || Boolean(resource.error) || !plan?.ready} onClick={create}>创建客户端包</Button>
+  }>
+    {resource.error ? <ErrorBlock message={resource.error} retry={resource.reload} /> : !plan ? <LoadingBlock /> :
+      <div className="client-plan">
+        <h3 aria-live="polite" className={`client-status client-status-${plan.ready ? 'current' : 'outdated'}`}>
+          {plan.ready ? '可以创建客户端包' : `创建前还需处理 ${plan.blockers.length} 项问题`}
+        </h3>
+        {groups.size > 0 && <ul className="client-plan-issues">{[...groups].map(([key, issues]) => <li key={key}>
+          {issues[0]!.modName && <strong>{issues[0]!.modName} <small>{issues[0]!.version}</small></strong>}
+          {issues.map(issue => <p key={issue.code}>{issue.message}</p>)}
+        </li>)}</ul>}
+        {plan.blockers.some(issue => issue.modName || issue.code === 'CLIENT_MODS_UNAVAILABLE' || issue.code === 'NO_CLIENT_MODS') &&
+          <a className="button button-quiet" href="#/mods">查看已安装模组</a>}
+        {plan.blockers.some(issue => issue.code === 'INVALID_INPUT') && <a className="button button-quiet" href="#/settings">查看连接设置</a>}
+        {!!plan.mods.length && <details className="client-plan-locks" open={plan.ready && plan.mods.length <= 8}>
+          <summary>{plan.ready ? '将纳入的精确版本' : '已确认可纳入的模组'}（{plan.mods.length}）</summary>
+          <ul>{plan.mods.map(mod => <li key={mod.name}><span>{mod.name}</span><code>{mod.version}</code></li>)}</ul>
+        </details>}
+      </div>}
+  </Panel>
+}
+
+const statusLabel = { current: '与当前配置一致', outdated: '与当前配置有差异', unknown: '配置匹配情况未知' }
+
+function PackageDetails({ item }: { item: ClientPackage }) {
+  const resource = useResource<ClientPackageDetails>(`/client-packages/${encodeURIComponent(item.id)}`)
+  if (resource.error) return <ErrorBlock message={resource.error} retry={resource.reload} />
+  const details = resource.data
+  if (!details || resource.loading) return <LoadingBlock />
+  const addressChanged = Boolean(details.profile && details.profile.address !== details.currentAddress)
+  return <section className="client-detail" aria-label="所选配置包详情">
+    <header className="client-detail-head">
+      <div>
+        <h3 className={`client-status client-status-${details.status}`}>{statusLabel[details.status]}</h3>
+        {details.status === 'outdated' && <p>要分发当前配置，请创建新包。</p>}
+        {details.reason && <p>{details.reason}</p>}
+      </div>
+      {details.downloadable && <div className="client-share-actions">
+        <a className="button button-primary" download href={item.downloadUrl}><Download /><span>下载所选包</span></a>
+        {details.status === 'current' && details.sha256 && <ClientJoinGuide item={item} digest={details.sha256} />}
+      </div>}
+    </header>
+    <dl className={`client-address${addressChanged ? ' client-changed-address' : ''}`}>
+      <div><dt>包内连接地址</dt><dd>{details.profile?.address ?? '未知'}</dd></div>
+      <div><dt>当前连接地址</dt><dd>{details.currentAddress}</dd></div>
+    </dl>
+    {details.profile ? <ModComparison details={details} /> : <p className="client-unknown-mods">包内模组版本未知。</p>}
+    {details.sha256 && <ClientFileCheck digest={details.sha256} bytes={item.bytes} />}
+  </section>
+}
+
+function ModComparison({ details }: { details: ClientPackageDetails }) {
+  const packed = new Map(details.profile!.mods.map(mod => [mod.name.toLowerCase(), mod]))
+  const current = new Map(details.currentMods?.map(mod => [mod.name.toLowerCase(), mod]))
+  const names = [...new Set([...packed.keys(), ...current.keys()])]
+  const rows = names.map(name => {
+    const before = packed.get(name)
+    const after = current.get(name)
+    let change = ''
+    if (details.currentMods) {
+      if (!before) change = '包内缺少'
+      else if (!after) change = '当前不再需要'
+      else if (before.version !== after.version) change = '版本已变'
+    }
+    return { name: (before ?? after)!.name, before: before?.version ?? '未收录', after: after?.version ?? (details.currentMods ? '无需安装' : '未知'), change }
+  }).sort((a, b) => Number(Boolean(b.change)) - Number(Boolean(a.change)) || a.name.localeCompare(b.name))
+  return <table className="client-mods" aria-label="包内模组版本与当前配置对照">
+    <colgroup><col /><col /><col /></colgroup>
+    <thead><tr><th scope="col">模组</th><th scope="col">包内版本</th><th scope="col">当前所需版本</th></tr></thead>
+    <tbody>{rows.map(row => <tr key={row.name} className={row.change ? 'client-mod-changed' : undefined}>
+      <th scope="row">{row.name}{row.change && <small>{row.change}</small>}</th>
+      <td>{row.before}</td><td>{row.after}</td>
+    </tr>)}</tbody>
+  </table>
+}

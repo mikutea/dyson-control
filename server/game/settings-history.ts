@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
-import type { GameSettings, GameSettingsHistoryEntry, ReadOnlyGameSetting } from '../../shared/contracts.js'
+import type { GameSettings, GameSettingsHistoryEntry, ReadOnlyGameSetting, ServerSettingKey, SettingsRollbackPreview } from '../../shared/contracts.js'
 import { GameAdapterError } from './errors.js'
 
 const maximumEntries = 100
@@ -20,6 +20,36 @@ interface StoredSettingsHistoryEntry extends GameSettingsHistoryEntry {
 
 function digestEntry(entry: Omit<StoredSettingsHistoryEntry, 'sha256'>): string {
   return createHash('sha256').update(JSON.stringify(entry)).digest('hex')
+}
+
+const settingKeys = ['serverName', 'address', 'backupKeep', 'targetUps', 'maxPlayers', 'autosaveMinutes'] as const
+
+export function assertSettingsUnchanged(current: GameSettings, expected: unknown): void {
+  if (expected === undefined) return
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected) ||
+      settingKeys.some(key => current[key] !== (expected as Partial<GameSettings>)[key])) {
+    throw new GameAdapterError('SETTINGS_CHANGED', '服务器设置已变化，请重新读取当前设置后再修改。')
+  }
+}
+
+const settingEffects: Record<ServerSettingKey, SettingsRollbackPreview['fields'][number]['effect']> = {
+  serverName: 'panel', address: 'client-packages', backupKeep: 'backup-retention', targetUps: 'next-start',
+  maxPlayers: 'demo', autosaveMinutes: 'demo'
+}
+
+export function describeSettingsRollback(entry: GameSettingsHistoryEntry, current: GameSettings, mode: 'windows' | 'demo', files?: readonly (string | null)[]): SettingsRollbackPreview {
+  const readOnly = new Set<ServerSettingKey>(current.readOnlyFields)
+  const fields = settingKeys.map(key => ({ key, current: current[key], selected: entry.settings[key],
+    effect: readOnly.has(key) ? 'read-only' as const : key === 'targetUps' && mode === 'demo' ? 'demo' as const : settingEffects[key] }))
+  const expectedRevision = createHash('sha256').update(JSON.stringify([entry, fields, files])).digest('hex')
+  return { historyId: entry.id, fields, expectedRevision, canRollback: fields.some(field => field.effect !== 'read-only' && field.current !== field.selected) }
+}
+
+export function assertSettingsRollback(preview: SettingsRollbackPreview, expectedRevision: unknown) {
+  if (expectedRevision !== undefined && expectedRevision !== preview.expectedRevision) {
+    throw new GameAdapterError('SETTINGS_ROLLBACK_CHANGED', '设置或启动任务已变化，请重新预览后恢复。')
+  }
+  if (!preview.canRollback) throw new GameAdapterError('SETTINGS_ROLLBACK_UNAVAILABLE', '当前没有可恢复的设置差异。')
 }
 
 function invalidHistory(message: string, cause?: unknown): never {
