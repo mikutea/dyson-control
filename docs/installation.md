@@ -112,6 +112,8 @@ Pop-Location
 
 生成的配置默认保持回环监听；可用 `--port 13021` 更改面板端口。省略 `--address` 时，游戏地址默认为本机 `127.0.0.1:8469`，适合先完成本机配置，之后再修改为实际分享地址。
 
+希望从面板检查自身更新时，在初始化命令中追加 `--updates-repository 'mikutea/dyson-control'`；使用其他分发仓库时替换为自己信任的 `owner/repository`。此选项只保存明确选择的更新来源，不下载或安装更新。省略时不配置更新源，已有配置可按[面板自身更新](control-updates.md)调整。仓库尚无正式 Release 时，页面会说明暂无可验证版本。
+
 | 内容 | 上述示例的路径 |
 | --- | --- |
 | 私有配置 | `C:\ProgramData\Dyson Control\control.config.json` |

@@ -17,7 +17,8 @@ export async function runAdmin(
   const passwords = new PasswordReader(environment, input, output)
   if (command === 'check-runtime') {
     if (args.length !== 1) throw new Error('check-runtime 不接受其他参数。')
-    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./runtime-check.js', import.meta.url))], {
+    const checkFile = import.meta.url.endsWith('.ts') ? './runtime-check.ts' : './runtime-check.js'
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL(checkFile, import.meta.url))], {
       windowsHide: true, timeout: 20_000, encoding: 'utf8', maxBuffer: 4096,
     })
     if (result.error || result.status !== 0 || result.stdout.trim() !== 'DYSON_RUNTIME_OK') {
@@ -90,7 +91,7 @@ export async function runAdmin(
   console.log('  node dist/server/admin.js check-runtime')
   console.log('  node dist/server/admin.js hash-password')
   console.log('  node dist/server/admin.js init-demo [config-path]')
-  console.log('  node dist/server/admin.js init-windows <config-path> --server-root <directory> [--address host:port] [--port 13020] [--name "Dyson Server"]')
+  console.log('  node dist/server/admin.js init-windows <config-path> --server-root <directory> [--address host:port] [--port 13020] [--name "Dyson Server"] [--updates-repository owner/repository]')
   console.log('  node dist/server/admin.js validate-config [config-path]')
 }
 
@@ -101,8 +102,8 @@ function windowsConfiguration(args: string[]): { target: string; config: Omit<Co
   for (let index = 0; index < options.length; index += 2) {
     const key = options[index]
     const value = options[index + 1]
-    if (!['--server-root', '--address', '--port', '--name'].includes(key) || flags.has(key) || !value || value.startsWith('--')) {
-      throw new Error('初始化参数无效：支持 --server-root、--address、--port 和 --name，每项只能指定一次。')
+    if (!['--server-root', '--address', '--port', '--name', '--updates-repository'].includes(key) || flags.has(key) || !value || value.startsWith('--')) {
+      throw new Error('初始化参数无效：支持 --server-root、--address、--port、--name 和 --updates-repository，每项只能指定一次。')
     }
     flags.set(key, value)
   }
@@ -114,6 +115,11 @@ function windowsConfiguration(args: string[]): { target: string; config: Omit<Co
   if (!address || address.length > 255 || /[\s\0]/u.test(address)) throw new Error('游戏地址不能为空或包含空白字符。')
   const serverName = (flags.get('--name') ?? 'Dyson Server').trim()
   if (!serverName || serverName.length > 80 || /[\r\n\0]/u.test(serverName)) throw new Error('服务器名称应为 1 到 80 个字符，且不能包含换行。')
+  const updatesRepository = flags.get('--updates-repository')
+  const controlUpdates = updatesRepository === undefined ? undefined : { repository: updatesRepository }
+  if (!controlConfigSchema.shape.controlUpdates.safeParse(controlUpdates).success) {
+    throw new Error('更新仓库必须使用 owner/repository 格式；请指定自己信任的公开发布仓库。')
+  }
   const target = resolve(configPath)
   const root = resolve(serverRoot)
   const dataDirectory = join(dirname(target), 'data')
@@ -132,7 +138,9 @@ function windowsConfiguration(args: string[]): { target: string; config: Omit<Co
       throw new Error('配置和面板数据目录不能与游戏、存档、备份或 Bridge 目录重叠。')
     }
   }
-  return { target, config: { host: '127.0.0.1', port: Number(portValue), dataDirectory, mode: 'windows', game } }
+  return { target, config: { host: '127.0.0.1', port: Number(portValue), dataDirectory, mode: 'windows', game,
+    ...(controlUpdates ? { controlUpdates } : {}),
+  } }
 }
 
 export class PasswordReader {

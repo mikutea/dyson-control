@@ -41,9 +41,9 @@ describe('Windows configuration initialization', () => {
   it('creates a loadable private Windows config with a verified password and separate storage paths', async () => {
     const f = await fixture()
     const log = vi.spyOn(console, 'log').mockImplementation(() => undefined)
-    await runAdmin(['init-windows', f.configPath, '--server-root', f.serverRoot, '--address', 'game.example.com:18469', '--port', '13021', '--name', '朋友的宇宙'], {}, passwords(), quiet())
+    await runAdmin(['init-windows', f.configPath, '--server-root', f.serverRoot, '--address', 'game.example.com:18469', '--port', '13021', '--name', '朋友的宇宙', '--updates-repository', 'fixture-owner/dyson-control'], {}, passwords(), quiet())
     const config = await loadConfig(f.configPath)
-    expect(config).toMatchObject({ host: '127.0.0.1', port: 13021, mode: 'windows', dataDirectory: path.join(f.privateRoot, 'data') })
+    expect(config).toMatchObject({ host: '127.0.0.1', port: 13021, mode: 'windows', dataDirectory: path.join(f.privateRoot, 'data'), controlUpdates: { repository: 'fixture-owner/dyson-control' } })
     expect(config.game).toEqual({
       root: path.join(f.serverRoot, 'game'), saveDirectory: path.join(f.serverRoot, 'userdata', 'Save'),
       backupDirectory: path.join(f.serverRoot, 'backups'), logFile: path.join(f.serverRoot, 'game', 'BepInEx', 'LogOutput.log'),
@@ -64,6 +64,7 @@ describe('Windows configuration initialization', () => {
     await runAdmin(['init-windows', f.configPath, '--server-root', f.serverRoot], { DYSON_CONTROL_ADMIN_PASSWORD: password }, Readable.from([]), quiet())
     const config = await loadConfig(f.configPath)
     expect(config).toMatchObject({ host: '127.0.0.1', port: 13020, game: { address: '127.0.0.1:8469', serverName: 'Dyson Server' } })
+    expect(config.controlUpdates).toBeUndefined()
     expect(await verifyPassword(password, config.adminPasswordHash)).toBe(true)
   })
 
@@ -103,6 +104,9 @@ describe('Windows configuration initialization', () => {
     ['duplicate option', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--port', '13020', '--port', '13021']],
     ['password argument', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--password', 'do-not-accept-secrets-in-arguments']],
     ['invalid address', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--address', 'invalid host']],
+    ['update source URL', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--updates-repository', 'https://github.com/fixture-owner/dyson-control']],
+    ['invalid update repository', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--updates-repository', '../dyson-control']],
+    ['duplicate update repository', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', f.serverRoot, '--updates-repository', 'first/repository', '--updates-repository', 'second/repository']],
     ['overlapping config', (f: Awaited<ReturnType<typeof fixture>>) => [path.join(f.serverRoot, 'game', 'config.json'), '--server-root', f.serverRoot]],
     ['overlapping data', (f: Awaited<ReturnType<typeof fixture>>) => [f.configPath, '--server-root', path.join(f.privateRoot, 'data', 'server')]],
   ])('rejects %s without reading a password or writing files', async (_label, argumentsFor) => {
