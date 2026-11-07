@@ -70,7 +70,7 @@ node .\scripts\prepare-release.mjs `
   --out-dir .\dist\release-candidate
 ```
 
-此命令依次生成完整包、仅面板包及各自的 `.sha256`，再生成 `SHA256SUMS`、`RELEASE_NOTES.md` 和 `release-evidence.json`。证据文件仅记录公开版本、源码提交、Bridge 构建身份和产物散列，不包含主机路径。输出目录必须不存在，源码有未提交变更时会拒绝打包；命令不创建 Git 标签、不上传或发布 Release。
+此命令依次生成完整包、仅面板包及各自的 `.sha256`，复读 ZIP 校验文件内容，并逐文件确认两种包的共用内容完全一致，再生成 `SHA256SUMS`、`RELEASE_NOTES.md` 和 `release-evidence.json`。Bridge 身份从归档内读取；证据文件仅记录公开版本、源码提交、文件数、构建身份和产物散列，不包含主机路径。输出目录必须不存在，源码有未提交变更时会拒绝打包；命令不创建 Git 标签、不上传或发布 Release。
 
 发布时使用该提交通过检查后的两个 ZIP 和对应校验文件。完整包服务首次安装，面板更新器使用仅面板包。先确认发布说明与实际验证一致，再创建公开版本；具体步骤见[发布准备](releasing.md)。
 

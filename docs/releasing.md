@@ -5,7 +5,7 @@
 ## 准备候选
 
 1. 确认 `package.json`、`package-lock.json`、Bridge 插件版本和 `docs/releases/v<version>.md` 一致。Bridge 按支持的游戏与 Nebula 引用构建，不打包这些第三方程序集。
-2. 在干净的 Git 工作区运行 `node scripts/prepare-release.mjs --bridge-dir <Bridge目录> --out-dir <新目录>`。输出包含完整包、仅面板包、各自 `.sha256`、总校验表、版本说明与公开产物证据。
+2. 在干净的 Git 工作区运行 `node scripts/prepare-release.mjs --bridge-dir <Bridge目录> --out-dir <新目录>`。工具按面板更新器的大小与解压限制复读两个包、核对 CRC 和发布身份，并逐文件比对共用内容；通过后输出完整包、仅面板包、各自 `.sha256`、总校验表、版本说明与公开产物证据。
 3. 核对 `release-evidence.json` 的 `sourceCommit` 与目标提交一致，并保留这个提交通过 CI 的记录。不能把另一个提交的 CI 结果用于新产物。
 4. 按安装指南在独立目录验证生产依赖与使用流程。Windows CI 会用仅生产依赖的安装目录，以 `SYSTEM` 身份验证原生 Steam 授权控制台的密码提示、Guard 输入、完成和取消，并覆盖首次安装、升级和失败回滚后的运行目录。控制台夹具使用本地测试程序，不登录真实 Steam 账号；实际授权与入服证据另行保留。
 
