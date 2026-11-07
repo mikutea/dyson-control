@@ -246,6 +246,8 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
   if ($LASTEXITCODE -ne 0 -or ($LongPaths -and $pathEvidence.maximumPathCharacters -le 260)) { throw 'The long-path lifecycle did not exercise paths beyond MAX_PATH.' }
   $scope['installedPathEvidence'] = $pathEvidence
   $steps.Add('install-system-task-and-health')
+  & (Join-Path $PSScriptRoot 'steam-terminal.fixture.ps1') -NodePath $node -RuntimeRoot (Join-Path $installRoot ('versions\' + $originalVersion)) -RunAsSystem -ProductionOnly
+  $steps.Add('installed-production-dependencies-system-steam-console')
 
   $operationId = [guid]::NewGuid().ToString()
   $operationRoot = Join-Path $privateRoot ('data\control-updates\operations\' + $operationId)
@@ -365,9 +367,11 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
   if ($second.version -cne $nextVersion -or $second.processId -eq $first.processId -or [int]$helperStatus.processId -ne [int]$second.processId) { throw 'SYSTEM helper upgrade did not replace the fixture instance.' }
   if ($null -ne (Get-CimInstance Win32_Process -Filter "ProcessId = $([int]$first.processId)" -ErrorAction SilentlyContinue)) { throw 'The pre-upgrade fixture process remains after helper success.' }
   $steps.Add('system-helper-handoff-receipt-cleanup-and-new-pid')
+  & (Join-Path $PSScriptRoot 'steam-terminal.fixture.ps1') -NodePath $node -RuntimeRoot (Join-Path $installRoot ('versions\' + $nextVersion)) -RunAsSystem -ProductionOnly
+  $steps.Add('upgraded-production-dependencies-system-steam-console')
 
   $invalidSource = New-Candidate (Join-Path $root 'invalid-source') ($versionPrefix + '-fixture.prepare-fail') $false
-  [IO.File]::WriteAllText((Join-Path $invalidSource 'dist\server\admin.js'), "throw new Error('Intentional fixture preparation failure');", $utf8)
+  [IO.File]::WriteAllText((Join-Path $invalidSource 'dist\server\runtime-check.js'), 'process.exit(1);', $utf8)
   $priorStateHash = (Get-FileHash -LiteralPath (Join-Path $installRoot 'install-state.json') -Algorithm SHA256).Hash
   $priorTaskXml = Export-ScheduledTask -TaskName $taskName -TaskPath '\'
   $preparationFailure = $null
@@ -381,7 +385,7 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
       (Get-FileHash -LiteralPath (Join-Path $installRoot 'install-state.json') -Algorithm SHA256).Hash -cne $priorStateHash -or
       (Export-ScheduledTask -TaskName $taskName -TaskPath '\') -cne $priorTaskXml -or
       (Test-Path -LiteralPath (Join-Path $privateRoot 'data\.control-maintenance.json'))) { throw 'Failed preparation changed the active installation.' }
-  $steps.Add('failed-upgrade-preparation-cleans-dependencies-without-interrupting-service')
+  $steps.Add('failed-runtime-check-cleans-staging-without-interrupting-service')
 
   $badSource = New-Candidate (Join-Path $root 'failed-source') $failedVersion $true
   $expectedFailure = $false
@@ -398,6 +402,8 @@ walk(process.argv[1]);console.log(JSON.stringify({files,maximumPathCharacters:ma
   if ($recovered.version -cne $nextVersion -or $state.activeVersion -cne $nextVersion) { throw 'Failed upgrade did not restore the prior version.' }
   if (Test-Path -LiteralPath (Join-Path $privateRoot 'data\.control-maintenance.json')) { throw 'Maintenance marker remained after recovery.' }
   $steps.Add('failed-startup-restores-prior-task-version-and-service')
+  & (Join-Path $PSScriptRoot 'steam-terminal.fixture.ps1') -NodePath $node -RuntimeRoot (Join-Path $installRoot ('versions\' + $nextVersion)) -RunAsSystem -ProductionOnly
+  $steps.Add('rolled-back-production-dependencies-system-steam-console')
 
   & (Join-Path $sourceRoot 'scripts\windows\uninstall-control.ps1') -InstallRoot $installRoot -TaskName $taskName -HealthCheckTimeoutSeconds 30 -OperationDrainTimeoutSeconds 30
   $installed = $false

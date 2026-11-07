@@ -43,6 +43,7 @@ const requiredFiles = [
   'GOAL.md',
   'dist/server/index.js',
   'dist/server/admin.js',
+  'dist/server/runtime-check.js',
   'dist/shared/contracts.js',
   'dist/web/index.html',
   'scripts/windows/install-control.ps1',

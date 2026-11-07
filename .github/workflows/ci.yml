@@ -45,7 +45,9 @@ jobs:
 
       - name: Exercise native Steam authorization console
         shell: powershell
-        run: .\scripts\tests\steam-terminal.fixture.ps1
+        run: |
+          .\scripts\tests\runtime-check.fixture.ps1
+          .\scripts\tests\steam-terminal.fixture.ps1
 
       - name: Parse Windows scripts
         shell: powershell
@@ -185,7 +187,7 @@ jobs:
           }
           $required = @(
             'package.json', 'package-lock.json', 'control.config.example.json', 'LICENSE',
-            'dist/server/index.js', 'dist/server/admin.js', 'dist/web/index.html',
+            'dist/server/index.js', 'dist/server/admin.js', 'dist/server/runtime-check.js', 'dist/web/index.html',
             'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1',
             'scripts/windows/uninstall-control.ps1', 'docs/installation.md',
             'scripts/windows/configure-game.ps1', 'scripts/windows/game-task.ps1', 'docs/game-configuration.md',

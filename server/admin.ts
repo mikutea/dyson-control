@@ -1,6 +1,7 @@
 import { lstat, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Readable, Writable } from 'node:stream'
 import type { ControlConfig } from '../shared/contracts.js'
 import { hashPassword } from './auth.js'
@@ -14,6 +15,17 @@ export async function runAdmin(
 ): Promise<void> {
   const [command, argument] = args
   const passwords = new PasswordReader(environment, input, output)
+  if (command === 'check-runtime') {
+    if (args.length !== 1) throw new Error('check-runtime 不接受其他参数。')
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL('./runtime-check.js', import.meta.url))], {
+      windowsHide: true, timeout: 20_000, encoding: 'utf8', maxBuffer: 4096,
+    })
+    if (result.error || result.status !== 0 || result.stdout.trim() !== 'DYSON_RUNTIME_OK') {
+      throw new Error('Windows 运行时自检失败。请使用 Windows 10 1809 / Server 2019 或更新版本、Node.js 24+，并重新安装锁定的生产依赖。当前安装尚未切换；不要手工复制其他 Node 版本的 node_modules。')
+    }
+    console.log('Windows runtime ready: SQLite and Steam authorization console.')
+    return
+  }
   if (command === 'hash-password') {
     const password = await passwords.read('Administrator password: ')
     console.log(await hashPassword(password))
@@ -75,6 +87,7 @@ export async function runAdmin(
     return
   }
   console.log('Usage:')
+  console.log('  node dist/server/admin.js check-runtime')
   console.log('  node dist/server/admin.js hash-password')
   console.log('  node dist/server/admin.js init-demo [config-path]')
   console.log('  node dist/server/admin.js init-windows <config-path> --server-root <directory> [--address host:port] [--port 13020] [--name "Dyson Server"]')

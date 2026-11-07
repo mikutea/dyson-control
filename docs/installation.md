@@ -20,7 +20,7 @@ C:\ProgramData\Dyson Control\
 
 ## 要求与边界
 
-- Windows 10、Windows Server 2019 或更新版本，Windows PowerShell 5.1。
+- Windows 10 1809、Windows Server 2019 或更新版本，Windows PowerShell 5.1。
 - 全局安装 Node.js 24 或更新版本，并可使用配套的 `npm.cmd`。
 - 安装、升级和卸载计划任务时使用管理员 PowerShell。准备发布包和配置无需管理员权限。
 - 默认配置必须监听 `127.0.0.1`。远程管理应在回环监听前配置独立的 HTTPS 反向代理。`-AllowNonLoopback` 只用于部署者明确接受直接监听风险的环境。
@@ -62,6 +62,18 @@ CI 使用 `--panel-only`，因为公共构建机没有受控的游戏/Nebula 引
 
 工具通过显式允许列表收集文件，并拒绝测试、临时目录、真实配置、数据库、日志、备份、私钥、常见令牌格式和已知私有部署路径。它不会收录 `node_modules`、`control.config.json`、`.data` 或 `state`。
 
+准备可供发布的同一提交产物时，先提交已审查的源码，在干净的 Git 工作区运行：
+
+```powershell
+node .\scripts\prepare-release.mjs `
+  --bridge-dir .\dist\bridge `
+  --out-dir .\dist\release-candidate
+```
+
+此命令依次生成完整包、仅面板包及各自的 `.sha256`，再生成 `SHA256SUMS`、`RELEASE_NOTES.md` 和 `release-evidence.json`。证据文件仅记录公开版本、源码提交、Bridge 构建身份和产物散列，不包含主机路径。输出目录必须不存在，源码有未提交变更时会拒绝打包；命令不创建 Git 标签、不上传或发布 Release。
+
+发布时使用该提交通过检查后的两个 ZIP 和对应校验文件。完整包服务首次安装，面板更新器使用仅面板包。先确认发布说明与实际验证一致，再创建公开版本；具体步骤见[发布准备](releasing.md)。
+
 分发前在发布目录验证校验值：
 
 ```powershell
@@ -87,6 +99,7 @@ $privateRoot = 'C:\ProgramData\Dyson Control'
 New-Item -ItemType Directory -Path $privateRoot -Force | Out-Null
 Push-Location $release
 npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+node .\dist\server\admin.js check-runtime
 node .\dist\server\admin.js init-windows "$privateRoot\control.config.json" `
   --server-root 'D:\Dyson' `
   --address 'game.example.com:8469' `
@@ -131,7 +144,9 @@ $config = 'C:\ProgramData\Dyson Control\control.config.json'
   -TaskName 'Dyson-Control'
 ```
 
-安装程序会验证 Node.js 24、发布目录、`release-manifest.json`、绝对配置路径、回环监听和数据目录隔离；复制到 `versions/<package-version>`；安装锁定的生产依赖；调用编译后的管理 CLI 验证配置；注册唯一的开机计划任务；启动服务并检查 `/healthz`。只有产品名、包版本、进程 PID、实际 Node 命令中的版本根目录都匹配，且服务明确返回 `accepting: true` 时才写入安装状态。
+安装程序会验证 Node.js 24、发布目录、`release-manifest.json`、绝对配置路径、回环监听和数据目录隔离；安装锁定的生产依赖；在暂存目录实际打开内存 SQLite，并启动隐藏的原生控制台子进程，再验证配置。通过后复制到 `versions/<package-version>`、注册唯一的开机计划任务、启动服务并检查 `/healthz`。只有产品名、包版本、进程 PID、实际 Node 命令中的版本根目录都匹配，且服务明确返回 `accepting: true` 时才写入安装状态。
+
+`check-runtime` 不访问 Steam、不启动游戏、不修改配置；可在解压并安装生产依赖后手工运行。自检失败时检查 Windows 与 Node 版本，并从锁定文件重新安装依赖；不要从其他 Node 版本的目录复制 `node_modules`。升级也会在暂停旧面板之前完成相同自检。
 
 完整包安装成功后，输出会明确显示 `Release: complete`、Bridge 候选目录和已核验的 SHA-256；候选文件保留在 `versions\<package-version>\dist\bridge`，安装程序不会直接替换游戏中的插件。面板包会明确显示 `Release: panel-only`，版本目录中没有 Bridge 候选文件，也不会更改游戏目录。
 
