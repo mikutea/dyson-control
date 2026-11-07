@@ -23,6 +23,15 @@ function digestEntry(entry: Omit<StoredSettingsHistoryEntry, 'sha256'>): string 
 }
 
 const settingKeys = ['serverName', 'address', 'backupKeep', 'targetUps', 'maxPlayers', 'autosaveMinutes'] as const
+
+export function assertSettingsUnchanged(current: GameSettings, expected: unknown): void {
+  if (expected === undefined) return
+  if (!expected || typeof expected !== 'object' || Array.isArray(expected) ||
+      settingKeys.some(key => current[key] !== (expected as Partial<GameSettings>)[key])) {
+    throw new GameAdapterError('SETTINGS_CHANGED', '服务器设置已变化，请重新读取当前设置后再修改。')
+  }
+}
+
 const settingEffects: Record<ServerSettingKey, SettingsRollbackPreview['fields'][number]['effect']> = {
   serverName: 'panel', address: 'client-packages', backupKeep: 'backup-retention', targetUps: 'next-start',
   maxPlayers: 'demo', autosaveMinutes: 'demo'

@@ -4,6 +4,8 @@
 
 ## 恢复历史服务器设置
 
+编辑服务器设置时，若其他页面已保存新的值，当前草稿会保留并提示冲突。撤销草稿会重新载入最新设置；任务实际执行前也会核对提交时的原值，拒绝覆盖其他操作。降低保留备份数量前，确认框会说明旧自动备份可能被清理。
+
 在“设置 → 设置历史”选择“预览恢复”，核对当前值、所选版本和生效时间。服务器名称立即更新，连接地址用于新生成的客户端包。降低保留数量会立即轮换自动备份，已标记保留的副本继续保留。受管启动任务在下次启动游戏时使用恢复后的目标 UPS。自定义启动任务的 UPS、Windows 的最多玩家和自动保存间隔为只读。
 
 确认后，面板会核对预览、保存当前设置到历史，再应用可写差异。设置文件或启动任务能力发生变化时，请重新打开预览。相同版本或仅有只读差异时，恢复按钮不可用。
@@ -42,7 +44,7 @@ SMB 全局映射使用现有共享身份与服务器权限。接入工具不会�
 只准备模式不需要停游戏，也不更改游戏目录、目标 secret、计划任务或存档。输出目录必须尚不存在：
 
 ```powershell
-$version = 'C:\Program Files\Dyson Control\versions\0.1.0'
+$version = 'C:\Program Files\Dyson Control\versions\0.1.10' # 改为 install-state.json 中的 activeVersion
 $config = 'C:\ProgramData\Dyson Control\control.config.json'
 $bridgeBuild = Join-Path $version 'dist\bridge'
 $bridgeManifest = Get-Content "$bridgeBuild\bridge-manifest.json" -Raw | ConvertFrom-Json

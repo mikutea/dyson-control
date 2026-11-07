@@ -234,14 +234,27 @@ function SettingsPage({ refreshToken, runAction }: PagesProps) {
   const [form, setForm] = useState<GameSettings | null>(null)
   const [baseForm, setBaseForm] = useState<GameSettings | null>(null)
   const dirty = !sameGameSettings(form, baseForm)
+  const changed = Boolean(baseForm && resource.data && !sameGameSettings(baseForm, resource.data))
   useEffect(() => {
     if (resource.data && (!dirty || sameGameSettings(resource.data, form))) {
       setForm(resource.data); setBaseForm(resource.data)
     }
   }, [resource.data, dirty, form])
   const update = <K extends keyof GameSettings>(key: K, value: GameSettings[K]) => setForm((current) => current ? { ...current, [key]: value } : current)
+  const submit = () => {
+    if (!form || !baseForm || !dirty || changed || resource.error) return
+    const { readOnlyFields: _readOnlyFields, ...settings } = form
+    const lowerRetention = form.backupKeep < baseForm.backupKeep
+    runAction('write-settings', { settings, expectedSettings: baseForm }, {
+      title: '保存服务器设置？', label: '保存设置', danger: lowerRetention,
+      description: '启动参数在下次启动游戏时生效，面板信息和备份设置立即生效。' + (lowerRetention ?
+        `保留数量将从 ${baseForm.backupKeep} 降为 ${form.backupKeep}，超出数量且未标记保留的旧自动备份可能被清理。` : '')
+    })
+  }
   return <><PageHeader title="设置" description="调整面板信息、游戏启动参数与备份保留数量" />
-    {!form ? resource.loading ? <LoadingBlock /> : <ErrorBlock message={resource.error || '未读取到设置'} retry={resource.reload} /> : <form className="settings-form" onSubmit={(event) => { event.preventDefault(); const { readOnlyFields: _readOnlyFields, ...settings } = form; runAction('write-settings', { settings }, { title: '保存服务器设置？', description: '启动参数在下次启动游戏时生效，面板信息和备份设置立即生效。', label: '保存设置' }) }}>
+    {!form ? resource.loading ? <LoadingBlock /> : <ErrorBlock message={resource.error || '未读取到设置'} retry={resource.reload} /> : <form className="settings-form" onSubmit={event => { event.preventDefault(); submit() }}>
+      {resource.error && <ErrorBlock message={`未能核对当前设置，草稿仍保留。${resource.error}`} retry={resource.reload} />}
+      {changed && dirty && <p className="runtime-notice" role="status">服务器设置已在其他页面变化。草稿仍保留；请撤销更改后基于最新设置重新编辑。</p>}
       <Panel title="基本信息" icon={<Settings2 />}>
         <div className="form-grid"><Field label="服务器名称" hint="显示在此管理面板中的名称"><input value={form.serverName} onChange={(event) => update('serverName', event.target.value)} maxLength={80} required /></Field><Field label="连接地址" hint="玩家用于加入服务器的地址"><input value={form.address} onChange={(event) => update('address', event.target.value)} required /></Field></div>
       </Panel>
@@ -250,7 +263,7 @@ function SettingsPage({ refreshToken, runAction }: PagesProps) {
         {Boolean(form.readOnlyFields?.length) && <p className="settings-note">灰色参数暂不支持由当前游戏或启动任务修改。</p>}
       </Panel>
       {dirty && baseForm && <details className="settings-preview"><summary>查看设置更改</summary><dl>{([['serverName', '服务器名称'], ['address', '连接地址'], ['maxPlayers', '最多玩家'], ['targetUps', '目标 UPS'], ['autosaveMinutes', '自动保存间隔'], ['backupKeep', '保留备份']] as const).filter(([key]) => form[key] !== baseForm[key]).map(([key, label]) => <div key={key}><dt>{label}</dt><dd>{String(baseForm[key] ?? '—')} → {String(form[key] ?? '—')}</dd></div>)}</dl></details>}
-      <div className="settings-actions"><Button type="button" disabled={!dirty} onClick={() => { if (resource.data) { setForm(resource.data); setBaseForm(resource.data) } }}>撤销更改</Button><Button type="submit" disabled={!dirty} variant="primary" icon={<SaveIcon />}>保存设置</Button></div>
+      <div className="settings-actions"><Button type="button" disabled={!dirty || Boolean(resource.error)} onClick={() => { if (resource.data) { setForm(resource.data); setBaseForm(resource.data) } }}>撤销更改</Button><Button type="submit" disabled={!dirty || changed || Boolean(resource.error)} variant="primary" icon={<SaveIcon />}>保存设置</Button></div>
     </form>}
     <SettingsHistory refreshToken={refreshToken} dirty={dirty} runAction={runAction} />
     <RuntimeSettingsPanel refreshToken={refreshToken} />

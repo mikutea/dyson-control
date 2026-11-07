@@ -5,7 +5,7 @@ Dyson Control 的程序版本、私有配置和运行数据必须分开保存。
 ```text
 C:\Program Files\Dyson Control\
   install-state.json
-  versions\0.1.0\
+  versions\0.1.10\
   rollback\...
 C:\ProgramData\Dyson Control\
   control.config.json
@@ -77,7 +77,7 @@ node .\scripts\prepare-release.mjs `
 分发前在发布目录验证校验值：
 
 ```powershell
-$zip = Resolve-Path .\dyson-control-v0.1.0-windows.zip # 面板包使用 *-windows-panel-only.zip
+$zip = Resolve-Path .\dyson-control-v0.1.10-windows.zip # 替换为下载的版本；面板包使用 *-windows-panel-only.zip
 $expected = ((Get-Content "$zip.sha256" -Raw).Trim() -split '\s+')[0]
 $actual = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($actual -ne $expected) { throw 'SHA-256 mismatch.' }
@@ -200,7 +200,7 @@ Invoke-RestMethod 'http://127.0.0.1:13020/api/session'
 卸载脚本只停止并删除安装状态中精确匹配、描述也属于 Dyson Control 的计划任务。若服务正在运行，它会执行与升级相同的 token 回认和持久化排空，确认精确版本/PID 已暂停接单后才停止；卸载失败且任务仍存在时会恢复原服务并释放自己的 marker：
 
 ```powershell
-& 'C:\Program Files\Dyson Control\versions\0.1.0\scripts\windows\uninstall-control.ps1' `
+& 'C:\Program Files\Dyson Control\versions\0.1.10\scripts\windows\uninstall-control.ps1' `
   -InstallRoot 'C:\Program Files\Dyson Control' `
   -TaskName 'Dyson-Control'
 ```

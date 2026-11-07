@@ -273,5 +273,5 @@ export interface ControlConfig {
 // GET /api/events streams `job` and `overview` events with the corresponding DTO as JSON.
 // Downloads: GET /api/backups/:id/download and /api/client-packages/:id/download.
 // GET /api/backups/:id/restore-preview returns BackupRestorePreview without verifying member hashes or running a job.
-// Input: load-save {saveId}; verify-backup {backupId}; set-backup-retained {backupId,retained}; restore {backupId,previewKey?}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings};
+// Input: load-save {saveId}; verify-backup {backupId}; set-backup-retained {backupId,retained}; restore {backupId,previewKey?}; import-backup {uploadId}; toggle-mod {modId,enabled}; write-settings {settings:GameSettings,expectedSettings?:GameSettings};
 // backup {saveId?}; install-update {component,version?}; create-client-package {}.

@@ -31,6 +31,35 @@ afterEach(async () => {
 })
 
 describe('Dyson Control API', () => {
+  it('checks settings drafts when queued work executes and returns the same failed receipt on retry', async () => {
+    const f = await createFixture()
+    const adapter = new DemoGameAdapter(f.config)
+    const app = await buildApp({ config: f.config, adapter, databasePath: ':memory:' })
+    try {
+      const cookie = await loginCookie(app)
+      const original = await adapter.settings()
+      const submit = (requestId: string, settings: GameSettings, expectedSettings: unknown) => app.inject({
+        method: 'POST', url: '/api/actions', headers: { cookie },
+        payload: { requestId, action: 'write-settings', input: { settings, expectedSettings } }
+      })
+      expect((await submit('invalid-settings-baseline', original, { serverName: original.serverName })).statusCode).toBe(400)
+      expect((await submit('first-settings-editor', { ...original, serverName: 'First editor' }, original)).statusCode).toBe(202)
+      const draft = { ...original, address: 'second.example.test:8469' }
+      const stale = await submit('second-settings-editor', draft, original)
+      expect(stale.statusCode).toBe(202)
+      const jobId = stale.json().data.id
+      const readJob = async () => (await app.inject({ url: '/api/jobs/' + jobId, headers: { cookie } })).json().data
+      await vi.waitFor(async () => expect((await readJob()).state).toBe('failed'))
+      expect((await readJob()).message).toContain('服务器设置已变化')
+      expect(await adapter.settings()).toEqual({ ...original, serverName: 'First editor' })
+      expect(await adapter.settingsHistory()).toHaveLength(1)
+      const retry = await submit('second-settings-editor', draft, original)
+      expect(retry.statusCode).toBe(202)
+      expect(retry.json().data).toMatchObject({ id: jobId, state: 'failed' })
+      expect((await app.inject({ url: '/api/jobs', headers: { cookie } })).json().data).toHaveLength(2)
+    } finally { await app.close() }
+  })
+
   it('authenticates settings restore previews and reuses the guarded rollback job on retries', async () => {
     const f = await createFixture()
     const adapter = new DemoGameAdapter(f.config)

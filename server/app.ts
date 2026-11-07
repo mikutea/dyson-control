@@ -66,7 +66,7 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'restore-removed-mod': z.object({ historyId: idSchema }).strict(),
   'write-mod-config': z.object({ configId: idSchema, content: z.string().max(256 * 1024), expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   'rollback-mod-config': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
-  'write-settings': z.object({ settings: settingsSchema }).strict(),
+  'write-settings': z.object({ settings: settingsSchema, expectedSettings: settingsSchema.optional() }).strict(),
   'rollback-settings': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'create-client-package': emptyObjectSchema,
   'kick-player': z.object({ playerId: z.string().regex(playerIdPattern) }).strict(),

@@ -9,7 +9,7 @@ import { GameAdapterError, invalidInput } from './errors.js'
 import { clientPackageDownload, compareClientPackage, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage } from './profile.js'
 import { modConfigRollbackPreview, prepareModConfigRollback, prepareModConfigWrite, publicModConfig } from './mod-config.js'
 import { timestampId } from './system.js'
-import { assertSettingsRollback, describeSettingsRollback } from './settings-history.js'
+import { assertSettingsRollback, assertSettingsUnchanged, describeSettingsRollback } from './settings-history.js'
 import { importUploadedBackup } from '../backup-import.js'
 import { exportBackup } from './backup-export.js'
 import { BackupRetention } from './backup-retention.js'
@@ -388,6 +388,7 @@ export class DemoGameAdapter implements GameAdapter {
   }
 
   async #writeSettings(input: Record<string, unknown>, report: ReportStep, operation: 'write' | 'rollback' = 'write'): Promise<Record<string, unknown>> {
+    assertSettingsUnchanged(this.#settings, input.expectedSettings)
     const settings = input.settings
     if (!settings || typeof settings !== 'object') invalidInput('settings is required.')
     const value = settings as Partial<GameSettings>

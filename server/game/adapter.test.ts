@@ -1337,6 +1337,40 @@ describe('Windows adapter fixture behavior', () => {
     expect((await adapter.settingsHistory())[0]!.settings).toMatchObject({ serverName: 'Changed Server', targetUps: 75 })
   })
 
+  it('rejects a stale settings draft before writing files, history or rotating automatic backups', async () => {
+    const fixture = await config('windows')
+    await fs.mkdir(fixture.game.root, { recursive: true })
+    await fs.writeFile(path.join(fixture.game.saveDirectory, 'World.dsv'), 'fixture-world')
+    await fs.writeFile(path.join(fixture.game.saveDirectory, 'World.server'), 'fixture-server')
+    const runScript = vi.fn(async () => { throw new Error('No game process should be launched') })
+    const adapter = new WindowsGameAdapter(fixture, { runScript, inspect: async () => ({
+      process: null, versions: { game: null, nebula: null, bepinex: null },
+      tasks: { start: true, startManaged: true, configuredTargetUps: null }
+    }) })
+    const signal = new AbortController().signal
+    const original = await adapter.settings()
+    await adapter.run('write-settings', { settings: { ...original, serverName: 'Other page' }, expectedSettings: original }, () => {}, signal)
+    await adapter.run('backup', { automatic: true }, () => {}, signal)
+    await adapter.run('backup', { automatic: true }, () => {}, signal)
+    const backups = await adapter.backups(), history = await adapter.settingsHistory()
+    expect(backups).toHaveLength(2)
+    const files = [path.join(fixture.dataDirectory, 'game-settings.json'), path.join(fixture.dataDirectory, 'game-startup', 'settings.json')]
+    const before = await Promise.all(files.map(file => fs.readFile(file)))
+    await expect(adapter.run('write-settings', {
+      settings: { ...original, backupKeep: 1 }, expectedSettings: original
+    }, () => {}, signal)).rejects.toMatchObject({ code: 'SETTINGS_CHANGED' })
+    expect(await Promise.all(files.map(file => fs.readFile(file)))).toEqual(before)
+    expect(await adapter.settingsHistory()).toEqual(history)
+    expect(await adapter.backups()).toEqual(backups)
+    expect((await adapter.settings()).serverName).toBe('Other page')
+    const current = await adapter.settings()
+    await adapter.run('write-settings', { settings: { ...current, backupKeep: 1 }, expectedSettings: current }, () => {}, signal)
+    expect(await adapter.backups()).toHaveLength(1)
+    expect((await adapter.settings()).serverName).toBe('Other page')
+    expect(await adapter.settingsHistory()).toHaveLength(2)
+    expect(runScript).not.toHaveBeenCalled()
+  })
+
   it('restores the first settings file and discards unused history when the startup write fails', async () => {
     const fixture = await config('windows')
     await fs.mkdir(fixture.game.root, { recursive: true })

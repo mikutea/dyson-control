@@ -26,7 +26,7 @@ import { HostNetworkRateTracker, type HostNetworkCounterSample } from './network
 import { clientPackageDownload, compareClientPackage, displayModName, displayModVersion, listClientPackages, readClientPackagePlan, withClientRuntime, writeClientPackage, type ClientPackageMod } from './profile.js'
 import { assertRestoreImpact, assertReviewedTarget, backupMemberBlockers, describeRestore, plainRestoreFile, readSaveMembers, saveExtensions, targetMemberBlockers } from './restore-preview.js'
 import { SaveRestoreManager } from './save-restore.js'
-import { assertSettingsRollback, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
+import { assertSettingsRollback, assertSettingsUnchanged, describeSettingsRollback, SettingsHistoryManager } from './settings-history.js'
 import { ensureInside, pathExists, resolveWindowsScript, runPowerShell, safeId, timestampId } from './system.js'
 import { GameUpdateManager, installedPackageName, packageIdentityFromVersionedReference } from './updates.js'
 import { GAME_VERSION_LOCK_ID, VersionLockStore } from './version-locks.js'
@@ -1358,7 +1358,7 @@ export class WindowsGameAdapter implements GameAdapter {
   }
 
   async #writeSettings(input: Record<string, unknown>, report: ReportStep): Promise<Record<string, unknown>> {
-    return this.#applySettings(input.settings, 'write', report)
+    return this.#applySettings(input.settings, 'write', report, undefined, input.expectedSettings)
   }
 
   async #rollbackSettings(input: Record<string, unknown>, report: ReportStep): Promise<Record<string, unknown>> {
@@ -1377,7 +1377,8 @@ export class WindowsGameAdapter implements GameAdapter {
     value: unknown,
     operation: GameSettingsHistoryEntry['operation'],
     report: ReportStep,
-    rollback?: RollbackSettingsState
+    rollback?: RollbackSettingsState,
+    expectedSettings?: unknown
   ): Promise<Record<string, unknown>> {
     const settings = validateSettings(value)
     const inspection = rollback?.inspection ?? await this.#inspect(true)
@@ -1394,6 +1395,7 @@ export class WindowsGameAdapter implements GameAdapter {
     }
     const nextStartup: StartupSettings = { ...previousStartup, targetUps: settings.targetUps }
     const previousPublic = rollback?.current ?? this.#settingsForInspection(inspection)
+    assertSettingsUnchanged(previousPublic, expectedSettings)
     const panelChanged = !rollback || settings.serverName !== previousStored.serverName || settings.address !== previousStored.address || settings.backupKeep !== previousStored.backupKeep
     const startupChanged = inspection.tasks.startManaged && (!rollback || settings.targetUps !== previousStartup.targetUps)
     const panelPayload = rollback?.panelFile ? { ...JSON.parse(rollback.panelFile.bytes.toString('utf8')), ...nextStored } : nextStored
