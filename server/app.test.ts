@@ -550,18 +550,47 @@ describe('Dyson Control API', () => {
       expect(runtime.lastBackupAt).not.toBeNull()
       expect((await app.inject({ method: 'GET', url: '/api/runtime/history?hours=24', headers: { cookie } })).json().data.length).toBeGreaterThan(0)
       const settings = { ...runtime.settings, backupEveryMinutes: 0 }
-      const saved = await app.inject({ method: 'PUT', url: '/api/runtime/settings', headers: { cookie }, payload: settings })
+      const saved = await app.inject({ method: 'PUT', url: '/api/runtime/settings', headers: { cookie }, payload: { settings, expectedSettings: runtime.settings } })
       expect(saved.statusCode).toBe(200)
       expect(saved.json().data.nextBackupAt).toBeNull()
       expect((await app.inject({ method: 'GET', url: '/api/runtime/settings-history' })).statusCode).toBe(401)
       const settingHistory = (await app.inject({ method: 'GET', url: '/api/runtime/settings-history', headers: { cookie } })).json().data
       expect(settingHistory).toHaveLength(2)
-      const restored = await app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers: { cookie }, payload: { historyId: settingHistory[1].id } })
+      const restored = await app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers: { cookie }, payload: { historyId: settingHistory[1].id, expectedSettings: settings } })
       expect(restored.statusCode).toBe(200)
       expect(restored.json().data.settings).toEqual(runtime.settings)
-      expect((await app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers: { cookie }, payload: { historyId: 999999 } })).statusCode).toBe(404)
+      expect((await app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers: { cookie }, payload: { historyId: 999999, expectedSettings: runtime.settings } })).statusCode).toBe(404)
       expect((await app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers: { cookie }, payload: { historyId: '1' } })).statusCode).toBe(400)
       expect((await app.inject({ method: 'PUT', url: '/api/runtime/settings', headers: { cookie }, payload: { ...settings, autoRestart: 'yes' } })).statusCode).toBe(400)
+    } finally { await app.close() }
+  })
+
+  it('requires the runtime settings baseline and returns conflict without changing settings or history', async () => {
+    const fixture = await createFixture()
+    const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:' })
+    try {
+      const headers = { cookie: await loginCookie(app) }
+      const original = (await app.inject({ url: '/api/runtime', headers })).json().data
+      const settings = { ...original.settings, backupEveryMinutes: 120, autoRestart: true }
+      const save = (payload: unknown) => app.inject({ method: 'PUT', url: '/api/runtime/settings', headers, payload: payload as Record<string, unknown> })
+      const restore = (payload: unknown) => app.inject({ method: 'POST', url: '/api/runtime/settings/restore', headers, payload: payload as Record<string, unknown> })
+      expect((await save(settings)).statusCode).toBe(400)
+      expect((await save({ settings })).statusCode).toBe(400)
+      expect((await save({ settings, expectedSettings: {} })).statusCode).toBe(400)
+      expect((await save({ settings: { ...settings, autoRestart: 'yes' }, expectedSettings: original.settings })).statusCode).toBe(400)
+      expect((await save({ settings, expectedSettings: original.settings })).statusCode).toBe(200)
+      const before = (await app.inject({ url: '/api/runtime', headers })).json().data
+      const history = (await app.inject({ url: '/api/runtime/settings-history', headers })).json().data
+      const stale = await save({ settings: { ...original.settings, minimumUps: 45 }, expectedSettings: original.settings })
+      expect(stale.statusCode).toBe(409)
+      expect(stale.json().error.code).toBe('runtime_settings_changed')
+      expect((await restore({ historyId: history[1].id })).statusCode).toBe(400)
+      expect((await restore({ historyId: history[1].id, expectedSettings: original.settings })).statusCode).toBe(409)
+      expect((await app.inject({ url: '/api/runtime', headers })).json().data).toEqual(before)
+      expect((await app.inject({ url: '/api/runtime/settings-history', headers })).json().data).toEqual(history)
+      const restored = await restore({ historyId: history[1].id, expectedSettings: settings })
+      expect(restored.statusCode).toBe(200)
+      expect(restored.json().data.settings).toEqual(original.settings)
     } finally { await app.close() }
   })
 

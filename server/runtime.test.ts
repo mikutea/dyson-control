@@ -133,6 +133,38 @@ describe('persisted empty-world observation', () => {
 })
 
 describe('background runtime monitoring', () => {
+  it('rejects stale saves and restores before changing backup scheduling, recovery intent or persisted history', async () => {
+    const f = await fixture()
+    await f.monitor.sample()
+    const initial = f.monitor.settings()
+    const updated = { ...initial, backupEveryMinutes: 120, autoRestart: true }
+    f.monitor.updateSettings(updated, initial)
+    const current = f.monitor.status()
+    const history = f.monitor.settingsHistory()
+    expect(current.recovery.wantedRunning).toBe(true)
+    f.advance(30_000)
+    expect(() => f.monitor.updateSettings({ ...initial, minimumUps: 45 }, initial)).toThrow('后台运行设置已变化')
+    expect(() => f.monitor.restoreSettings(history[1]!.id, initial)).toThrow('后台运行设置已变化')
+    expect(f.monitor.status()).toEqual(current)
+    expect(f.monitor.settingsHistory()).toEqual(history)
+    expect(f.calls).toEqual([])
+    await f.monitor.close()
+    const reopened = f.open()
+    expect(reopened.settings()).toEqual(updated)
+    expect(reopened.status()).toMatchObject({ nextBackupAt: current.nextBackupAt, recovery: current.recovery })
+    expect(reopened.settingsHistory()).toEqual(history)
+    expect(reopened.restoreSettings(history[1]!.id, updated).settings).toEqual(initial)
+  })
+
+  it('does not reset the backup schedule or create history for an unchanged settings request', async () => {
+    const f = await fixture()
+    const initial = f.monitor.settings()
+    const before = f.monitor.status()
+    f.advance(30_000)
+    expect(f.monitor.updateSettings(initial, initial)).toEqual(before)
+    expect(f.monitor.settingsHistory()).toEqual([])
+  })
+
   it('does not pause game recovery after a read-only backup verification failure', async () => {
     const f = await fixture()
     await f.monitor.sample()

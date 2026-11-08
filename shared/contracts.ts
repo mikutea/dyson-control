@@ -135,6 +135,8 @@ export interface VersionLock { package: string; version: string; lockedAt: strin
 export interface RuntimeSettings {
   backupEveryMinutes: number; autoRestart: boolean; minimumFreeDiskGiB: number; minimumUps: number
 }
+export interface RuntimeSettingsUpdate { settings: RuntimeSettings; expectedSettings: RuntimeSettings }
+export interface RuntimeSettingsRestore { historyId: number; expectedSettings: RuntimeSettings }
 export interface RuntimeSettingsHistoryEntry { id: number; createdAt: string; settings: RuntimeSettings }
 export interface RuntimeAlert {
   code: string; severity: 'warning' | 'error'; message: string; active: boolean

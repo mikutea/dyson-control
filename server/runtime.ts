@@ -110,8 +110,15 @@ export class RuntimeMonitor {
 
   settings(): RuntimeSettings { return { ...this.#settings } }
 
-  updateSettings(input: RuntimeSettings): RuntimeStatus {
+  updateSettings(input: RuntimeSettings, expectedSettings?: RuntimeSettings): RuntimeStatus {
     const next = runtimeSettingsSchema.parse(input)
+    if (expectedSettings) {
+      const expected = runtimeSettingsSchema.parse(expectedSettings)
+      if ((Object.keys(expected) as Array<keyof RuntimeSettings>).some(key => expected[key] !== this.#settings[key])) {
+        throw new ApiError(409, 'runtime_settings_changed', '后台运行设置已变化，请重新载入当前设置后再保存或恢复。')
+      }
+    }
+    if ((Object.keys(next) as Array<keyof RuntimeSettings>).every(key => next[key] === this.#settings[key])) return this.status()
     const now = this.#clock()
     const state = { ...this.#state, recoveryAttempts: [...this.#state.recoveryAttempts] }
     if (next.backupEveryMinutes !== this.#settings.backupEveryMinutes) {
@@ -144,10 +151,10 @@ export class RuntimeMonitor {
     return rows.map(row => ({ id: row.id, createdAt: asDate(row.at)!, settings: runtimeSettingsSchema.parse(JSON.parse(row.settings)) }))
   }
 
-  restoreSettings(id: number): RuntimeStatus {
+  restoreSettings(id: number, expectedSettings?: RuntimeSettings): RuntimeStatus {
     const entry = this.#db.prepare('SELECT settings FROM runtime_settings_history WHERE id = ?').get(id) as { settings: string } | undefined
     if (!entry) throw new ApiError(404, 'runtime_settings_history_not_found', '未找到这条后台设置历史。')
-    return this.updateSettings(runtimeSettingsSchema.parse(JSON.parse(entry.settings)))
+    return this.updateSettings(runtimeSettingsSchema.parse(JSON.parse(entry.settings)), expectedSettings)
   }
 
   status(): RuntimeStatus {

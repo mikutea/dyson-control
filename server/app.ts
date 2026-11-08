@@ -406,13 +406,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
   app.put('/api/runtime/settings', async (request) => {
     assertNoQuery(request)
-    return data(runtime.updateSettings(runtimeSettingsSchema.parse(request.body)))
+    const { settings, expectedSettings } = z.object({ settings: runtimeSettingsSchema, expectedSettings: runtimeSettingsSchema }).strict().parse(request.body)
+    return data(runtime.updateSettings(settings, expectedSettings))
   })
   app.get('/api/runtime/settings-history', async request => { assertNoQuery(request); return data(runtime.settingsHistory()) })
   app.post('/api/runtime/settings/restore', async request => {
     assertNoQuery(request)
-    const { historyId } = z.object({ historyId: z.number().int().positive().safe() }).strict().parse(request.body)
-    return data(runtime.restoreSettings(historyId))
+    const { historyId, expectedSettings } = z.object({ historyId: z.number().int().positive().safe(), expectedSettings: runtimeSettingsSchema }).strict().parse(request.body)
+    return data(runtime.restoreSettings(historyId, expectedSettings))
   })
 
   app.get('/api/jobs/current', async request => {
