@@ -57,10 +57,18 @@ export function RuntimeSettingsPanel({ refreshToken }: { refreshToken: number })
   useEffect(() => {
     if (!runtime.data) return
     const settings = runtime.data.settings
-    setEditor(previous => previous && !sameRuntimeSettings(previous.base, previous.draft) ? previous : { base: settings, draft: settings })
+    setEditor(previous => previous && !sameRuntimeSettings(previous.base, previous.draft) && !sameRuntimeSettings(previous.draft, settings)
+      ? previous : { base: settings, draft: settings })
   }, [runtime.data])
   const update = <K extends keyof RuntimeSettings>(key: K, value: RuntimeSettings[K]) => {
-    setEditor(previous => previous ? { ...previous, draft: { ...previous.draft, [key]: value } } : previous); setMessage(null)
+    setEditor(previous => {
+      if (!previous) return previous
+      const draft = { ...previous.draft, [key]: value }
+      const latest = runtime.data?.settings
+      return latest && !runtime.error && sameRuntimeSettings(draft, previous.base)
+        ? { base: latest, draft: latest } : { ...previous, draft }
+    })
+    setError(null); setMessage(null)
   }
   const save = async () => {
     if (!editor || !dirty || busy || changed || runtime.error) return
@@ -91,7 +99,7 @@ export function RuntimeSettingsPanel({ refreshToken }: { refreshToken: number })
     }
     finally { setBusy(false) }
   }
-  return <Panel title="自动备份与恢复" icon={<ShieldCheck />}>
+  return <Panel title="自动备份与恢复" icon={<ShieldCheck />} action={<Button disabled={busy} onClick={() => { setError(null); setMessage(null); void runtime.reload() }}>刷新后台设置</Button>}>
     {!form ? runtime.loading ? <LoadingBlock /> : <ErrorBlock message={runtime.error || '未读取到后台设置'} retry={runtime.reload} /> : <form className="runtime-settings" onSubmit={event => { event.preventDefault(); void save() }}>
       <fieldset className="runtime-fields" disabled={busy}><div className="form-grid">
         <label className="field"><span>自动备份间隔（分钟）</span><input type="number" min={0} max={10_080} step={1} value={form.backupEveryMinutes} onChange={event => update('backupEveryMinutes', Number(event.target.value))} required /><small>0 表示关闭。游戏运行且就绪时，先保存再备份。</small></label>
