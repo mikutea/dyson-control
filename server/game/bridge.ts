@@ -36,7 +36,7 @@ export interface StopReceipt {
 }
 
 export interface BridgeTelemetry {
-  sessionId: string; processId: number; sampledAt: string
+  sessionId: string; processId: number; sampledAt: string; bridgeStartedAt: number
   ups: number; tps: number; gameTick: number
 }
 
@@ -335,7 +335,8 @@ export async function readBridgeTelemetry(bridgeDirectory: string, secretFile: s
     if (!/^(?:0|[1-9]\d*)(?:\.\d{1,6})?$/.test(value) || !Number.isFinite(Number(value))) protocolError('BRIDGE_METRICS_INVALID')
     return Number(value)
   }
-  return { sessionId: row.sessionId, processId, sampledAt: new Date(writtenAt).toISOString(), ups: rate(row.ups), tps: rate(row.tps), gameTick: integer(row.gameTick) }
+  return { sessionId: row.sessionId, processId, sampledAt: new Date(writtenAt).toISOString(), bridgeStartedAt: heartbeat.startedAtUnixMs,
+    ups: rate(row.ups), tps: rate(row.tps), gameTick: integer(row.gameTick) }
 }
 
 export async function readBridgeVersions(bridgeDirectory: string, secretFile: string, expectedProcessId: number): Promise<BridgeVersions> {
@@ -354,7 +355,11 @@ export async function readBridgeVersions(bridgeDirectory: string, secretFile: st
 }
 
 export async function readBridgePlayers(bridgeDirectory: string, secretFile: string, expectedProcessId?: number): Promise<Player[]> {
-  const { root, secret } = await readBridgeContext(bridgeDirectory, secretFile, expectedProcessId)
+  return (await readBridgeRoster(bridgeDirectory, secretFile, expectedProcessId)).players
+}
+
+export async function readBridgeRoster(bridgeDirectory: string, secretFile: string, expectedProcessId?: number) {
+  const { root, secret, heartbeat } = await readBridgeContext(bridgeDirectory, secretFile, expectedProcessId)
   const playerPath = path.join(root, 'players')
   const stat = await fs.lstat(playerPath).catch(() => null)
   if (!stat?.isFile() || stat.isSymbolicLink() || stat.size < 1 || stat.size > 32_768) protocolError('PLAYER_SNAPSHOT_UNAVAILABLE')
@@ -372,12 +377,12 @@ export async function readBridgePlayers(bridgeDirectory: string, secretFile: str
   })
   if (row.protocol !== 'DYSON_CONTROL_PLAYERS_V1' || !/^[0-9a-f-]{36}$/i.test(row.sessionId) || !/^(?:active|inactive|unavailable)$/.test(row.state) || !/^(?:true|false)$/.test(row.truncated)) protocolError('PLAYER_SNAPSHOT_INVALID')
   const writtenAt = integer(row.writtenAtUnixMs, 1)
-  integer(row.sequence, 1)
+  const sequence = integer(row.sequence, 1)
   const count = integer(row.playerCount)
   if (count > 64 || !/^[A-Za-z0-9_-]{2,30000}$/.test(row.playersJsonB64) || Buffer.from(row.playersJsonB64, 'base64url').toString('base64url') !== row.playersJsonB64) protocolError('PLAYER_SNAPSHOT_INVALID')
   assertSignature(row.hmac, hmac(secret, keys.slice(0, -1).map((key) => row[key])))
   const age = Date.now() - writtenAt
-  if (age < -5_000 || age > 10_000) protocolError('PLAYER_SNAPSHOT_STALE')
+  if (age < -5_000 || age > 10_000 || writtenAt < heartbeat.startedAtUnixMs) protocolError('PLAYER_SNAPSHOT_STALE')
   let decoded: unknown
   let canonical: string
   try { canonical = Buffer.from(row.playersJsonB64, 'base64url').toString('utf8'); decoded = JSON.parse(canonical) } catch { protocolError('PLAYER_SNAPSHOT_INVALID') }
@@ -398,7 +403,7 @@ export async function readBridgePlayers(bridgeDirectory: string, secretFile: str
   })
   const normalized = JSON.stringify(decoded.map((player: Record<string, unknown>) => ({ sessionPlayerId: player.sessionPlayerId, displayName: player.displayName, online: true, joinedAtUnixMs: player.joinedAtUnixMs, location: player.location })))
   if (normalized !== canonical) protocolError('PLAYER_SNAPSHOT_NONCANONICAL')
-  return players
+  return { players, sessionId: row.sessionId.toLowerCase(), writtenAt, sequence, bridgeStartedAt: heartbeat.startedAtUnixMs }
 }
 
 /** Historical events remain readable after game exit; they never imply a live player. */

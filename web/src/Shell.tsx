@@ -18,6 +18,7 @@ export const navItems: NavItem[] = [
   { page: 'clients', label: '客户端', icon: CloudCog },
   { page: 'server', label: '服务器', icon: Server },
   { page: 'settings', label: '设置', icon: Settings },
+  { page: 'setup', label: '安装与授权', icon: CloudCog },
   { page: 'activity', label: '活动', icon: Activity },
 ]
 
@@ -91,11 +92,13 @@ export function Shell({ page, session, serverState, onNavigate, onLogout, childr
 function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; onOpen: (open: boolean) => void; onActivity: () => void }) {
   const working = job.state === 'queued' || job.state === 'running'
   const latestStep = job.steps.at(-1)?.message
-  const tone = job.state === 'succeeded' ? 'good' : job.state === 'failed' || job.state === 'interrupted' ? 'bad' : 'warning'
-  const summary = useMemo(() => formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])
+  const tone = job.state === 'succeeded' ? 'good' : job.state === 'cancelled' ? 'muted' : job.state === 'failed' || job.state === 'interrupted' ? 'bad' : 'warning'
+  const summary = useMemo(() => job.state === 'failed' || job.state === 'interrupted'
+    ? job.message || jobStateLabels[job.state]
+    : formatJobResult(job) || latestStep || job.message || jobStateLabels[job.state], [job, latestStep])
 
   if (!open) return (
-    <button className="job-chip" onClick={() => onOpen(true)}>
+    <button className="job-chip" aria-expanded="false" onClick={() => onOpen(true)}>
       {working ? <span className="job-spinner" /> : <StatusDot state={tone} />}
       <span>{actionLabels[job.action]} · {jobStateLabels[job.state]}</span>
       <ChevronRight />
@@ -105,7 +108,7 @@ function JobDock({ job, open, onOpen, onActivity }: { job: Job; open: boolean; o
   return (
     <aside className="job-dock" aria-live="polite">
       <header>
-        <div>{working ? <span className="job-spinner" /> : <StatusDot state={tone} />}<span>当前操作</span></div>
+        <div>{working ? <span className="job-spinner" /> : <StatusDot state={tone} />}<span>{working ? '当前操作' : '最近操作'}</span></div>
         <button className="icon-button" aria-label="收起" onClick={() => onOpen(false)}><X /></button>
       </header>
       <div className="job-main">

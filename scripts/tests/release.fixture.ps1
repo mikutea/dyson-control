@@ -110,6 +110,14 @@ function Assert-PackageReader(
     if ((Test-Path -LiteralPath (Join-Path $Destination 'dist\bridge')) -ne $HasBridge) {
       throw "$ScriptPath copied an incorrect Bridge candidate state for $Kind."
     }
+    foreach ($image in @('docs\images\overview.jpg', 'docs\images\saves.jpg')) {
+      $sourceImage = Join-Path $SourceRoot $image
+      $copiedImage = Join-Path $Destination $image
+      if (-not (Test-Path -LiteralPath $copiedImage -PathType Leaf) -or
+          (Get-FileHash -LiteralPath $sourceImage).Hash -cne (Get-FileHash -LiteralPath $copiedImage).Hash) {
+        throw "$ScriptPath did not preserve README image $image for $Kind."
+      }
+    }
   } $definitions $ReleaseRoot $ExpectedKind $ExpectBridge $CopyDestination
 }
 
@@ -152,7 +160,7 @@ try {
       -or $file.StartsWith('dist/web/', [StringComparison]::Ordinal) `
       -or $file -in @('dist/bridge/DysonControlBridge.dll', 'dist/bridge/bridge-manifest.json') `
       -or ($file.StartsWith('scripts/windows/', [StringComparison]::Ordinal) -and $file.EndsWith('.ps1', [StringComparison]::OrdinalIgnoreCase)) `
-      -or ($file.StartsWith('docs/', [StringComparison]::Ordinal) -and $file.EndsWith('.md', [StringComparison]::OrdinalIgnoreCase))
+      -or ($file.StartsWith('docs/', [StringComparison]::Ordinal) -and [IO.Path]::GetExtension($file).ToLowerInvariant() -in @('.md', '.png', '.jpg'))
     if (-not $allowed) { throw "Complete release allowlist audit rejected $file" }
     if ($file -match '(^|/)(node_modules|\.data|state|coverage|backups?|userdata|validation|fixtures?|tests?|temp|tmp)(/|$)' `
         -or $file -match '(^|/)control\.config\.json$' `
@@ -205,7 +213,25 @@ try {
     Assert-PackageReader $scriptPath $panelRoot 'panel-only' $false (Join-Path $fixtureRoot "$scriptSlug-panel-copy")
   }
 
-  Write-Output 'Release fixture passed: complete allowlist/hash, invalid Bridge rejection, and complete/panel-only installer reads.'
+  $statusWriter = Join-Path $panelRoot 'scripts\windows\atomic-json.ps1'
+  $heldWriter = Join-Path $fixtureRoot 'held-atomic-json.ps1'
+  Move-Item -LiteralPath $statusWriter -Destination $heldWriter
+  try {
+    foreach ($scriptName in $scriptNames) {
+      $definitions = Get-HelperDefinitions (Join-Path $projectRoot "scripts\windows\$scriptName")
+      & {
+        param($Definitions, $ReleaseRoot)
+        . $Definitions -SourcePath $ReleaseRoot
+        $rejected = $false
+        try { [void](Read-SourcePackage $ReleaseRoot) }
+        catch { if ($_.Exception.Message -notlike '*atomic-json.ps1*') { throw }; $rejected = $true }
+        if (-not $rejected) { throw 'An installer accepted a release missing its shared status writer.' }
+      } $definitions $panelRoot
+    }
+  }
+  finally { Move-Item -LiteralPath $heldWriter -Destination $statusWriter }
+
+  Write-Output 'Release fixture passed: complete allowlist/hash, invalid Bridge and missing status writer rejection, complete/panel-only installer reads.'
 }
 finally {
   $resolvedFixture = [IO.Path]::GetFullPath($fixtureRoot)

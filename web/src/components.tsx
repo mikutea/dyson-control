@@ -57,8 +57,9 @@ export function StatusDot({ state }: { state: 'good' | 'warning' | 'bad' | 'mute
   return <span className={`status-dot status-${state}`} aria-hidden />
 }
 
-export function ConfirmDialog({ title, description, confirmLabel, danger = false, busy = false, onConfirm, onCancel }: {
-  title: string; description: string; confirmLabel: string; danger?: boolean; busy?: boolean; onConfirm: () => void; onCancel: () => void
+export function ConfirmDialog({ title, description, confirmLabel, danger = false, busy = false, confirmDisabled = false, children, onConfirm, onCancel }: {
+  title: string; description: string; confirmLabel: string; danger?: boolean; busy?: boolean; confirmDisabled?: boolean; children?: ReactNode
+  onConfirm: () => void; onCancel: () => void
 }) {
   const dialog = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -68,7 +69,7 @@ export function ConfirmDialog({ title, description, confirmLabel, danger = false
   }, [])
   return (
     <div className="modal-layer" role="presentation" onMouseDown={(event) => !busy && event.target === event.currentTarget && onCancel()}>
-      <div ref={dialog} className="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-description" onKeyDown={(event) => {
+      <div ref={dialog} className={children ? 'dialog dialog-detailed' : 'dialog'} role="alertdialog" aria-modal="true" aria-labelledby="dialog-title" aria-describedby="dialog-description" onKeyDown={(event) => {
         if (event.key === 'Escape' && !busy) { event.preventDefault(); onCancel() }
         if (event.key !== 'Tab') return
         const controls = Array.from(dialog.current?.querySelectorAll<HTMLElement>('button:not(:disabled), [tabindex="0"]') ?? [])
@@ -80,9 +81,10 @@ export function ConfirmDialog({ title, description, confirmLabel, danger = false
         <div className={`dialog-icon ${danger ? 'dialog-danger' : ''}`}><AlertCircle /></div>
         <h2 id="dialog-title">{title}</h2>
         <p id="dialog-description">{description}</p>
+        {children}
         <div className="dialog-actions">
           <Button onClick={onCancel} disabled={busy}>取消</Button>
-          <Button variant={danger ? 'danger' : 'primary'} busy={busy} onClick={onConfirm}>{confirmLabel}</Button>
+          <Button variant={danger ? 'danger' : 'primary'} busy={busy} disabled={confirmDisabled} onClick={onConfirm}>{confirmLabel}</Button>
         </div>
       </div>
     </div>

@@ -114,6 +114,50 @@ describe('managed BepInEx configuration', () => {
     expect((await manager.history(initial.id)).map((item) => item.operation)).toEqual(['rollback', 'write'])
   })
 
+  it('previews the exact public line changes without writing history or exposing either set of secrets or raw hashes', async () => {
+    const { configRoot, historyRoot, manager } = await fixture()
+    const configPath = path.join(configRoot, 'server.cfg')
+    const saved = '[General]\r\nRate = 1\r\nKeep = yes\r\n# old note\r\n[Auth]\r\nPassword = first-private-value'
+    await fs.writeFile(configPath, saved)
+    const initial = (await manager.list())[0]!
+    const draft = initial.content.replace('Rate = 1', 'Rate = 3\r\nExtra = true').replace('# old note\r\n', '')
+    const written = await manager.write(initial.id, draft, initial.revision)
+    const current = (await fs.readFile(configPath, 'utf8')).replace('first-private-value', 'current-private-value')
+    await fs.writeFile(configPath, current)
+    const preview = await manager.previewRollback(written.historyId)
+    expect(preview).toEqual({
+      historyId: written.historyId, configId: initial.id, path: 'server.cfg', expectedRevision: written.revision,
+      preservedSecretKeys: ['Auth.Password'], changes: [
+        { side: 'current', startLine: 2, lineCount: 2, text: 'Rate = 3\r\nExtra = true\r\n' },
+        { side: 'restored', startLine: 2, lineCount: 1, text: 'Rate = 1\r\n' },
+        { side: 'restored', startLine: 4, lineCount: 1, text: '# old note\r\n' }
+      ]
+    })
+    const serialized = JSON.stringify(preview)
+    for (const value of [saved, current, 'first-private-value', 'current-private-value']) {
+      expect(serialized).not.toContain(value)
+      expect(serialized).not.toContain(createHash('sha256').update(value).digest('hex'))
+    }
+    expect(await fs.readdir(historyRoot)).toEqual([written.historyId])
+    expect(await fs.readFile(configPath, 'utf8')).toBe(current)
+    await manager.rollback(written.historyId, preview.expectedRevision)
+    expect(await fs.readFile(configPath, 'utf8')).toBe(saved.replace('first-private-value', 'current-private-value'))
+    expect((await manager.previewRollback(written.historyId)).changes).toEqual([])
+  })
+
+  it('keeps complete before and after ranges for a large replacement and includes original line endings', async () => {
+    const { configRoot, manager } = await fixture()
+    const original = Array.from({ length: 4096 }, (_, n) => `entry${n}=1\r\n`).join('')
+    await fs.writeFile(path.join(configRoot, 'large.cfg'), original)
+    const initial = (await manager.list())[0]!
+    const draft = original.replace(/=1\r\n/g, '=2\n')
+    const change = await manager.write(initial.id, draft, initial.revision)
+    expect((await manager.previewRollback(change.historyId)).changes).toEqual([
+      { side: 'current', startLine: 1, lineCount: 4096, text: draft },
+      { side: 'restored', startLine: 1, lineCount: 4096, text: original }
+    ])
+  })
+
   it('rejects rollback when historical and current secret-key sets are incompatible', async () => {
     const { configRoot, manager } = await fixture()
     const configPath = path.join(configRoot, 'server.cfg')
@@ -123,6 +167,8 @@ describe('managed BepInEx configuration', () => {
     await fs.writeFile(configPath, '[General]\nValue = two\n[Auth]\nAccessToken = current-token\n')
     const current = (await manager.list())[0]!
 
+    await expect(manager.previewRollback(written.historyId))
+      .rejects.toMatchObject({ code: 'MOD_CONFIG_SECRET_SCHEMA_CHANGED' })
     await expect(manager.rollback(written.historyId, current.revision))
       .rejects.toMatchObject({ code: 'MOD_CONFIG_SECRET_SCHEMA_CHANGED' })
     expect(await fs.readFile(configPath, 'utf8')).toContain('AccessToken = current-token')

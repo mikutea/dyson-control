@@ -64,11 +64,11 @@ $candidate = Get-Item -LiteralPath (Join-Path $output 'DysonControlBridge.dll')
 $manifest = [ordered]@{
     schema = 1
     pluginVersion = $packageVersion
-    builtAtUtc = [DateTimeOffset]::UtcNow.ToString('o')
+    builtAtUtc = [DateTime]::UtcNow.ToString('o')
     dll = [ordered]@{ file = $candidate.Name; bytes = $candidate.Length; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $candidate.FullName).Hash.ToLowerInvariant() }
     references = @($referenceEvidence)
 }
-$manifest | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $output 'bridge-manifest.json') -Encoding utf8
+[IO.File]::WriteAllText((Join-Path $output 'bridge-manifest.json'), (($manifest | ConvertTo-Json -Depth 5) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
 $unexpectedOutput = @(Get-ChildItem -LiteralPath $output -Force | Where-Object {
     $_.PSIsContainer -or $_.Name -notin @('DysonControlBridge.dll', 'bridge-manifest.json')
 })

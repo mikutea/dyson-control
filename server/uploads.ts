@@ -28,22 +28,23 @@ export class BackupUploadStore {
     this.directory = path.resolve(dataDirectory, 'uploads')
   }
 
-  async initialize(findJob: (requestId: string) => Job | null): Promise<void> {
+  async initialize(findJob: (requestId: string) => Job | null, protectedImports: ReadonlySet<string> = new Set()): Promise<void> {
     await fs.mkdir(this.directory, { recursive: true })
     const names = await fs.readdir(this.directory)
     for (const name of names) {
-      if (name.endsWith('.part')) await fs.rm(path.join(this.directory, name), { force: true })
+      if (name.endsWith('.part') && !protectedImports.has(name.split('.')[0]!)) await fs.rm(path.join(this.directory, name), { force: true })
     }
 
-    const metadata = await this.#listMetadata()
+    const metadata = await this.#listMetadata(protectedImports)
     const knownIds = new Set(metadata.map((item) => item.uploadId))
     for (const name of await fs.readdir(this.directory)) {
       const match = /^([0-9a-f-]{36})\.zip$/i.exec(name)
-      if (match && !knownIds.has(match[1]!.toLowerCase())) await fs.rm(path.join(this.directory, name), { force: true })
+      if (match && !knownIds.has(match[1]!.toLowerCase()) && !protectedImports.has(match[1]!.toLowerCase())) await fs.rm(path.join(this.directory, name), { force: true })
     }
 
     const now = Date.now()
     for (const item of metadata) {
+      if (protectedImports.has(item.uploadId)) continue
       const job = findJob(item.requestId)
       if ((job && job.state !== 'queued' && job.state !== 'running') || now - Date.parse(item.createdAt) >= STALE_UPLOAD_MS) {
         await this.remove(item.uploadId)
@@ -122,6 +123,8 @@ export class BackupUploadStore {
         fs.rm(metadataPart, { force: true }),
         fs.rm(metadataPath, { force: true }),
       ])
+      const code = (error as NodeJS.ErrnoException)?.code
+      if (code === 'ENOSPC' || code === 'EDQUOT') throw new ApiError(507, 'upload_storage_full', '上传暂存目录所在磁盘空间不足，请释放空间后重新上传。')
       throw error
     }
   }
@@ -134,6 +137,18 @@ export class BackupUploadStore {
       fs.rm(`${this.#archivePath(uploadId)}.part`, { force: true }),
       fs.rm(`${this.#metadataPath(uploadId)}.part`, { force: true }),
     ])
+  }
+
+  async discardCancelled(uploadId: string, requestId: string): Promise<void> {
+    const metadataPath = this.#metadataPath(uploadId)
+    const contents = await fs.readFile(metadataPath, 'utf8').catch((error: NodeJS.ErrnoException) => error.code === 'ENOENT' ? null : Promise.reject(error))
+    if (contents === null) return
+    const metadata = parseMetadata(JSON.parse(contents))
+    if (metadata.uploadId !== uploadId || metadata.requestId !== requestId) return
+    // Keep metadata until the ZIP is gone so a retry or startup cleanup can finish a partial removal.
+    const archive = this.#archivePath(uploadId)
+    await Promise.all([archive, archive + '.part', metadataPath + '.part'].map(file => fs.rm(file, { force: true })))
+    await fs.rm(metadataPath, { force: true })
   }
 
   createReadStream(uploadId: string): ReadStream {
@@ -151,7 +166,7 @@ export class BackupUploadStore {
     return path.join(this.directory, `${uploadId}.json`)
   }
 
-  async #listMetadata(): Promise<BackupUploadMetadata[]> {
+  async #listMetadata(protectedImports?: ReadonlySet<string>): Promise<BackupUploadMetadata[]> {
     await fs.mkdir(this.directory, { recursive: true })
     const names = (await fs.readdir(this.directory)).filter((name) => /^[0-9a-f-]{36}\.json$/i.test(name)).slice(0, MAX_STAGED_UPLOADS + 1)
     const result: BackupUploadMetadata[] = []
@@ -163,7 +178,7 @@ export class BackupUploadStore {
         result.push(item)
       } catch {
         const uploadId = name.slice(0, -'.json'.length)
-        await this.remove(uploadId).catch(() => undefined)
+        if (!protectedImports?.has(uploadId)) await this.remove(uploadId).catch(() => undefined)
       }
     }
     return result

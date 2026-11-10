@@ -43,13 +43,16 @@ const requiredFiles = [
   'GOAL.md',
   'dist/server/index.js',
   'dist/server/admin.js',
+  'dist/server/runtime-check.js',
   'dist/shared/contracts.js',
   'dist/web/index.html',
   'scripts/windows/install-control.ps1',
   'scripts/windows/upgrade-control.ps1',
   'scripts/windows/uninstall-control.ps1',
   'scripts/windows/configure-game.ps1',
+  'scripts/windows/game-task.ps1',
   'scripts/windows/remove-install-directory.ps1',
+  'scripts/windows/atomic-json.ps1',
 ]
 for (const file of requiredFiles) await requirePlainFile(file)
 
@@ -331,7 +334,7 @@ function assertAllowedReleasePath(name) {
     || name === 'dist/bridge/DysonControlBridge.dll'
     || name === 'dist/bridge/bridge-manifest.json'
     || (name.startsWith('scripts/windows/') && extname(name).toLowerCase() === '.ps1')
-    || (name.startsWith('docs/') && extname(name).toLowerCase() === '.md')
+    || (name.startsWith('docs/') && ['.md', '.png', '.jpg'].includes(extname(name).toLowerCase()))
   if (!allowed) fail(`Release allowlist rejected ${name}.`)
   if (/(^|\/)(?:node_modules|\.data|state|coverage|backups?|userdata|validation|fixtures?|tests?|temp|tmp)(?:\/|$)/i.test(name)
       || /(?:^|\/)control\.config\.json$/i.test(name)

@@ -17,6 +17,7 @@ export class EventHub {
   readonly #pollIntervalMs: number
   #pollTimer: NodeJS.Timeout | null = null
   #sampling = false
+  #closed = false
 
   constructor(
     private readonly adapter: GameAdapter,
@@ -30,7 +31,7 @@ export class EventHub {
   }
 
   get hasCapacity(): boolean {
-    return this.#clients.size < this.#maxClients
+    return !this.#closed && this.#clients.size < this.#maxClients
   }
 
   subscribe(response: ServerResponse, sessionToken = ''): () => void {
@@ -80,6 +81,7 @@ export class EventHub {
   }
 
   close(): void {
+    this.#closed = true
     if (this.#pollTimer) clearInterval(this.#pollTimer)
     this.#pollTimer = null
     for (const client of [...this.#clients]) this.#closeClient(client)

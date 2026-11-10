@@ -2,7 +2,6 @@ import cookie from '@fastify/cookie'
 import fastifyStatic from '@fastify/static'
 import Fastify, { LogController, type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify'
 import { createReadStream, existsSync } from 'node:fs'
-import { lstat } from 'node:fs/promises'
 import { resolve, basename, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { Readable } from 'node:stream'
@@ -14,17 +13,22 @@ import { EventHub } from './events.js'
 import { loadHealthIdentity, MaintenanceGate } from './health.js'
 import { JobQueue, JobStore } from './jobs.js'
 import { RuntimeMonitor, runtimeSettingsSchema } from './runtime.js'
-import { PlayerHistoryStore } from './player-history.js'
+import { PlayerHistoryStore, playerHistoryQuery } from './player-history.js'
+import { startReadinessMessages } from './game/start-readiness.js'
 import { BackupUploadStore, MAX_BACKUP_UPLOAD_BYTES } from './uploads.js'
+import { recoverImportStages } from './backup-import.js'
 import { createGameAdapter, GameAdapterError } from './game/index.js'
+import { openGameLog, redactGameLogDownload } from './game/logs.js'
 import { playerIdPattern } from './game/bridge.js'
 import { ControlUpdateError, ControlUpdateManager } from './control-updates.js'
+import { SteamAuthManager } from './steam-auth.js'
+import { ServerSetupManager } from './server-setup.js'
 
 const emptyObjectSchema = z.object({}).strict()
 const REQUEST_TIMEOUT_MS = 30 * 60 * 1_000
 const idSchema = z.string().trim().min(1).max(256)
 const requestIdSchema = z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9._:-]+$/)
-const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'backup', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player'])
+const actionSchema = z.enum(['start', 'save', 'stop', 'restart', 'load-save', 'backup', 'verify-backup', 'set-backup-retained', 'restore', 'import-backup', 'install-update', 'set-version-lock', 'set-mod-side', 'install-mod', 'rollback-update', 'toggle-mod', 'remove-mod', 'restore-removed-mod', 'write-mod-config', 'rollback-mod-config', 'write-settings', 'rollback-settings', 'create-client-package', 'kick-player', 'prepare-steamcmd', 'install-server', 'prepare-first-world', 'prepare-existing-server', 'adopt-existing-server'])
 const settingsSchema = z.object({
   serverName: z.string().trim().min(1).max(80).regex(/^[^\r\n\0]+$/u),
   maxPlayers: z.number().int().min(1).max(256).nullable(),
@@ -35,13 +39,22 @@ const settingsSchema = z.object({
   readOnlyFields: z.array(z.enum(['maxPlayers', 'targetUps', 'autosaveMinutes'])).max(3).optional(),
 }).strict().transform(({ readOnlyFields: _readOnlyFields, ...settings }) => settings)
 
+const localGameUserSchema = z.string().trim().min(1).max(80).regex(/^[^\\/\r\n\0]+$/u)
 const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
+  'prepare-steamcmd': emptyObjectSchema,
+  'install-server': z.object({ gameUser: localGameUserSchema }).strict(),
+  'prepare-existing-server': z.object({ gameUser: localGameUserSchema }).strict(),
+  'adopt-existing-server': z.object({ planId: z.string().uuid() }).strict(),
+  'prepare-first-world': emptyObjectSchema,
   start: emptyObjectSchema,
   save: emptyObjectSchema,
   stop: emptyObjectSchema,
   restart: emptyObjectSchema,
+  'load-save': z.object({ saveId: idSchema }).strict(),
   backup: z.object({ saveId: idSchema.optional() }).strict(),
-  restore: z.object({ backupId: idSchema }).strict(),
+  'verify-backup': z.object({ backupId: idSchema }).strict(),
+  'set-backup-retained': z.object({ backupId: idSchema, retained: z.boolean() }).strict(),
+  restore: z.object({ backupId: idSchema, previewKey: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'import-backup': z.object({ uploadId: z.string().uuid() }).strict(),
   'install-update': z.object({ component: z.enum(['game', 'nebula', 'bepinex']), version: z.string().trim().min(1).max(100).optional() }).strict(),
   'set-version-lock': z.object({ component: z.enum(['game', 'nebula', 'bepinex']).optional(), modId: idSchema.optional(), locked: z.boolean() }).strict().refine(value => Boolean(value.component) !== Boolean(value.modId), '指定一个组件或模组。'),
@@ -53,14 +66,15 @@ const actionInputSchemas: Record<Action, z.ZodType<Record<string, unknown>>> = {
   'restore-removed-mod': z.object({ historyId: idSchema }).strict(),
   'write-mod-config': z.object({ configId: idSchema, content: z.string().max(256 * 1024), expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
   'rollback-mod-config': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/) }).strict(),
-  'write-settings': z.object({ settings: settingsSchema }).strict(),
-  'rollback-settings': z.object({ historyId: idSchema }).strict(),
+  'write-settings': z.object({ settings: settingsSchema, expectedSettings: settingsSchema.optional() }).strict(),
+  'rollback-settings': z.object({ historyId: idSchema, expectedRevision: z.string().regex(/^[0-9a-f]{64}$/).optional() }).strict(),
   'create-client-package': emptyObjectSchema,
   'kick-player': z.object({ playerId: z.string().regex(playerIdPattern) }).strict(),
 }
 
 export interface BuildAppOptions {
   config: ControlConfig
+  releaseDataDirectory?: () => void
   adapter?: GameAdapter
   databasePath?: string
   webRoot?: string
@@ -71,7 +85,9 @@ export interface BuildAppOptions {
   maxOutstandingJobs?: number
   jobTimeoutMs?: number
   runtimeOptions?: { clock?: () => number; intervalMs?: number }
-  controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'history' | 'close'>
+  steamAuth?: SteamAuthManager
+  serverSetup?: Pick<ServerSetupManager, 'status' | 'prepareSteam' | 'install' | 'prepareExisting' | 'adoptExisting'>
+  controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'recoverReceipt' | 'history' | 'close'>
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
@@ -83,14 +99,34 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     requestTimeout: REQUEST_TIMEOUT_MS,
     trustProxy: (address, hop) => hop === 0 && isLoopbackAddress(address),
   })
+  // Fastify runs onClose in reverse order. Release the CLI's lock after the queue and stores close.
+  const { releaseDataDirectory } = options
+  if (releaseDataDirectory) app.addHook('onClose', async () => releaseDataDirectory())
+  const steamAuth = options.steamAuth ?? new SteamAuthManager(options.config)
+  await steamAuth.initialize()
+  const setup = options.serverSetup ?? new ServerSetupManager(options.config, steamAuth)
   const adapter = options.adapter ?? await createGameAdapter(options.config)
   const store = new JobStore(options.databasePath ?? resolve(options.config.dataDirectory, 'control.sqlite'))
   const recoveredJobs = store.recoverInterruptedJobs()
   const uploads = new BackupUploadStore(options.config.dataDirectory)
-  await uploads.initialize((requestId) => store.findByRequestId(requestId))
+  const protectedImports = await recoverImportStages(options.config, (requestId, uploadId) => {
+    const job = store.findByRequestId(requestId)
+    return job?.action === 'import-backup' && (job.state === 'interrupted' || job.state === 'failed') && store.input(job.id).uploadId === uploadId
+  })
+  if (protectedImports.size) app.log.warn({ count: protectedImports.size }, '保留了仍在使用或无法核实归属的导入暂存记录。')
+  await uploads.initialize((requestId) => store.findByRequestId(requestId), protectedImports)
   const queue = new JobQueue(store, adapter, {
     maxOutstandingJobs: options.maxOutstandingJobs,
     jobTimeoutMs: options.jobTimeoutMs,
+    execute: (action, input, report, signal) => {
+      switch (action) {
+        case 'prepare-steamcmd': return setup.prepareSteam(report, signal)
+        case 'install-server': return setup.install(String(input.gameUser), report, signal)
+        case 'prepare-existing-server': return setup.prepareExisting(String(input.gameUser), report, signal)
+        case 'adopt-existing-server': return setup.adoptExisting(String(input.planId), report, signal)
+        default: return adapter.run(action, input, report, signal)
+      }
+    },
   })
   const maintenance = new MaintenanceGate(
     options.config.dataDirectory,
@@ -103,7 +139,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const controlUpdates = options.controlUpdates ?? new ControlUpdateManager({ config: options.config, currentVersion: healthIdentity.version })
   await controlUpdates.initialize()
   let events: EventHub
-  const sessions = new SessionStore({ maxSessions: options.maxSessions, onInvalidate: (token) => events.closeSession(token) })
+  const sessions = new SessionStore({ maxSessions: options.maxSessions, onInvalidate: (token) => { events.closeSession(token); steamAuth.invalidate(token) } })
   events = new EventHub(adapter, (token) => sessions.has(token), { maxClients: options.maxSseClients })
   const loginGuard = options.loginGuard ?? new LoginGuard()
   const activeUploads = new Map<string, AbortController>()
@@ -162,7 +198,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       const status = error.code === 'RECEIPT_INVALID' || error.code === 'RECEIPT_EXPIRED' ? 401
         : error.code === 'UPDATE_NOT_FOUND' ? 404
         : error.code === 'INVALID_INPUT' ? 400
-        : error.code === 'UPDATE_SCHEDULE_FAILED' ? 503 : 409
+        : error.code === 'UPDATE_SCHEDULE_FAILED' || error.code === 'UPDATE_RECEIPT_UNAVAILABLE' ? 503 : 409
       void reply.code(status).send({ error: { code: error.code, message: error.message } })
       return
     }
@@ -207,16 +243,46 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     return data(sessionDto(false, adapter))
   })
 
+  app.get('/api/server/start-readiness', async request => {
+    assertNoQuery(request)
+    if (adapter.source !== 'windows') throw new ApiError(501, 'windows_required', '此检查需要 Windows 游戏实例。')
+    const state = await adapter.recoveryStartReadiness().catch(() => 'unknown' as const)
+    return data({ state, message: startReadinessMessages[state], checkedAt: new Date().toISOString() })
+  })
   app.get('/api/overview', async (request) => {
     assertNoQuery(request)
     const overview = await adapter.overview()
     events.publishOverview(overview)
     return data(overview)
   })
+  app.get('/api/setup', async request => { assertNoQuery(request); return data(await setup.status(request.cookies[SESSION_COOKIE]!)) })
+  app.get('/api/steam-auth', async request => { assertNoQuery(request); return data(steamAuth.status(request.cookies[SESSION_COOKIE]!)) })
+  app.post('/api/steam-auth', { bodyLimit: 1024 }, async request => {
+    assertNoQuery(request)
+    assertSteamTransport(request)
+    if (options.config.mode !== 'windows') throw new ApiError(501, 'windows_required', 'Steam 授权需要 Windows 服务器。')
+    if (!queue.isIdle) throw new ApiError(409, 'job_in_progress', '请等待当前服务器任务结束后再授权。')
+    const body = z.object({ accountName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/) }).strict().parse(request.body)
+    return data(await steamAuth.start(request.cookies[SESSION_COOKIE]!, body.accountName))
+  })
+  app.post('/api/steam-auth/:id/input', { bodyLimit: 2048 }, async request => {
+    assertNoQuery(request)
+    assertSteamTransport(request)
+    try {
+      const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+      const body = z.object({ promptId: z.number().int().nonnegative(), value: z.string().min(1).max(256) }).strict().parse(request.body)
+      return data(steamAuth.input(request.cookies[SESSION_COOKIE]!, id, body.promptId, body.value))
+    } finally { request.body = undefined }
+  })
+  app.delete('/api/steam-auth/:id', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+    return data(await steamAuth.cancel(request.cookies[SESSION_COOKIE]!, id))
+  })
   app.get('/api/players', async (request) => { assertNoQuery(request); return data(await adapter.players()) })
   app.get('/api/player-history', async request => {
-    const query = z.object({ limit: z.coerce.number().int().min(1).max(200).default(100), offset: z.coerce.number().int().min(0).max(10_000).default(0) }).strict().parse(request.query)
-    return data(playerHistory.read(query.limit, query.offset))
+    const query = playerHistoryQuery.parse(request.query)
+    return data(playerHistory.read(query.limit, query.offset, query))
   })
   app.get('/api/logs', async (request) => { assertNoQuery(request); return data(await adapter.logs()) })
   app.get('/api/logs/download', async (request, reply) => {
@@ -232,11 +298,23 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const query = z.object({ search: z.string().trim().max(128).default('') }).strict().parse(request.query)
     return data(await adapter.modCatalog(query.search))
   })
+  app.get('/api/mod-catalog/plan', async request => {
+    const query = z.object({
+      package: z.string().max(200).regex(/^[A-Za-z0-9_]+-[A-Za-z0-9_]+$/),
+      version: z.string().max(100).regex(/^[A-Za-z0-9][A-Za-z0-9._+-]*$/),
+    }).strict().parse(request.query)
+    return data(await adapter.modInstallPlan(query.package, query.version))
+  })
   app.get('/api/mod-configs', async (request) => { assertNoQuery(request); return data(await adapter.modConfigs()) })
   app.get('/api/mod-removal-history', async request => { assertNoQuery(request); return data(await adapter.modRemovalHistory()) })
   app.get('/api/mod-config-history', async (request) => {
     const { configId } = z.object({ configId: idSchema.optional() }).strict().parse(request.query)
     return data(await adapter.modConfigHistory(configId))
+  })
+  app.get('/api/mod-config-history/:id/rollback-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.modConfigRollbackPreview(id))
   })
   app.get('/api/versions', async (request) => { assertNoQuery(request); return data(await adapter.versions()) })
   app.get('/api/control-version', async (request) => { assertNoQuery(request); return data(healthIdentity) })
@@ -252,6 +330,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
     const token = z.string().regex(/^[A-Za-z0-9_-]{43}$/).parse(request.headers['x-update-receipt'])
     return data(await controlUpdates.readWithReceipt(id, token))
+  })
+  app.post('/api/control-updates/:id/receipt', async (request) => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+    const { receiptToken } = z.object({ receiptToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional() }).strict().parse(request.body)
+    return data(await controlUpdates.recoverReceipt(id, receiptToken))
   })
   app.post('/api/control-updates/prepare', async (request, reply) => {
     assertNoQuery(request)
@@ -276,36 +360,110 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   app.get('/api/update-history', async (request) => { assertNoQuery(request); return data(await adapter.updateHistory()) })
   app.get('/api/saves', async (request) => { assertNoQuery(request); return data(await adapter.saves()) })
   app.get('/api/backups', async (request) => { assertNoQuery(request); return data(await adapter.backups()) })
+  app.get('/api/backups/:id/restore-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.restorePreview(id))
+  })
   app.get('/api/settings', async (request) => { assertNoQuery(request); return data(await adapter.settings()) })
   app.get('/api/settings-history', async request => { assertNoQuery(request); return data(await adapter.settingsHistory()) })
+  app.get('/api/settings-history/:id/rollback-preview', async request => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    return data(await adapter.settingsRollbackPreview(id))
+  })
+  app.get('/api/client-package-plan', async request => {
+    assertNoQuery(request)
+    if (!adapter.clientPackagePlan) throw new ApiError(501, 'client_plan_unavailable', '当前适配器无法检查客户端包。')
+    return data(await adapter.clientPackagePlan())
+  })
   app.get('/api/client-packages', async (request) => { assertNoQuery(request); return data(await adapter.clientPackages()) })
-  app.get('/api/jobs', async (request) => { assertNoQuery(request); return data(store.list()) })
+  app.get('/api/client-packages/:id', async (request) => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    if (adapter.clientPackageDetails) return data(await adapter.clientPackageDetails(id))
+    if (!(await adapter.clientPackages()).some(item => item.id === id)) throw new ApiError(404, 'download_not_found', '找不到这份客户端包。')
+    return data({ id, profile: null, currentAddress: (await adapter.settings()).address, currentMods: null,
+      status: 'unknown', reason: '当前适配器未提供客户端包版本记录。', downloadable: Boolean(adapter.download), sha256: null })
+  })
+  app.get('/api/jobs', async request => {
+    const query = z.object({
+      action: actionSchema.optional(),
+      state: z.enum(['queued', 'running', 'succeeded', 'failed', 'interrupted', 'cancelled']).optional(),
+      before: z.string().uuid().optional(),
+      limit: z.coerce.number().int().min(1).max(200).optional(),
+    }).strict().parse(request.query)
+    return data(store.list(query))
+  })
   app.get('/api/runtime', async (request) => { assertNoQuery(request); return data(runtime.status()) })
+  const historyQuery = z.object({ hours: z.coerce.number().int().min(1).max(168).default(24) }).strict()
   app.get('/api/runtime/history', async (request) => {
-    const { hours } = z.object({ hours: z.coerce.number().int().min(1).max(168).default(24) }).strict().parse(request.query)
+    const { hours } = historyQuery.parse(request.query)
     return data(runtime.history(hours))
+  })
+  app.get('/api/runtime/history/trend', async request => {
+    const { hours } = historyQuery.parse(request.query)
+    return data(runtime.historyWindow(hours))
+  })
+  app.get('/api/runtime/history/download', async (request, reply) => {
+    const { hours } = historyQuery.parse(request.query)
+    reply.type('text/csv; charset=utf-8').header('content-disposition', `attachment; filename="dyson-runtime-${hours}h.csv"`)
+    return reply.send(Readable.from(runtime.historyCsv(hours)))
   })
   app.put('/api/runtime/settings', async (request) => {
     assertNoQuery(request)
-    return data(runtime.updateSettings(runtimeSettingsSchema.parse(request.body)))
+    const { settings, expectedSettings } = z.object({ settings: runtimeSettingsSchema, expectedSettings: runtimeSettingsSchema }).strict().parse(request.body)
+    return data(runtime.updateSettings(settings, expectedSettings))
   })
   app.get('/api/runtime/settings-history', async request => { assertNoQuery(request); return data(runtime.settingsHistory()) })
   app.post('/api/runtime/settings/restore', async request => {
     assertNoQuery(request)
-    const { historyId } = z.object({ historyId: z.number().int().positive().safe() }).strict().parse(request.body)
-    return data(runtime.restoreSettings(historyId))
+    const { historyId, expectedSettings } = z.object({ historyId: z.number().int().positive().safe(), expectedSettings: runtimeSettingsSchema }).strict().parse(request.body)
+    return data(runtime.restoreSettings(historyId, expectedSettings))
   })
 
+  app.get('/api/jobs/current', async request => {
+    assertNoQuery(request)
+    return data(store.current())
+  })
+  app.get('/api/jobs/by-request/:requestId', async request => {
+    assertNoQuery(request)
+    const { requestId } = z.object({ requestId: requestIdSchema }).strict().parse(request.params)
+    return data(store.findByRequestId(requestId))
+  })
   app.get('/api/jobs/:id', async (request) => {
     assertNoQuery(request)
     const { id } = z.object({ id: idSchema }).strict().parse(request.params)
     return data(store.require(id))
+  })
+  app.post('/api/jobs/:id/cancel', async request => {
+    assertNoQuery(request)
+    emptyObjectSchema.parse(request.body === undefined ? {} : request.body)
+    const { id } = z.object({ id: idSchema }).strict().parse(request.params)
+    const job = queue.cancelQueued(id)
+    if (job.action === 'import-backup') {
+      const { uploadId } = store.input(id)
+      if (typeof uploadId === 'string') {
+        try { await uploads.discardCancelled(uploadId, job.requestId) }
+        catch { throw new ApiError(503, 'cancelled_upload_cleanup_pending', '任务已取消，上传暂存文件待清理。可重试取消，服务启动时也会重新清理。') }
+      }
+    }
+    return data(job)
   })
 
   app.post('/api/actions', { bodyLimit: 300 * 1024 }, async (request, reply) => {
     assertNoQuery(request)
     const parsed = z.object({ requestId: requestIdSchema, action: actionSchema, input: z.unknown().optional() }).strict().parse(request.body)
     const input = actionInputSchemas[parsed.action].parse(parsed.input ?? {})
+    if (parsed.action === 'import-backup' && !store.findByRequestId(parsed.requestId)) {
+      try {
+        const { metadata } = await uploads.require(input.uploadId as string)
+        if (metadata.requestId !== parsed.requestId) throw new ApiError(409, 'upload_request_mismatch', '该上传已绑定另一项导入请求。')
+      } catch (error) {
+        // Another submission may have completed and removed staging during this read. Replay its durable receipt.
+        if (!store.findByRequestId(parsed.requestId)) throw error
+      }
+    }
     const actionRequest: ActionRequest = { requestId: parsed.requestId, action: parsed.action, input }
     const job = queue.enqueue({ requestId: actionRequest.requestId, action: actionRequest.action, input })
     return reply.code(202).send(data(job))
@@ -425,7 +583,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
 
   app.addHook('onClose', async () => {
-    events.close()
     await controlUpdates.close()
     await queue.shutdown()
     await runtime.close()
@@ -436,6 +593,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
 
   app.addHook('preClose', async () => {
+    // HTTP shutdown waits for open responses; end SSE before that wait begins.
+    events.close()
+    await steamAuth.close()
     runtime.stop()
     playerHistory.stop()
     for (const controller of activeUploads.values()) controller.abort(new Error('控制服务正在关闭。'))
@@ -496,6 +656,10 @@ function isLoopbackAddress(address: string): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
 }
 
+function assertSteamTransport(request: FastifyRequest): void {
+  if (!isSecure(request) && !isLoopbackAddress(request.ip)) throw new ApiError(403, 'https_required', '输入 Steam 凭据需要 HTTPS 或服务器本机访问。')
+}
+
 function isSecure(request: FastifyRequest): boolean {
   return request.protocol === 'https'
 }
@@ -508,9 +672,16 @@ function cookieOptions(request: FastifyRequest) {
 }
 
 function gameErrorStatus(code: string): number {
+  if (code === 'LOG_UNAVAILABLE') return 503
+  if (['RESTORE_STATE_UNKNOWN', 'RESTORE_STORAGE_UNAVAILABLE', 'BACKUP_STORAGE_UNAVAILABLE'].includes(code)) return 503
+  if (['BACKUP_MANIFEST_INVALID', 'BACKUP_VERIFICATION_FAILED', 'RESTORE_STARTUP_INVALID'].includes(code)) return 409
+  if (code === 'BACKUP_EXPORT_SPACE') return 507
+  if (code === 'BACKUP_EXPORT_STORAGE') return 503
+  if (code === 'STEAM_BUSY' || code.startsWith('SETUP_') || code === 'STEAM_AUTH_REQUIRED' || code === 'STEAM_ACCOUNT_REQUIRED') return 409
   if (['MOD_SIDE_BUILTIN', 'MOD_SIDE_UNCONFIRMED', 'MOD_SIDE_LIMIT_EXCEEDED'].includes(code)) return 409
   if (code === 'VERSION_LOCK_CONFLICT') return 409
   if (code === 'SETTINGS_HISTORY_NOT_FOUND') return 404
+  if (['SETTINGS_ROLLBACK_CHANGED', 'SETTINGS_ROLLBACK_UNAVAILABLE', 'SETTINGS_PREVIEW_INVALID'].includes(code)) return 409
   if (['MOD_NOT_FOUND', 'MOD_REMOVAL_HISTORY_NOT_FOUND'].includes(code)) return 404
   if (['MOD_VERSION_CHANGED', 'MOD_DEPENDENCY_ACTIVE', 'MOD_DEPENDENCY_MISSING', 'MOD_REMOVAL_DESTINATION_EXISTS', 'MOD_REMOVAL_PATH_INVALID', 'MOD_REMOVAL_LIMIT_EXCEEDED', 'MOD_CHANGED'].includes(code)) return 409
   if (['MOD_CONFIG_NOT_FOUND', 'MOD_CONFIG_HISTORY_NOT_FOUND'].includes(code)) return 404
@@ -532,25 +703,50 @@ async function sendDownload(
 ) {
   assertNoQuery(request)
   if (!adapter.download) throw new ApiError(404, 'download_not_available', '当前下载不可用。')
-  const download = await adapter.download(kind, id)
-  if (!existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
-  const name = basename(download.fileName)
-  const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
-  reply.type(download.contentType)
-  reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
-  return reply.send(createReadStream(download.path))
+  const abort = new AbortController()
+  const onClose = () => { if (!reply.raw.writableFinished) abort.abort() }
+  reply.raw.once('close', onClose)
+  if (reply.raw.destroyed) onClose()
+  let stream: Readable | undefined
+  try {
+    const download = await adapter.download(kind, id, abort.signal)
+    stream = download.stream
+    abort.signal.throwIfAborted()
+    if (!download.stream && !download.verifiedBytes && !existsSync(download.path)) throw new ApiError(404, 'download_not_found', '下载文件不存在。')
+    const name = basename(download.fileName)
+    const fallback = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_')
+    reply.type(download.contentType)
+    reply.header('content-disposition', `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(name)}`)
+    if (download.stream) {
+      if (download.length !== undefined) reply.header('content-length', download.length)
+      return await reply.send(download.stream)
+    }
+    return await reply.send(download.verifiedBytes ?? createReadStream(download.path))
+  } finally {
+    stream?.destroy()
+    reply.raw.off('close', onClose)
+  }
 }
 
 const MAX_LOG_DOWNLOAD_BYTES = 16 * 1024 * 1024
 
 async function sendLogDownload(logPath: string, request: FastifyRequest, reply: FastifyReply) {
   assertNoQuery(request)
-  const stat = await lstat(logPath).catch(() => null)
-  if (!stat?.isFile() || stat.isSymbolicLink()) throw new ApiError(404, 'log_not_found', '服务器日志文件不存在。')
-  const start = Math.max(0, stat.size - MAX_LOG_DOWNLOAD_BYTES)
+  const log = await openGameLog(logPath)
+  if (!log) throw new ApiError(404, 'log_not_found', '服务器日志文件不存在。')
+  const size = Number(log.stat.size)
+  const start = Math.max(0, size - MAX_LOG_DOWNLOAD_BYTES)
   const name = basename(logPath).replace(/[^A-Za-z0-9._-]/g, '_') || 'server.log'
   reply.type('text/plain; charset=utf-8')
   reply.header('content-disposition', `attachment; filename="${name}"`)
   reply.header('x-log-truncated', start > 0 ? 'true' : 'false')
-  return reply.send(createReadStream(logPath, stat.size === 0 ? undefined : { start, end: stat.size - 1 }))
+  if (!size) {
+    await log.handle.close()
+    return reply.send(Buffer.alloc(0))
+  }
+  const source = log.handle.createReadStream({ start, end: size - 1 })
+  const output = Readable.from(redactGameLogDownload(source, start > 0))
+  source.on('error', error => output.destroy(error))
+  output.once('close', () => source.destroy())
+  return reply.send(output)
 }

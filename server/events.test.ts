@@ -13,6 +13,24 @@ const overview: Overview = {
 }
 
 describe('authenticated server-sent events', () => {
+  it('does not reopen a stream after shutdown while a final sample is pending', async () => {
+    let finish!: (value: Overview) => void
+    const adapter = { overview: () => new Promise<Overview>(resolve => { finish = resolve }) } as GameAdapter
+    const hub = new EventHub(adapter)
+    const response = new PassThrough()
+    response.resume()
+    hub.subscribe(response as unknown as ServerResponse, 'session-a')
+    hub.close()
+    finish(overview)
+    await Promise.resolve()
+    expect(response.writableEnded).toBe(true)
+    expect(hub.hasCapacity).toBe(false)
+    const late = new PassThrough()
+    expect(() => hub.subscribe(late as unknown as ServerResponse, 'session-a')).toThrow()
+    expect(late.writableLength).toBe(0)
+    late.destroy()
+  })
+
   it('closes streams immediately when their session is invalidated', async () => {
     const adapter = { overview: async () => overview } as GameAdapter
     const hub = new EventHub(adapter, () => true, { pollIntervalMs: 10 })

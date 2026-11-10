@@ -1,11 +1,19 @@
 import type { Action, Job, JobState, ServerState } from '../../shared/contracts'
 
 export const actionLabels: Record<Action, string> = {
+  'prepare-steamcmd': '准备 SteamCMD',
+  'install-server': '首次安装服务器',
+  'prepare-first-world': '重新准备首次建图',
+  'prepare-existing-server': '预览已有服务器接入',
+  'adopt-existing-server': '接入已有服务器',
   start: '启动服务器',
   save: '保存游戏',
   stop: '停止服务器',
   restart: '重新启动',
+  'load-save': '加载存档',
   backup: '创建备份',
+  'verify-backup': '校验备份',
+  'set-backup-retained': '更改备份保留状态',
   restore: '恢复备份',
   'import-backup': '导入备份',
   'install-update': '安装更新',
@@ -30,6 +38,19 @@ export const jobStateLabels: Record<JobState, string> = {
   succeeded: '已完成',
   failed: '未完成',
   interrupted: '已中断',
+  cancelled: '已取消',
+}
+
+const backupReasonLabels: Record<string, string> = {
+  manual: '手动备份', imported: '导入备份', 'automatic-scheduled': '定时备份',
+  'automatic-before-load-save': '切换存档前', 'automatic-before-restore': '恢复存档前',
+  'automatic-before-update': '安装更新前', 'automatic-before-update-rollback': '回滚更新前',
+  'automatic-before-mod-toggle': '更改模组状态前', 'automatic-before-mod-install': '安装模组前',
+  'automatic-before-mod-removal': '移除模组前', 'automatic-before-mod-restore': '恢复模组前',
+  'automatic-before-mod-config-write': '修改模组配置前', 'automatic-before-mod-config-rollback': '恢复模组配置前',
+}
+export function formatBackupReason(reason: string) {
+  return Object.hasOwn(backupReasonLabels, reason) ? backupReasonLabels[reason] : reason
 }
 
 export const serverStateLabels: Record<ServerState, string> = {
@@ -89,12 +110,20 @@ export function formatJobResult(job: Job): string | null {
   if (job.state !== 'succeeded' || !job.result) return null
   const text = (key: string) => typeof job.result?.[key] === 'string' ? String(job.result[key]) : null
   switch (job.action) {
+    case 'prepare-steamcmd': return 'SteamCMD 已就绪，可继续授权'
+    case 'install-server': return '服务器安装完成，等待手动首次启动'
+    case 'prepare-first-world': return '首次建图已准备，请前往概览手动启动'
+    case 'prepare-existing-server': return '接入预览已生成，可在安装与授权页核对'
+    case 'adopt-existing-server': return '已有服务器已接入，可前往概览手动启动'
     case 'start': return '服务器已启动'
+    case 'load-save': return text('saveName') ? `已从存档 ${text('saveName')} 启动服务器` : '已加载所选存档'
     case 'stop': return '服务器已安全停止'
     case 'restart': return '服务器已重新启动'
     case 'kick-player': return '玩家已离线，游戏已完成连接清理'
     case 'save': return text('saveName') ? `存档 ${text('saveName')} 已保存` : '游戏已保存'
     case 'backup': return text('saveName') ? `${text('saveName')} 已完整备份` : '备份已创建'
+    case 'set-backup-retained': return job.result.retained === true ? '备份已保留，自动轮换会跳过此副本' : '已取消保留，此备份以后可能随轮换清理'
+    case 'verify-backup': return text('saveName') ? `${text('saveName')} 备份完整性校验通过` : '备份完整性校验通过'
     case 'restore': return text('saveName') ? `${text('saveName')} 已恢复` : '备份已恢复'
     case 'import-backup': return text('saveName') ? `${text('saveName')} 已导入，可在存档页面恢复` : '备份已导入，可在存档页面恢复'
     case 'install-update': return text('version') ? `已更新至 ${text('version')}` : '更新已安装'

@@ -1,7 +1,9 @@
 param([Parameter(Mandatory = $true)][string]$ArgumentsPath)
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'path-policy.ps1')
+. (Join-Path $PSScriptRoot 'game-task.ps1')
 $argsObject = Get-Content -LiteralPath $ArgumentsPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$checkRecovery = $argsObject.checkRecoveryStart -eq $true
 if ($null -eq $argsObject.gameRoot -or [string]::IsNullOrWhiteSpace([string]$argsObject.gameRoot)) { throw 'gameRoot is required.' }
 $gameRoot = [IO.Path]::GetFullPath([string]$argsObject.gameRoot)
 $gameExe = [IO.Path]::GetFullPath((Join-Path $gameRoot 'DSPGAME.exe'))
@@ -19,15 +21,22 @@ $logFile = Get-FullPathOrNull $argsObject.logFile
 
 $matchingProcesses = @(
   Get-CimInstance Win32_Process -Filter "Name = 'DSPGAME.exe'" | Where-Object {
-    if ($null -eq $_.ExecutablePath) { return $false }
+    if ([string]::IsNullOrWhiteSpace([string]$_.ExecutablePath)) {
+      if ($argsObject.requireProcessIdentity) { throw 'Cannot identify a DSPGAME.exe process for restore.' }
+      return $false
+    }
     try { return (ConvertTo-DysonCanonicalPath ([string]$_.ExecutablePath)).Equals($canonicalGameExe, [StringComparison]::OrdinalIgnoreCase) }
-    catch { return $false }
+    catch {
+      if ($argsObject.requireProcessIdentity) { throw 'Cannot identify a DSPGAME.exe process for restore.' }
+      return $false
+    }
   }
 )
 if ($matchingProcesses.Count -gt 1) {
   throw "Multiple DSPGAME.exe processes match the configured game root; the managed instance is ambiguous."
 }
 $process = $matchingProcesses | Select-Object -First 1
+if ($checkRecovery -and $null -ne $process) { [ordered]@{ state = 'game-present' } | ConvertTo-Json -Compress; return }
 
 $processResult = $null
 if ($null -ne $process) {
@@ -51,37 +60,32 @@ $processSampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 # Host-wide traffic counters. Restricting the set to active physical adapters avoids
 # double-counting Hyper-V/tunnel interfaces; these counters are not process-specific.
 $networkResult = $null
-try {
-  $networkAdapters = @(
-    Get-NetAdapter -Name '*' -Physical -ErrorAction Stop |
-      Where-Object { [string]$_.Status -eq 'Up' } |
-      Sort-Object @{ Expression = { [string]$_.InterfaceGuid } }
-  )
-  $networkCounters = @()
-  foreach ($adapter in $networkAdapters) {
-    $adapterId = ([Guid]$adapter.InterfaceGuid).ToString('D').ToLowerInvariant()
-    $statistics = Get-NetAdapterStatistics -Name ([string]$adapter.Name) -ErrorAction Stop
-    $networkCounters += [ordered]@{
-      id = $adapterId
-      receivedBytes = ([UInt64]$statistics.ReceivedBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
-      sentBytes = ([UInt64]$statistics.SentBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+if (-not $checkRecovery) {
+  try {
+    $networkAdapters = @(
+      Get-NetAdapter -Name '*' -Physical -ErrorAction Stop |
+        Where-Object { [string]$_.Status -eq 'Up' } |
+        Sort-Object @{ Expression = { [string]$_.InterfaceGuid } }
+    )
+    $networkCounters = @()
+    foreach ($adapter in $networkAdapters) {
+      $adapterId = ([Guid]$adapter.InterfaceGuid).ToString('D').ToLowerInvariant()
+      $statistics = Get-NetAdapterStatistics -Name ([string]$adapter.Name) -ErrorAction Stop
+      $networkCounters += [ordered]@{
+        id = $adapterId
+        receivedBytes = ([UInt64]$statistics.ReceivedBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+        sentBytes = ([UInt64]$statistics.SentBytes).ToString([Globalization.CultureInfo]::InvariantCulture)
+      }
     }
+    $networkResult = [ordered]@{
+      sampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+      adapters = @($networkCounters)
+    }
+  } catch {
+    # Network telemetry is optional. Process and lifecycle inspection must remain available
+    # on hosts without the NetAdapter module or when a physical adapter disappears mid-read.
+    $networkResult = $null
   }
-  $networkResult = [ordered]@{
-    sampledAtUnixMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    adapters = @($networkCounters)
-  }
-} catch {
-  # Network telemetry is optional. Process and lifecycle inspection must remain available
-  # on hosts without the NetAdapter module or when a physical adapter disappears mid-read.
-  $networkResult = $null
-}
-
-function Get-ExactTask([object]$NameValue) {
-  if ($null -eq $NameValue) { return $null }
-  $name = [string]$NameValue
-  if ([string]::IsNullOrWhiteSpace($name) -or $name.Length -gt 240 -or $name -match '[*?\[\]]') { return $null }
-  return Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Where-Object { $_.TaskName -ceq $name } | Select-Object -First 1
 }
 
 function Get-ActionOption([object]$Action, [string]$Name) {
@@ -158,7 +162,38 @@ function Test-ManagedStartArguments([object]$Action) {
   )
 }
 
-$startTask = Get-ExactTask $argsObject.startTaskName
+function Get-RecoveryStartState([object]$Task, [bool]$Managed) {
+  if (-not $Managed -or $Task.Description -cne 'DYSON_CONTROL_MANAGED_GAME_START_V1' -or
+      $Task.State -ne 'Ready' -or $Task.Settings.Enabled -ne $true -or @($Task.Triggers | Where-Object { $null -ne $_ }).Count -ne 0 -or
+      $Task.Principal.LogonType -ne 'Interactive' -or $Task.Principal.RunLevel -ne 'Limited') { return 'task-unavailable' }
+  try {
+    $principal = [string]$Task.Principal.UserId
+    if ([string]::IsNullOrWhiteSpace($principal)) { return 'task-unavailable' }
+    $sid = if ($principal -match '^S-1-') { [Security.Principal.SecurityIdentifier]::new($principal) }
+           else { [Security.Principal.NTAccount]::new($principal).Translate([Security.Principal.SecurityIdentifier]) }
+    $account = @(Get-CimInstance -ClassName Win32_UserAccount -Filter "LocalAccount = TRUE AND SID = '$($sid.Value)'" -ErrorAction Stop)
+    if ($account.Count -ne 1 -or $account[0].SID -cne $sid.Value -or $account[0].LocalAccount -ne $true -or $account[0].Disabled -ne $false) { return 'task-unavailable' }
+    $sessions = @{}; $otherUser = $false; $unknownOwner = $false
+    foreach ($steam in @(Get-CimInstance Win32_Process -Filter "Name = 'steam.exe'" -ErrorAction Stop)) {
+      if ($null -eq $steam.SessionId) { $unknownOwner = $true; continue }
+      if ([int]$steam.SessionId -le 0) { continue }
+      $owner = Invoke-CimMethod -InputObject $steam -MethodName GetOwnerSid -ErrorAction Stop
+      if ($owner.ReturnValue -ne 0 -or [string]::IsNullOrWhiteSpace([string]$owner.Sid)) { $unknownOwner = $true; continue }
+      if ([Security.Principal.SecurityIdentifier]::new([string]$owner.Sid).Value -ceq $sid.Value) { $sessions[[int]$steam.SessionId] = $true }
+      else { $otherUser = $true }
+    }
+    if ($sessions.Count -gt 1) { return 'session-ambiguous' }
+    if ($unknownOwner) { return 'unknown' }
+    if ($sessions.Count -eq 1) { return 'ready' }
+    if ($otherUser) { return 'steam-other-user' }
+    return 'steam-missing'
+  } catch { return 'unknown' }
+}
+
+$selection = Get-DysonGameTaskSelection $argsObject.startTaskName
+$startTask = $selection.task
+if ($checkRecovery -and $selection.state -ceq 'unavailable') { [ordered]@{ state = 'unknown' } | ConvertTo-Json -Compress; return }
+if ($checkRecovery -and ($null -eq $startTask -or $startTask.TaskPath -cne '\')) { [ordered]@{ state = 'task-unavailable' } | ConvertTo-Json -Compress; return }
 $startManaged = $false
 $configuredTargetUps = $null
 if ($null -ne $startTask -and @($startTask.Actions).Count -eq 1) {
@@ -176,6 +211,8 @@ if ($null -ne $startTask -and @($startTask.Actions).Count -eq 1 -and $null -ne $
   )
 }
 
+if ($checkRecovery) { [ordered]@{ state = Get-RecoveryStartState $startTask $startManaged } | ConvertTo-Json -Compress; return }
+
 $result = [ordered]@{
   process = $processResult
   # DSPGAME.exe reports Unity's product version, while DLL assembly versions do not
@@ -188,6 +225,7 @@ $result = [ordered]@{
   }
   tasks = [ordered]@{
     start = $null -ne $startTask
+    startIssue = $selection.message
     startManaged = $startManaged
     configuredTargetUps = $configuredTargetUps
   }

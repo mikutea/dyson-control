@@ -1,0 +1,17 @@
+.dialog-detailed { width: min(34rem, 100%); max-height: calc(100dvh - 2rem); overflow-y: auto; }
+.restore-preview { margin: 0 0 1rem; text-align: left; }
+.restore-members { margin: 0; padding: 0 .8rem; list-style: none; border: 1px solid var(--line); border-radius: .6rem; }
+.restore-members li { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: .75rem; padding: .55rem 0; font-size: .78rem; }
+.restore-members li + li { border-top: 1px solid var(--line); }
+.restore-members li span, .restore-effects dd { overflow-wrap: anywhere; }
+.restore-members li strong { color: var(--muted); font-size: .69rem; }
+.restore-members .restore-member-remove { color: var(--red); }
+.restore-members .restore-member-replace { color: var(--amber); }
+.restore-members .restore-member-create { color: var(--green); }
+.restore-effects { display: grid; gap: .55rem; margin: .85rem 0; font-size: .76rem; line-height: 1.55; }
+.restore-effects div { display: grid; grid-template-columns: 4.3rem minmax(0, 1fr); gap: .5rem; }
+.restore-effects dt { color: var(--quiet); }
+.restore-effects dd { margin: 0; }
+.restore-effects dd span { display: block; }
+.restore-blockers { margin: .8rem 0; padding: .6rem .8rem .6rem 1.7rem; border: 1px solid var(--line); border-radius: .5rem; color: var(--amber); font-size: .75rem; }
+.dialog .restore-wait { margin: .5rem 0; color: var(--amber); }

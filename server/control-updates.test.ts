@@ -33,7 +33,7 @@ function config(root: string, mode: 'demo' | 'windows' = 'demo'): ControlConfig 
   }
 }
 
-function panelArchive(version: string): Buffer {
+function panelArchive(version: string, omitFile?: string): Buffer {
   const files: Array<{ name: string; data: string }> = [
     { name: 'package.json', data: JSON.stringify({ name: 'dyson-control', version }) },
     { name: 'package-lock.json', data: JSON.stringify({ name: 'dyson-control', version, lockfileVersion: 3, packages: { '': { name: 'dyson-control', version } } }) },
@@ -41,11 +41,11 @@ function panelArchive(version: string): Buffer {
     { name: 'README.md', data: '# fixture' }, { name: 'GOAL.md', data: '# fixture' },
     { name: 'dist/server/index.js', data: 'export {}' }, { name: 'dist/shared/contracts.js', data: 'export {}' },
     { name: 'dist/web/index.html', data: '<!doctype html>' },
-    ...['install-control.ps1', 'upgrade-control.ps1', 'uninstall-control.ps1', 'configure-game.ps1', 'control-update-helper.ps1']
+    ...['install-control.ps1', 'upgrade-control.ps1', 'uninstall-control.ps1', 'configure-game.ps1', 'control-update-helper.ps1', 'atomic-json.ps1']
       .map(name => ({ name: `scripts/windows/${name}`, data: '# fixture' })),
     { name: 'release-manifest.json', data: JSON.stringify({ schema: 1, product: 'dyson-control', packageVersion: version, kind: 'panel-only', bridge: null }) },
   ]
-  return buildStoredZip(files)
+  return buildStoredZip(files.filter(file => file.name !== omitFile))
 }
 
 function releaseFetch(version: string, archive = panelArchive(version), checksum = createHash('sha256').update(archive).digest('hex')): typeof fetch {
@@ -84,6 +84,12 @@ async function waitForTerminal(manager: ControlUpdateManager, id: string): Promi
   throw new Error('operation did not settle')
 }
 
+async function waitForReady(manager: ControlUpdateManager, id: string): Promise<ControlUpdateOperation> {
+  const operation = await waitForTerminal(manager, id)
+  expect(operation.state, operation.message).toBe('ready')
+  return operation
+}
+
 async function installedLayout(root: string, version: string, taskName = 'Dyson-Control-Fixture'): Promise<{ installRoot: string; versionRoot: string }> {
   const installRoot = path.join(root, 'installed')
   const versionRoot = path.join(installRoot, 'versions', version)
@@ -99,6 +105,17 @@ async function installedLayout(root: string, version: string, taskName = 'Dyson-
 }
 
 describe('control update discovery and preparation', () => {
+  it('rejects a release missing the shared status writer before it becomes ready to install', async () => {
+    const root = await fixtureRoot()
+    const fetch = releaseFetch('0.2.0', panelArchive('0.2.0', 'scripts/windows/atomic-json.ps1'))
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'missing-status-writer', expectedVersion: '0.2.0' })
+      expect(await waitForTerminal(manager, started.operation.id)).toMatchObject({ state: 'failed' })
+    } finally { await manager.close() }
+  })
+
   it('does not invent a latest version when no source is configured', async () => {
     const root = await fixtureRoot()
     const withoutSource = { ...config(root), controlUpdates: undefined }
@@ -137,13 +154,121 @@ describe('control update discovery and preparation', () => {
     await manager.close()
   })
 
+  it('recovers a lost receipt after reopening without preparing again or exposing its hash', async () => {
+    const root = await fixtureRoot()
+    const fetch = releaseFetch('0.2.0')
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    const started = await manager.prepare({ requestId: 'lost-receipt', expectedVersion: '0.2.0' })
+    const ready = await waitForReady(manager, started.operation.id)
+    await manager.close()
+    const reopened = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await reopened.initialize()
+    try {
+      const requests = vi.mocked(fetch).mock.calls.length
+      const recovered = await reopened.recoverReceipt(ready.id)
+      expect(recovered.operation).toEqual(ready)
+      expect(recovered.receiptToken).not.toBe(started.receiptToken)
+      await expect(reopened.readWithReceipt(ready.id, started.receiptToken!)).rejects.toMatchObject({ code: 'RECEIPT_INVALID' })
+      await expect(reopened.readWithReceipt(ready.id, recovered.receiptToken)).resolves.toEqual(ready)
+      await expect(reopened.recoverReceipt(ready.id, recovered.receiptToken)).resolves.toEqual(recovered)
+      // A lost recovery response can be retried; only the newest read-only token is retained.
+      const retry = await reopened.recoverReceipt(ready.id)
+      await expect(reopened.readWithReceipt(ready.id, retry.receiptToken)).resolves.toEqual(ready)
+      expect(await reopened.history()).toEqual([ready])
+      expect(vi.mocked(fetch).mock.calls).toHaveLength(requests)
+      const stored = await fs.readFile(path.join(root, 'data/control-updates/operations', ready.id, 'operation.json'), 'utf8')
+      expect(stored).not.toContain(retry.receiptToken)
+      expect(stored).toContain(createHash('sha256').update(retry.receiptToken).digest('hex'))
+      expect(JSON.stringify(await reopened.history())).not.toContain('receiptHash')
+    } finally { await reopened.close() }
+  })
+
+  it('does not extend candidate or terminal retention when recovering or clearing a receipt', async () => {
+    const root = await fixtureRoot()
+    let now = Date.parse('2026-11-10T00:00:00.000Z')
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0'), clock: () => now })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'receipt-retention', expectedVersion: '0.2.0' })
+      const ready = await waitForReady(manager, started.operation.id)
+      now += 23 * 60 * 60 * 1000
+      const recovered = await manager.recoverReceipt(ready.id)
+      expect(recovered.operation).toEqual(ready)
+      await manager.acknowledgeReceipt(ready.id, recovered.receiptToken)
+      expect(await manager.read(ready.id)).toEqual(ready)
+      now += 60 * 60 * 1000 + 1
+      const expired = await manager.read(ready.id)
+      expect(expired).toMatchObject({ state: 'failed', message: expect.stringContaining('24 小时') })
+      const terminal = await manager.recoverReceipt(ready.id)
+      now += 23 * 60 * 60 * 1000
+      const finalReceipt = await manager.recoverReceipt(ready.id)
+      now += 60 * 60 * 1000 + 1
+      await expect(manager.recoverReceipt(ready.id)).rejects.toMatchObject({ code: 'UPDATE_RECEIPT_EXPIRED' })
+      await expect(manager.readWithReceipt(ready.id, terminal.receiptToken)).rejects.toMatchObject({ code: 'RECEIPT_INVALID' })
+      await expect(manager.readWithReceipt(ready.id, finalReceipt.receiptToken)).rejects.toMatchObject({ code: 'RECEIPT_EXPIRED' })
+      expect(await manager.read(ready.id)).toEqual(expired)
+    } finally { await manager.close() }
+  })
+
+  it('waits for preparation to finish before replacing its receipt', async () => {
+    const root = await fixtureRoot()
+    const base = releaseFetch('0.2.0')
+    let releaseDownload!: () => void
+    const held = new Promise<void>(resolve => { releaseDownload = resolve })
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('.zip')) await held
+      return base(input, init)
+    }) as unknown as typeof globalThis.fetch
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'preparing-receipt', expectedVersion: '0.2.0' })
+      await expect(manager.recoverReceipt(started.operation.id)).rejects.toMatchObject({ code: 'UPDATE_CONFLICT' })
+      releaseDownload()
+      await waitForReady(manager, started.operation.id)
+      await expect(manager.readWithReceipt(started.operation.id, started.receiptToken!)).resolves.toMatchObject({ state: 'ready' })
+      const recovered = await manager.recoverReceipt(started.operation.id)
+      await expect(manager.readWithReceipt(started.operation.id, recovered.receiptToken)).resolves.toMatchObject({ state: 'ready' })
+    } finally { releaseDownload(); await manager.close() }
+  })
+
+  it.each([['ENOSPC', '磁盘空间不足'], ['EPERM', '目录权限与文件占用']])(
+    'explains %s during preparation without exposing private filesystem details', async (code, message) => {
+      const root = await fixtureRoot()
+      const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+      await manager.initialize()
+      const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+      const writeFile = fs.writeFile.bind(fs)
+      const spy = vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+        if (String(args[0]).endsWith('-windows-panel-only.zip')) {
+          throw Object.assign(new Error('private deployment filesystem detail'), { code })
+        }
+        return writeFile(...args)
+      })
+      try {
+        const started = await manager.prepare({ requestId: `io-failure-${code}`, expectedVersion: '0.2.0' })
+        const operation = await waitForTerminal(manager, started.operation.id)
+        expect(operation).toMatchObject({ state: 'failed', message: expect.stringContaining(message) })
+        expect(operation.message).not.toContain('private deployment filesystem detail')
+        expect(diagnostic).toHaveBeenCalledWith('Control update preparation failed.', expect.objectContaining({ code }))
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain(root)
+        expect(JSON.stringify(diagnostic.mock.calls)).not.toContain('private deployment filesystem detail')
+      } finally {
+        spy.mockRestore()
+        diagnostic.mockRestore()
+        await manager.close()
+      }
+    },
+  )
+
   it('expires an unapplied ready candidate after 24 hours and removes staged files', async () => {
     const root = await fixtureRoot()
     let now = Date.parse('2026-10-17T00:00:00.000Z')
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0'), clock: () => now })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'expire-ready', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     now += 24 * 60 * 60 * 1000 + 1
     await expect(manager.read(started.operation.id)).resolves.toMatchObject({ state: 'failed', message: expect.stringContaining('24 小时') })
     await expect(fs.stat(path.join(root, 'data', 'control-updates', 'operations', started.operation.id, 'source'))).rejects.toMatchObject({ code: 'ENOENT' })
@@ -184,12 +309,77 @@ describe('control update discovery and preparation', () => {
 })
 
 describe('control update application evidence', () => {
+  it('keeps the last receipt readable until a temporarily occupied update receipt can be replaced', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    const rename = fs.rename.bind(fs)
+    const held: string[] = []
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (String(to).endsWith('operation.json') && held.length < 5 &&
+        JSON.parse(await fs.readFile(from, 'utf8')).step === 'verifying') {
+        expect(JSON.parse(await fs.readFile(to, 'utf8')).step).toBe('downloading')
+        held.push(String(from))
+        throw Object.assign(new Error('fixture sharing violation'), { code: 'EPERM', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'transient-receipt-lock', expectedVersion: '0.2.0' })
+      const ready = await waitForReady(manager, prepared.operation.id)
+      expect(ready.sha256).toMatch(/^[a-f0-9]{64}$/)
+      expect(held).toHaveLength(5)
+      expect(new Set(held).size).toBe(1)
+      expect(await fs.readdir(path.dirname(held[0]))).not.toContain(path.basename(held[0]))
+    } finally {
+      spy.mockRestore()
+      await manager.close()
+    }
+  })
+
+  it('reports a failed preparation when even its failure receipt cannot yet be written', async () => {
+    const root = await fixtureRoot()
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
+    await manager.initialize()
+    let deny = true
+    let attemptedFailure!: () => void
+    const failureWrite = new Promise<void>(resolve => { attemptedFailure = resolve })
+    const rename = fs.rename.bind(fs)
+    const diagnostic = vi.spyOn(console, 'error').mockImplementation(() => undefined)
+    const spy = vi.spyOn(fs, 'rename').mockImplementation(async (from, to) => {
+      if (deny && String(to).endsWith('operation.json')) {
+        const record = JSON.parse(await fs.readFile(from, 'utf8'))
+        if (record.state === 'failed') attemptedFailure()
+        if (record.step !== 'downloading') throw Object.assign(new Error('fixture denied write'), { code: 'EACCES', syscall: 'rename' })
+      }
+      await rename(from, to)
+    })
+    try {
+      const prepared = await manager.prepare({ requestId: 'held-failure-receipt', expectedVersion: '0.2.0' })
+      await failureWrite
+      // Closing drains the preparation, including cleanup, before we inspect the receipt.
+      await manager.close()
+      await expect(manager.read(prepared.operation.id)).rejects.toMatchObject({ code: 'UPDATE_RECEIPT_UNAVAILABLE' })
+      deny = false
+      expect(await manager.read(prepared.operation.id)).toMatchObject({ state: 'failed', step: 'complete' })
+      const reopened = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0' })
+      await reopened.initialize()
+      expect(await reopened.read(prepared.operation.id)).toMatchObject({ state: 'failed' })
+      await reopened.close()
+    } finally {
+      deny = false
+      spy.mockRestore()
+      diagnostic.mockRestore()
+      await manager.close()
+    }
+  })
+
   it('rejects apply in source/demo mode after allowing preparation', async () => {
     const root = await fixtureRoot()
     const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0') })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-demo', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-demo' }))
       .rejects.toMatchObject({ code: 'UPDATE_EXECUTION_UNAVAILABLE' } satisfies Partial<ControlUpdateError>)
     await manager.close()
@@ -207,10 +397,13 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-real', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     const applied = await manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })
     expect(applied.operation.state).toBe('scheduled')
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })).resolves.toMatchObject({ operation: { id: started.operation.id, state: 'scheduled' } })
+    expect(schedules).toBe(2)
+    const recovered = await manager.recoverReceipt(started.operation.id)
+    expect(recovered.operation).toMatchObject({ state: 'scheduled', applyRequestId: 'apply-real' })
     expect(schedules).toBe(2)
     const handoff = JSON.parse(await fs.readFile(handoffPath, 'utf8')) as { statusPath: string; installRoot: string }
 
@@ -229,6 +422,7 @@ describe('control update application evidence', () => {
     })
     await restarted.initialize()
     await expect(restarted.read(started.operation.id)).resolves.toMatchObject({ state: 'succeeded', targetVersion: '0.2.0' })
+    await expect(restarted.readWithReceipt(started.operation.id, recovered.receiptToken)).resolves.toMatchObject({ state: 'succeeded' })
     await restarted.close()
   })
 
@@ -242,7 +436,7 @@ describe('control update application evidence', () => {
     })
     await manager.initialize()
     const started = await manager.prepare({ requestId: 'prepare-rollback', expectedVersion: '0.2.0' })
-    await waitForTerminal(manager, started.operation.id)
+    await waitForReady(manager, started.operation.id)
     await manager.apply({ operationId: started.operation.id, requestId: 'apply-rollback' })
     const handoff = JSON.parse(await fs.readFile(handoffPath, 'utf8')) as { statusPath: string; installRoot: string }
     await fs.writeFile(handoff.statusPath, JSON.stringify({

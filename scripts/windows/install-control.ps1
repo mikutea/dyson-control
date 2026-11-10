@@ -183,7 +183,7 @@ function Read-SourcePackage([string]$Root) {
     'package.json', 'package-lock.json', 'control.config.example.json', 'release-manifest.json', 'LICENSE',
     'dist\server\index.js', 'dist\server\admin.js', 'dist\shared\contracts.js', 'dist\web\index.html',
     'scripts\windows\install-control.ps1', 'scripts\windows\upgrade-control.ps1', 'scripts\windows\uninstall-control.ps1',
-    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1'
+    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1', 'scripts\windows\atomic-json.ps1'
   )) {
     [void](Get-ExistingFile (Join-Path $Root $relativePath) "Release file $relativePath")
   }
@@ -268,6 +268,8 @@ function Install-ProductionDependencies([string]$VersionRoot, [string]$NpmExecut
 }
 
 function Assert-RuntimeConfig([string]$VersionRoot, [string]$NodeExecutable, [string]$PrivateConfigPath) {
+  & $NodeExecutable (Join-Path $VersionRoot 'dist\server\admin.js') check-runtime
+  if ($LASTEXITCODE -ne 0) { throw 'The staged Windows runtime failed its SQLite and native console check.' }
   & $NodeExecutable (Join-Path $VersionRoot 'dist\server\admin.js') validate-config $PrivateConfigPath
   if ($LASTEXITCODE -ne 0) { throw "Dyson Control rejected the configuration at $PrivateConfigPath." }
 }

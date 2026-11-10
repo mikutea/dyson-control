@@ -4,6 +4,7 @@ import type { ModCatalogEntry } from '../../shared/contracts'
 import type { RunAction } from './App'
 import { Button, EmptyBlock, ErrorBlock, LoadingBlock } from './components'
 import { useResource } from './hooks'
+import { ModInstallPlan } from './ModInstallPlan'
 
 export function ModCatalog({ refreshToken, runAction }: { refreshToken: number; runAction: RunAction }) {
   const [text, setText] = useState('')
@@ -16,11 +17,12 @@ export function ModCatalog({ refreshToken, runAction }: { refreshToken: number; 
     </form>
     <p className="catalog-hint">从 Thunderstore 查找模组。安装时会一并处理依赖；多人兼容性请以模组作者说明为准。</p>
     {catalog.loading && !catalog.data ? <LoadingBlock rows={4} /> : catalog.error ? <ErrorBlock message={catalog.error} retry={catalog.reload} /> : !catalog.data?.length ? <EmptyBlock title="没有找到模组" description="试试其他名称或关键词" /> : <div className="catalog-list">{catalog.data.map((mod) => <article key={mod.package}>
-      <div className="catalog-copy"><h3>{mod.name}</h3><p>{mod.description}</p><small>{mod.owner} · {mod.latestVersion} · {mod.dependencies.length} 项依赖{mod.installedVersion ? ` · 已安装 ${mod.installedVersion}` : ''}</small></div>
+      <div className="catalog-copy"><h3>{mod.name}</h3><p>{mod.description}</p><small>{mod.owner} · {mod.latestVersion} · {mod.dependencies.length} 项直接依赖{mod.installedVersion ? ` · 已安装 ${mod.installedVersion}` : ''}</small>
+        <ModInstallPlan packageName={mod.package} version={mod.latestVersion} /></div>
       <div className="catalog-actions">
         {mod.packageUrl && <a href={mod.packageUrl} target="_blank" rel="noreferrer" className="button button-quiet">作者说明</a>}
         <Button icon={<CloudDownload />} disabled={mod.installedVersion === mod.latestVersion} onClick={() => runAction('install-mod', { package: mod.package, version: mod.latestVersion }, {
-          title: `安装 ${mod.name}？`, description: `将安装 ${mod.latestVersion} 和所需依赖。运行中的游戏会先保存并备份，再停服安装和重新启动。`, label: '安装模组', danger: true
+          title: `安装 ${mod.name}？`, description: `先下载并校验 ${mod.latestVersion} 及其依赖。通过后，运行中的游戏会保存、备份并停服安装，完成后重新启动。`, label: '安装模组', danger: true
         })}>{mod.installedVersion === mod.latestVersion ? '已安装' : mod.installedVersion ? '更新模组' : '安装'}</Button>
       </div>
     </article>)}</div>}

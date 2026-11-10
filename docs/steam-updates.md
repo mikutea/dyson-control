@@ -1,10 +1,10 @@
 # Steam game updates
 
-Dyson Control updates Dyson Sphere Program through Valve's official SteamCMD client and app id `1366540`. The backend uses the Steam `public` branch and an existing authorized SteamCMD session. It never accepts, stores, or passes a Steam password or Steam Guard code.
+Dyson Control updates Dyson Sphere Program through Valve's official SteamCMD client and app id `1366540`. The update backend uses the Steam `public` branch and an existing authorized SteamCMD session. Update jobs never accept or store a Steam password or Steam Guard code. The separate [installation and authorization flow](server-setup.md) sends transient credential input directly to SteamCMD.
 
 ## Prerequisites
 
-Install SteamCMD separately and complete its first interactive login outside Dyson Control. Valve documents that the first login may request the account password and Steam Guard code; later commands can use the cached session by supplying only the account name. Preserve SteamCMD's `config/config.vdf` session file and restrict access to the SteamCMD directory.
+Use “安装与授权” to prepare SteamCMD and complete its first login, or retain an existing authorized installation. Valve documents that the first login may request the account password and Steam Guard code; later commands can use the cached session by supplying only the account name. Preserve SteamCMD's `config/config.vdf` session file and restrict access to the SteamCMD directory.
 
 Configure:
 
@@ -52,7 +52,7 @@ Do not remove `steam-state.json`, `steam-update-*` history directories, their `s
 
 ## Authorization failures
 
-When SteamCMD requests a password or Steam Guard code, stop the control-plane operation. Log in interactively at the SteamCMD console on the server, confirm the session was saved, close that console, and retry from Dyson Control. Never paste the password or Guard code into Dyson Control configuration, logs, job input, or command arguments.
+When SteamCMD requests authorization, open “安装与授权” and complete the dedicated login prompts. The panel verifies the cached session using a read-only version query before reporting success. A server-side SteamCMD console remains an alternative; close it before retrying from the panel. Never paste the password or Guard code into configuration, logs, job input, command arguments, or chat.
 
 Valve references:
 

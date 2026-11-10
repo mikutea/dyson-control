@@ -1,10 +1,11 @@
-import { writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { lstat, writeFile } from 'node:fs/promises'
+import { spawnSync } from 'node:child_process'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import type { Readable, Writable } from 'node:stream'
 import type { ControlConfig } from '../shared/contracts.js'
 import { hashPassword } from './auth.js'
-import { loadConfig } from './config.js'
+import { controlConfigSchema, loadConfig } from './config.js'
 
 export async function runAdmin(
   args = process.argv.slice(2),
@@ -14,9 +15,44 @@ export async function runAdmin(
 ): Promise<void> {
   const [command, argument] = args
   const passwords = new PasswordReader(environment, input, output)
+  if (command === 'check-runtime') {
+    if (args.length !== 1) throw new Error('check-runtime 不接受其他参数。')
+    const checkFile = import.meta.url.endsWith('.ts') ? './runtime-check.ts' : './runtime-check.js'
+    const result = spawnSync(process.execPath, [fileURLToPath(new URL(checkFile, import.meta.url))], {
+      windowsHide: true, timeout: 20_000, encoding: 'utf8', maxBuffer: 4096,
+    })
+    if (result.error || result.status !== 0 || result.stdout.trim() !== 'DYSON_RUNTIME_OK') {
+      throw new Error('Windows 运行时自检失败。请使用 Windows 10 1809 / Server 2019 或更新版本、Node.js 24+，并重新安装锁定的生产依赖。当前安装尚未切换；不要手工复制其他 Node 版本的 node_modules。')
+    }
+    console.log('Windows runtime ready: SQLite and Steam authorization console.')
+    return
+  }
   if (command === 'hash-password') {
     const password = await passwords.read('Administrator password: ')
     console.log(await hashPassword(password))
+    return
+  }
+  if (command === 'init-windows') {
+    const { target, config } = windowsConfiguration(args.slice(1))
+    const existing = await lstat(target).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return null
+      throw error
+    })
+    if (existing) throw new Error('配置文件已存在；初始化不会覆盖已有配置。')
+    const parent = await lstat(dirname(target)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') throw new Error('请先创建私有配置目录，再运行初始化。')
+      throw error
+    })
+    if (!parent.isDirectory()) throw new Error('配置文件的父路径必须是目录。')
+    const password = await passwords.read('Administrator password: ')
+    const confirmation = await passwords.read('Confirm password: ')
+    if (password !== confirmation) throw new Error('两次输入的密码不一致。')
+    const validated = controlConfigSchema.parse({ ...config, adminPasswordHash: await hashPassword(password) })
+    await writeFile(target, `${JSON.stringify(validated, null, 2)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 })
+    console.log(`Created ${target}`)
+    console.log(`面板地址：http://127.0.0.1:${validated.port}`)
+    console.log(`游戏目录：${validated.game.root}`)
+    console.log('下一步：使用此配置运行 install-control.ps1，再打开“安装与授权”。')
     return
   }
   if (command === 'init-demo') {
@@ -52,9 +88,59 @@ export async function runAdmin(
     return
   }
   console.log('Usage:')
-  console.log('  npm run admin -- hash-password')
-  console.log('  npm run admin -- init-demo [config-path]')
-  console.log('  npm run admin -- validate-config [config-path]')
+  console.log('  node dist/server/admin.js check-runtime')
+  console.log('  node dist/server/admin.js hash-password')
+  console.log('  node dist/server/admin.js init-demo [config-path]')
+  console.log('  node dist/server/admin.js init-windows <config-path> --server-root <directory> [--address host:port] [--port 13020] [--name "Dyson Server"] [--updates-repository owner/repository]')
+  console.log('  node dist/server/admin.js validate-config [config-path]')
+}
+
+function windowsConfiguration(args: string[]): { target: string; config: Omit<ControlConfig, 'adminPasswordHash'> } {
+  const [configPath, ...options] = args
+  if (!configPath || !isAbsolute(configPath)) throw new Error('请指定配置文件的绝对路径。')
+  const flags = new Map<string, string>()
+  for (let index = 0; index < options.length; index += 2) {
+    const key = options[index]
+    const value = options[index + 1]
+    if (!['--server-root', '--address', '--port', '--name', '--updates-repository'].includes(key) || flags.has(key) || !value || value.startsWith('--')) {
+      throw new Error('初始化参数无效：支持 --server-root、--address、--port、--name 和 --updates-repository，每项只能指定一次。')
+    }
+    flags.set(key, value)
+  }
+  const serverRoot = flags.get('--server-root')
+  if (!serverRoot || !isAbsolute(serverRoot)) throw new Error('请用 --server-root 指定服务器存储目录的绝对路径。')
+  const portValue = flags.get('--port') ?? '13020'
+  if (!/^\d+$/.test(portValue) || Number(portValue) < 1 || Number(portValue) > 65_535) throw new Error('面板端口必须是 1 到 65535 之间的整数。')
+  const address = (flags.get('--address') ?? '127.0.0.1:8469').trim()
+  if (!address || address.length > 255 || /[\s\0]/u.test(address)) throw new Error('游戏地址不能为空或包含空白字符。')
+  const serverName = (flags.get('--name') ?? 'Dyson Server').trim()
+  if (!serverName || serverName.length > 80 || /[\r\n\0]/u.test(serverName)) throw new Error('服务器名称应为 1 到 80 个字符，且不能包含换行。')
+  const updatesRepository = flags.get('--updates-repository')
+  const controlUpdates = updatesRepository === undefined ? undefined : { repository: updatesRepository }
+  if (!controlConfigSchema.shape.controlUpdates.safeParse(controlUpdates).success) {
+    throw new Error('更新仓库必须使用 owner/repository 格式；请指定自己信任的公开发布仓库。')
+  }
+  const target = resolve(configPath)
+  const root = resolve(serverRoot)
+  const dataDirectory = join(dirname(target), 'data')
+  const game = {
+    root: join(root, 'game'), saveDirectory: join(root, 'userdata', 'Save'), backupDirectory: join(root, 'backups'),
+    logFile: join(root, 'game', 'BepInEx', 'LogOutput.log'), bridgeDirectory: join(root, 'bridge'),
+    bridgeSecretFile: join(root, 'private', 'bridge-secret'), startTaskName: 'Dyson-Game-Start', address, serverName,
+  }
+  const inside = (child: string, parent: string) => {
+    const suffix = relative(parent, child)
+    return suffix === '' || (!isAbsolute(suffix) && suffix !== '..' && !suffix.startsWith(`..${sep}`))
+  }
+  if (inside(target, dataDirectory)) throw new Error('配置文件不能占用面板数据目录。')
+  for (const directory of [game.root, game.saveDirectory, game.backupDirectory, game.bridgeDirectory]) {
+    if (inside(target, directory) || inside(dataDirectory, directory) || inside(directory, dataDirectory)) {
+      throw new Error('配置和面板数据目录不能与游戏、存档、备份或 Bridge 目录重叠。')
+    }
+  }
+  return { target, config: { host: '127.0.0.1', port: Number(portValue), dataDirectory, mode: 'windows', game,
+    ...(controlUpdates ? { controlUpdates } : {}),
+  } }
 }
 
 export class PasswordReader {
