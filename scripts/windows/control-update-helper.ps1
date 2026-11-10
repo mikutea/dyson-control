@@ -13,7 +13,6 @@ $ProgressPreference = 'SilentlyContinue'
 Set-StrictMode -Version 3
 $managedControlDescription = 'Dyson Control managed startup task.'
 $managedUpdatePrefix = 'Dyson Control one-shot control update '
-$utf8 = [Text.UTF8Encoding]::new($false)
 
 function Get-FullPath([string]$PathValue) {
   if ([string]::IsNullOrWhiteSpace($PathValue) -or -not [IO.Path]::IsPathRooted($PathValue) -or $PathValue -match '["\r\n\0]') {
@@ -62,12 +61,7 @@ function Test-PathInside([string]$Candidate, [string]$Parent) {
 }
 
 function Write-AtomicJson([string]$PathValue, [object]$Value) {
-  $temporary = "$PathValue.partial-$([guid]::NewGuid().ToString('N'))"
-  try {
-    [IO.File]::WriteAllText($temporary, (($Value | ConvertTo-Json -Depth 8) + [Environment]::NewLine), $utf8)
-    Move-Item -LiteralPath $temporary -Destination $PathValue -Force
-  }
-  finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+  Write-DysonAtomicJson $PathValue $Value 8
 }
 
 function Read-Operation([string]$PathValue) {
@@ -216,6 +210,7 @@ function Read-ExistingTerminalStatus([object]$Operation) {
 }
 
 $handoff = Read-Operation $OperationFile
+. (Join-Path $PSScriptRoot 'atomic-json.ps1')
 $operation = $handoff.Value
 $taskName = 'Dyson-Control-Update-' + ([string]$operation.operationId).Replace('-', '')
 $taskDescription = $managedUpdatePrefix + [string]$operation.operationId

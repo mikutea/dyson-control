@@ -176,7 +176,7 @@ function Read-SourcePackage([string]$Root) {
     'package.json', 'package-lock.json', 'control.config.example.json', 'release-manifest.json', 'LICENSE',
     'dist\server\index.js', 'dist\server\admin.js', 'dist\shared\contracts.js', 'dist\web\index.html',
     'scripts\windows\install-control.ps1', 'scripts\windows\upgrade-control.ps1', 'scripts\windows\uninstall-control.ps1',
-    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1'
+    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1', 'scripts\windows\atomic-json.ps1'
   )) {
     [void](Get-ExistingFile (Join-Path $Root $relativePath) "Release file $relativePath")
   }
@@ -461,9 +461,7 @@ function Wait-ControlIdle([string]$DataDirectory, [string]$NodeExecutable, [int]
 }
 
 function Write-InstallState([string]$Path, [object]$State) {
-  $temporary = "$Path.partial-$([guid]::NewGuid().ToString('N'))"
-  [IO.File]::WriteAllText($temporary, (($State | ConvertTo-Json -Depth 5) + [Environment]::NewLine), $utf8NoBom)
-  Move-Item -LiteralPath $temporary -Destination $Path -Force
+  Write-DysonAtomicJson $Path $State 5
 }
 
 function Initialize-UpdateStatusTarget([string]$PathValue, [string]$OperationId) {
@@ -494,21 +492,17 @@ function Write-ControlUpdateStatus(
   [string]$Message
 ) {
   if ($null -eq $Target) { return }
-  $temporary = "$($Target.Path).partial-$([guid]::NewGuid().ToString('N'))"
   $value = [ordered]@{
     schema = 1; product = 'dyson-control-control-update-result'; operationId = [string]$Target.OperationId;
     status = $Status; step = $Step; targetVersion = $TargetVersion; activeVersion = $ActiveVersion;
     installRoot = $InstallRootValue; previousProcessId = $PreviousProcessId; processId = $ProcessId;
     accepting = $Accepting; message = $Message; updatedAt = [DateTimeOffset]::UtcNow.ToString('o')
   }
-  try {
-    [IO.File]::WriteAllText($temporary, (($value | ConvertTo-Json -Depth 5) + [Environment]::NewLine), $utf8NoBom)
-    Move-Item -LiteralPath $temporary -Destination $Target.Path -Force
-  }
-  finally { Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue }
+  Write-DysonAtomicJson $Target.Path $value 5
 }
 
 Assert-TaskName $TaskName
+. (Join-Path $PSScriptRoot 'atomic-json.ps1')
 $updateStatusTarget = Initialize-UpdateStatusTarget $UpdateStatusPath $UpdateOperationId
 $sourceRoot = Get-ExistingDirectory $SourcePath 'SourcePath'
 $installRootPath = Get-ExistingDirectory $InstallRoot 'InstallRoot'

@@ -33,7 +33,7 @@ function config(root: string, mode: 'demo' | 'windows' = 'demo'): ControlConfig 
   }
 }
 
-function panelArchive(version: string): Buffer {
+function panelArchive(version: string, omitFile?: string): Buffer {
   const files: Array<{ name: string; data: string }> = [
     { name: 'package.json', data: JSON.stringify({ name: 'dyson-control', version }) },
     { name: 'package-lock.json', data: JSON.stringify({ name: 'dyson-control', version, lockfileVersion: 3, packages: { '': { name: 'dyson-control', version } } }) },
@@ -41,11 +41,11 @@ function panelArchive(version: string): Buffer {
     { name: 'README.md', data: '# fixture' }, { name: 'GOAL.md', data: '# fixture' },
     { name: 'dist/server/index.js', data: 'export {}' }, { name: 'dist/shared/contracts.js', data: 'export {}' },
     { name: 'dist/web/index.html', data: '<!doctype html>' },
-    ...['install-control.ps1', 'upgrade-control.ps1', 'uninstall-control.ps1', 'configure-game.ps1', 'control-update-helper.ps1']
+    ...['install-control.ps1', 'upgrade-control.ps1', 'uninstall-control.ps1', 'configure-game.ps1', 'control-update-helper.ps1', 'atomic-json.ps1']
       .map(name => ({ name: `scripts/windows/${name}`, data: '# fixture' })),
     { name: 'release-manifest.json', data: JSON.stringify({ schema: 1, product: 'dyson-control', packageVersion: version, kind: 'panel-only', bridge: null }) },
   ]
-  return buildStoredZip(files)
+  return buildStoredZip(files.filter(file => file.name !== omitFile))
 }
 
 function releaseFetch(version: string, archive = panelArchive(version), checksum = createHash('sha256').update(archive).digest('hex')): typeof fetch {
@@ -105,6 +105,17 @@ async function installedLayout(root: string, version: string, taskName = 'Dyson-
 }
 
 describe('control update discovery and preparation', () => {
+  it('rejects a release missing the shared status writer before it becomes ready to install', async () => {
+    const root = await fixtureRoot()
+    const fetch = releaseFetch('0.2.0', panelArchive('0.2.0', 'scripts/windows/atomic-json.ps1'))
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'missing-status-writer', expectedVersion: '0.2.0' })
+      expect(await waitForTerminal(manager, started.operation.id)).toMatchObject({ state: 'failed' })
+    } finally { await manager.close() }
+  })
+
   it('does not invent a latest version when no source is configured', async () => {
     const root = await fixtureRoot()
     const withoutSource = { ...config(root), controlUpdates: undefined }

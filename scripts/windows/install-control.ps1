@@ -183,7 +183,7 @@ function Read-SourcePackage([string]$Root) {
     'package.json', 'package-lock.json', 'control.config.example.json', 'release-manifest.json', 'LICENSE',
     'dist\server\index.js', 'dist\server\admin.js', 'dist\shared\contracts.js', 'dist\web\index.html',
     'scripts\windows\install-control.ps1', 'scripts\windows\upgrade-control.ps1', 'scripts\windows\uninstall-control.ps1',
-    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1'
+    'scripts\windows\configure-game.ps1', 'scripts\windows\remove-install-directory.ps1', 'scripts\windows\atomic-json.ps1'
   )) {
     [void](Get-ExistingFile (Join-Path $Root $relativePath) "Release file $relativePath")
   }

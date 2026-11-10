@@ -52,6 +52,7 @@ const requiredFiles = [
   'scripts/windows/configure-game.ps1',
   'scripts/windows/game-task.ps1',
   'scripts/windows/remove-install-directory.ps1',
+  'scripts/windows/atomic-json.ps1',
 ]
 for (const file of requiredFiles) await requirePlainFile(file)
 

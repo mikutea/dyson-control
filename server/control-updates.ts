@@ -641,7 +641,7 @@ async function validatePanelRelease(root: string, expectedVersion: string): Prom
   const requiredFiles = ['package.json', 'package-lock.json', 'control.config.example.json', 'LICENSE', 'README.md', 'GOAL.md',
     'dist/server/index.js', 'dist/shared/contracts.js', 'dist/web/index.html',
     'scripts/windows/install-control.ps1', 'scripts/windows/upgrade-control.ps1', 'scripts/windows/uninstall-control.ps1',
-    'scripts/windows/configure-game.ps1', 'scripts/windows/control-update-helper.ps1', 'release-manifest.json']
+    'scripts/windows/configure-game.ps1', 'scripts/windows/control-update-helper.ps1', 'scripts/windows/atomic-json.ps1', 'release-manifest.json']
   await Promise.all(requiredFiles.map(name => assertPlainFile(path.join(root, ...name.split('/')))))
   const [manifest, packageJson] = await Promise.all([
     readJsonObject(path.join(root, 'release-manifest.json')),

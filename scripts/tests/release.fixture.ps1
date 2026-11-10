@@ -213,7 +213,25 @@ try {
     Assert-PackageReader $scriptPath $panelRoot 'panel-only' $false (Join-Path $fixtureRoot "$scriptSlug-panel-copy")
   }
 
-  Write-Output 'Release fixture passed: complete allowlist/hash, invalid Bridge rejection, and complete/panel-only installer reads.'
+  $statusWriter = Join-Path $panelRoot 'scripts\windows\atomic-json.ps1'
+  $heldWriter = Join-Path $fixtureRoot 'held-atomic-json.ps1'
+  Move-Item -LiteralPath $statusWriter -Destination $heldWriter
+  try {
+    foreach ($scriptName in $scriptNames) {
+      $definitions = Get-HelperDefinitions (Join-Path $projectRoot "scripts\windows\$scriptName")
+      & {
+        param($Definitions, $ReleaseRoot)
+        . $Definitions -SourcePath $ReleaseRoot
+        $rejected = $false
+        try { [void](Read-SourcePackage $ReleaseRoot) }
+        catch { if ($_.Exception.Message -notlike '*atomic-json.ps1*') { throw }; $rejected = $true }
+        if (-not $rejected) { throw 'An installer accepted a release missing its shared status writer.' }
+      } $definitions $panelRoot
+    }
+  }
+  finally { Move-Item -LiteralPath $heldWriter -Destination $statusWriter }
+
+  Write-Output 'Release fixture passed: complete allowlist/hash, invalid Bridge and missing status writer rejection, complete/panel-only installer reads.'
 }
 finally {
   $resolvedFixture = [IO.Path]::GetFullPath($fixtureRoot)

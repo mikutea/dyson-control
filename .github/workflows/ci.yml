@@ -49,6 +49,10 @@ jobs:
           .\scripts\tests\runtime-check.fixture.ps1
           .\scripts\tests\steam-terminal.fixture.ps1
 
+      - name: Exercise continuous update status reads
+        shell: powershell
+        run: .\scripts\tests\control-update-status.fixture.ps1
+
       - name: Parse Windows scripts
         shell: powershell
         run: |
@@ -193,6 +197,7 @@ jobs:
             'scripts/windows/configure-game.ps1', 'scripts/windows/game-task.ps1', 'docs/game-configuration.md',
             'docs/images/overview.jpg', 'docs/images/saves.jpg',
             'scripts/windows/remove-install-directory.ps1',
+            'scripts/windows/atomic-json.ps1',
             'release-manifest.json'
           )
           foreach ($requiredFile in $required) {
