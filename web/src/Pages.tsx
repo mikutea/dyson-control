@@ -110,9 +110,9 @@ function OverviewPage({ refreshToken, overview: streamedOverview, onOverview, ru
 function PlayersPage({ refreshToken, overview, runAction }: PagesProps) {
   const players = useResource<Player[]>('/players', refreshToken)
   useEffect(() => {
-    const timer = window.setInterval(() => { void players.reload() }, 5_000)
+    const timer = window.setInterval(() => { void players.poll() }, 5_000)
     return () => window.clearInterval(timer)
-  }, [players.reload])
+  }, [players.poll])
   return <><PageHeader title="玩家" description="查看当前在线玩家；在线时长从 Bridge 首次观测到该连接时计算" />
     <Panel className="table-panel">
       <ResourceBody resource={players} emptyTitle="当前没有玩家在线" emptyDescription="玩家加入服务器后会显示在这里">

@@ -45,9 +45,9 @@ export function ControlUpdates({ refreshToken }: { refreshToken: number }) {
   }, [history.data])
   useEffect(() => {
     if (!current) return
-    const timer = window.setInterval(() => void history.reload(), 2000)
+    const timer = window.setInterval(() => void history.poll(), 2000)
     return () => window.clearInterval(timer)
-  }, [current?.id, history.reload])
+  }, [current?.id, history.poll])
   const requestId = (key: string) => {
     let value = requestIds.current.get(key)
     if (!value) { value = newRequestId(); requestIds.current.set(key, value) }

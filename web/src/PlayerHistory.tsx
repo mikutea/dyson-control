@@ -45,9 +45,9 @@ function HistoryPage({ resource, refreshToken, filtered, page, pinned, latest, p
 }) {
   const history = useResource<HistoryData>(resource, refreshToken)
   useEffect(() => {
-    const timer = window.setInterval(() => { void history.reload() }, 5000)
+    const timer = window.setInterval(() => { void history.poll() }, 5000)
     return () => window.clearInterval(timer)
-  }, [history.reload])
+  }, [history.poll])
   const data = history.data
   return <>
     <nav className="player-history-pagination" aria-label="进出记录分页">
