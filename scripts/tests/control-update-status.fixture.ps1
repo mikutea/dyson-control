@@ -16,6 +16,28 @@ $utf8 = [Text.UTF8Encoding]::new($false)
 $utf8NoBom = $utf8
 . (Join-Path $PSScriptRoot '..\windows\atomic-json.ps1')
 
+# The real helper starts in a fresh process; fixture variables must not supply missing globals.
+$fingerprintRoot = Join-Path $fixtureRoot 'fingerprint source'
+New-Item -ItemType Directory -Path $fingerprintRoot | Out-Null
+$memberName = [string][char]0x72b6 + [char]0x6001 + ' payload.txt'
+$memberBytes = $utf8.GetBytes('fixture payload')
+[IO.File]::WriteAllBytes((Join-Path $fingerprintRoot $memberName), $memberBytes)
+$hasher = [Security.Cryptography.SHA256]::Create()
+try {
+  $memberHash = ([BitConverter]::ToString($hasher.ComputeHash($memberBytes))).Replace('-', '').ToLowerInvariant()
+  $fingerprintText = $memberName + [char]0 + $memberBytes.Length + [char]0 + $memberHash + "`n"
+  $expectedFingerprint = ([BitConverter]::ToString($hasher.ComputeHash($utf8.GetBytes($fingerprintText)))).Replace('-', '').ToLowerInvariant()
+} finally { $hasher.Dispose() }
+$helperText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\windows\control-update-helper.ps1') -Raw -Encoding UTF8
+$entrypoint = $helperText.IndexOf('$handoff = Read-Operation $OperationFile', [StringComparison]::Ordinal)
+if ($entrypoint -lt 0) { throw 'Unable to locate the update helper entrypoint.' }
+$probePath = Join-Path $fixtureRoot 'fingerprint-probe.ps1'
+[IO.File]::WriteAllText($probePath, $helperText.Substring(0, $entrypoint) + "`nGet-SourceFingerprint `$OperationFile`n", $utf8)
+$powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+$fingerprint = & $powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $probePath -Mode Register -OperationFile $fingerprintRoot
+if ($LASTEXITCODE -ne 0 -or [string]$fingerprint -cne $expectedFingerprint) { throw 'Update helper fingerprint failed in a fresh PowerShell process.' }
+Write-Output 'CONTROL_UPDATE_FINGERPRINT_FIXTURE_OK: fresh process and UTF-8 source identity'
+
 Add-Type -ReferencedAssemblies 'System.Web.Extensions.dll' -TypeDefinition @'
 using System;
 using System.IO;

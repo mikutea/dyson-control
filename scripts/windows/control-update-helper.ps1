@@ -128,7 +128,7 @@ function Get-SourceFingerprint([string]$Root) {
   }
   $hash = [Security.Cryptography.SHA256]::Create()
   try {
-    $digest = $hash.ComputeHash($utf8.GetBytes($builder.ToString()))
+    $digest = $hash.ComputeHash([Text.Encoding]::UTF8.GetBytes($builder.ToString()))
     return ([BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
   }
   finally { $hash.Dispose() }
