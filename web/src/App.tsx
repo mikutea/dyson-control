@@ -45,6 +45,7 @@ export default function App() {
   const [submitting, setSubmitting] = useState(false)
   const [checkingReceipts, setCheckingReceipts] = useState(false)
   const submittingRef = useRef(false)
+  const actionRequest = useRef<AbortController | null>(null)
   const sessionGeneration = useRef(0)
   const [toast, setToast] = useState<{ message: string; tone: 'success' | 'error' } | null>(null)
 
@@ -59,6 +60,8 @@ export default function App() {
 
   const endSession = useCallback(() => {
     sessionGeneration.current += 1
+    actionRequest.current?.abort()
+    actionRequest.current = null
     submittingRef.current = false
     setSubmitting(false)
     setCheckingReceipts(false)
@@ -71,7 +74,7 @@ export default function App() {
 
   useEffect(() => {
     window.addEventListener('dyson-auth-required', endSession)
-    return () => window.removeEventListener('dyson-auth-required', endSession)
+    return () => { window.removeEventListener('dyson-auth-required', endSession); actionRequest.current?.abort() }
   }, [endSession])
 
   useEffect(() => {
@@ -190,19 +193,22 @@ export default function App() {
   const execute = useCallback(async (action: Action, input: Record<string, unknown>) => {
     if (submittingRef.current) return
     const generation = sessionGeneration.current
+    const controller = new AbortController()
+    actionRequest.current = controller
     submittingRef.current = true
     setSubmitting(true)
     try {
-      const { recovered } = await submitAction(action, input)
-      if (generation !== sessionGeneration.current) return
+      const { recovered } = await submitAction(action, input, controller.signal)
+      if (generation !== sessionGeneration.current || controller.signal.aborted) return
       receiveJob()
       setPending(null)
       setToast({ message: recovered ? '已找到之前提交的任务，可在活动中查看结果。' : '操作已提交，可继续使用其他页面', tone: 'success' })
     } catch (reason) {
-      if (generation !== sessionGeneration.current) return
+      if (generation !== sessionGeneration.current || controller.signal.aborted) return
       checkCurrentJob.current()
       setToast({ message: reason instanceof Error ? reason.message : '操作未能开始', tone: 'error' })
     } finally {
+      if (actionRequest.current === controller) actionRequest.current = null
       if (generation === sessionGeneration.current) {
         submittingRef.current = false
         setSubmitting(false)
@@ -222,6 +228,7 @@ export default function App() {
   }
 
   const logout = async () => {
+    actionRequest.current?.abort()
     const generation = sessionGeneration.current
     try { await remove<void>('/session') }
     catch {

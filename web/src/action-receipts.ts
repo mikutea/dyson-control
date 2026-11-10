@@ -1,6 +1,6 @@
 import { useSyncExternalStore } from 'react'
 import type { Action, ActionRequest, Job } from '../../shared/contracts'
-import { ApiError, get, newRequestId, post, uploadBackup } from './api'
+import { api, ApiError, newRequestId, uploadBackup } from './api'
 import { actionLabels } from './format'
 
 // A tab retains only action names and random IDs. Separate ZIP selections can have separate pending receipts.
@@ -53,8 +53,10 @@ export function usePendingReceiptActions(): Action[] {
   return useSyncExternalStore(subscribe, () => visible)
 }
 
-async function lookup(action: Action, requestId: string): Promise<Job | null> {
-  const job = await get<Job | null>(`/jobs/by-request/${encodeURIComponent(requestId)}`)
+async function lookup(action: Action, requestId: string, signal?: AbortSignal): Promise<Job | null> {
+  signal?.throwIfAborted()
+  const job = await api<Job | null>(`/jobs/by-request/${encodeURIComponent(requestId)}`, { signal })
+  signal?.throwIfAborted()
   if (job && (!job.id || job.action !== action || job.requestId !== requestId)) throw new Error('返回的任务与原请求不符，请查看活动记录。')
   if (job) forget(action, requestId)
   return job
@@ -75,9 +77,11 @@ export async function findPendingReceipts(options: { action?: Action; exceptId?:
 }
 
 async function submitWithReceipt(action: Action, requestId: string, send: () => Promise<Job>, signal?: AbortSignal): Promise<{ job: Job; recovered: boolean }> {
+  if (action !== 'import-backup') signal?.throwIfAborted()
   const prior = pending.get(requestId) === action
   if (prior || action === 'import-backup') {
-    const recorded = await lookup(action, requestId)
+    // Cancelling a file transfer can still recover an accepted upload in the same page.
+    const recorded = await lookup(action, requestId, action === 'import-backup' ? undefined : signal)
     if (recorded) return { job: recorded, recovered: true }
   }
   if (signal?.aborted) throw new Error('已停止发送文件。')
@@ -86,6 +90,7 @@ async function submitWithReceipt(action: Action, requestId: string, send: () => 
   persist()
   try {
     const job = await send()
+    if (action !== 'import-backup') signal?.throwIfAborted()
     if (!job?.id || job.requestId !== requestId || job.action !== action) throw new Error('任务回执与请求不符。')
     forget(action, requestId)
     return { job, recovered: false }
@@ -95,8 +100,9 @@ async function submitWithReceipt(action: Action, requestId: string, send: () => 
       forget(action, requestId)
       throw error
     }
-    if (signal?.aborted && signal.reason === 'page-left') throw error
-    const recorded = await lookup(action, requestId).catch(() => null)
+    if (signal?.aborted && (action !== 'import-backup' || signal.reason === 'page-left')) throw error
+    const recorded = await lookup(action, requestId, action === 'import-backup' ? undefined : signal).catch(() => null)
+    if (action !== 'import-backup') signal?.throwIfAborted()
     if (recorded) return { job: recorded, recovered: true }
     if (uploading) throw new Error('服务端仍在接收同一请求的文件，请稍后核对回执。', { cause: error })
     if (signal?.aborted) throw new Error('已停止发送文件，尚未确认导入任务。可在连接恢复后核对回执。', { cause: error })
@@ -108,9 +114,11 @@ async function submitWithReceipt(action: Action, requestId: string, send: () => 
   }
 }
 
-export function submitAction(action: Action, input: Record<string, unknown>) {
+export function submitAction(action: Action, input: Record<string, unknown>, signal?: AbortSignal) {
   const requestId = [...pending].find(([, type]) => type === action)?.[0] ?? newRequestId()
-  return submitWithReceipt(action, requestId, () => post<Job>('/actions', { requestId, action, input } satisfies ActionRequest))
+  return submitWithReceipt(action, requestId, () => api<Job>('/actions', {
+    method: 'POST', body: JSON.stringify({ requestId, action, input } satisfies ActionRequest), signal,
+  }), signal)
 }
 
 export function submitBackup(file: File, requestId: string, signal: AbortSignal, onProgress: (percent: number) => void) {
