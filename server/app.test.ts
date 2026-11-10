@@ -444,6 +444,37 @@ describe('Dyson Control API', () => {
     } finally { await app.close() }
   })
 
+  it('closes connected event streams before waiting for the HTTP server to stop', async () => {
+    const fixture = await createFixture()
+    const app = await buildApp({ config: fixture.config, adapter: fixture.adapter, databasePath: ':memory:' })
+    const address = await app.listen({ host: '127.0.0.1', port: 0 })
+    const controller = new AbortController()
+    let timer: NodeJS.Timeout | undefined
+    try {
+      const cookie = await loginCookie(app)
+      const streams = await Promise.all([0, 1].map(async () => {
+        const response = await fetch(`${address}/api/events`, { headers: { cookie }, signal: controller.signal })
+        expect(response.status).toBe(200)
+        const reader = response.body!.getReader()
+        expect((await reader.read()).done).toBe(false)
+        return reader
+      }))
+      const closing = app.close()
+      const stopped = await Promise.race([
+        closing.then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), 1500) }),
+      ])
+      expect(stopped).toBe(true)
+      for (const reader of streams) {
+        while (!(await reader.read()).done) { /* drain the final buffered event */ }
+      }
+    } finally {
+      clearTimeout(timer)
+      controller.abort()
+      await app.close()
+    }
+  })
+
   it('protects control updates while allowing only a token-bound read after session loss', async () => {
     const fixture = await createFixture()
     const id = randomUUID(), token = 'a'.repeat(43)
@@ -461,12 +492,15 @@ describe('Dyson Control API', () => {
       discard: async () => { calls.push('discard'); return operation },
       read: async () => operation, history: async () => [operation],
       readWithReceipt: async (operationId, receiptToken) => { if (operationId !== id || receiptToken !== token) throw new ControlUpdateError('RECEIPT_INVALID', '更新回执无效。'); return operation },
+      recoverReceipt: async (operationId) => { expect(operationId).toBe(id); calls.push('recoverReceipt'); return { operation, receiptToken: token } },
     } })
     await app.ready()
     try {
       for (const url of ['/api/control-updates', '/api/control-updates/history', `/api/control-updates/${id}`]) expect((await app.inject({ method: 'GET', url })).statusCode).toBe(401)
       expect((await app.inject({ method: 'POST', url: `/api/control-updates/${id}/apply`, headers: { 'x-update-receipt': token }, payload: { requestId: 'apply-1' } })).statusCode).toBe(401)
       const receiptUrl = `/api/control-updates/${id}/receipt`
+      expect((await app.inject({ method: 'POST', url: receiptUrl, payload: {} })).statusCode).toBe(401)
+      expect((await app.inject({ method: 'POST', url: receiptUrl, headers: { 'x-update-receipt': token }, payload: {} })).statusCode).toBe(401)
       expect((await app.inject({ method: 'GET', url: receiptUrl })).statusCode).toBe(400)
       expect((await app.inject({ method: 'GET', url: receiptUrl, headers: { 'x-update-receipt': 'b'.repeat(43) } })).statusCode).toBe(401)
       expect((await app.inject({ method: 'GET', url: `${receiptUrl}?token=${token}`, headers: { 'x-update-receipt': token } })).statusCode).toBe(400)
@@ -477,10 +511,17 @@ describe('Dyson Control API', () => {
         expect(response.json().data).toEqual(operation)
       }
       const cookie = await loginCookie(app)
+      expect((await app.inject({ method: 'POST', url: receiptUrl, headers: { cookie, origin: 'https://untrusted.example.test' }, payload: {} })).statusCode).toBe(403)
+      expect((await app.inject({ method: 'POST', url: receiptUrl, headers: { cookie }, payload: { receiptToken: 'invalid' } })).statusCode).toBe(400)
+      expect((await app.inject({ method: 'POST', url: `${receiptUrl}?token=${token}`, headers: { cookie }, payload: {} })).statusCode).toBe(400)
+      const recovered = await app.inject({ method: 'POST', url: receiptUrl, headers: { cookie }, payload: { receiptToken: token } })
+      expect(recovered.statusCode).toBe(200)
+      expect(recovered.headers['cache-control']).toBe('no-store')
+      expect(recovered.json().data).toEqual({ operation, receiptToken: token })
       expect((await app.inject({ method: 'POST', url: '/api/control-updates/prepare', headers: { cookie }, payload: { requestId: 'prepare-1', expectedVersion: '0.2.0' } })).statusCode).toBe(202)
       expect((await app.inject({ method: 'POST', url: `/api/control-updates/${id}/apply`, headers: { cookie }, payload: { requestId: 'apply-1' } })).statusCode).toBe(202)
       expect((await app.inject({ method: 'POST', url: `/api/control-updates/${id}/discard`, headers: { cookie }, payload: {} })).statusCode).toBe(200)
-      expect(calls).toEqual(['prepare', 'apply', 'discard'])
+      expect(calls).toEqual(['recoverReceipt', 'prepare', 'apply', 'discard'])
     } finally { await app.close() }
   })
 

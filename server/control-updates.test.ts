@@ -143,6 +143,85 @@ describe('control update discovery and preparation', () => {
     await manager.close()
   })
 
+  it('recovers a lost receipt after reopening without preparing again or exposing its hash', async () => {
+    const root = await fixtureRoot()
+    const fetch = releaseFetch('0.2.0')
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    const started = await manager.prepare({ requestId: 'lost-receipt', expectedVersion: '0.2.0' })
+    const ready = await waitForReady(manager, started.operation.id)
+    await manager.close()
+    const reopened = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await reopened.initialize()
+    try {
+      const requests = vi.mocked(fetch).mock.calls.length
+      const recovered = await reopened.recoverReceipt(ready.id)
+      expect(recovered.operation).toEqual(ready)
+      expect(recovered.receiptToken).not.toBe(started.receiptToken)
+      await expect(reopened.readWithReceipt(ready.id, started.receiptToken!)).rejects.toMatchObject({ code: 'RECEIPT_INVALID' })
+      await expect(reopened.readWithReceipt(ready.id, recovered.receiptToken)).resolves.toEqual(ready)
+      await expect(reopened.recoverReceipt(ready.id, recovered.receiptToken)).resolves.toEqual(recovered)
+      // A lost recovery response can be retried; only the newest read-only token is retained.
+      const retry = await reopened.recoverReceipt(ready.id)
+      await expect(reopened.readWithReceipt(ready.id, retry.receiptToken)).resolves.toEqual(ready)
+      expect(await reopened.history()).toEqual([ready])
+      expect(vi.mocked(fetch).mock.calls).toHaveLength(requests)
+      const stored = await fs.readFile(path.join(root, 'data/control-updates/operations', ready.id, 'operation.json'), 'utf8')
+      expect(stored).not.toContain(retry.receiptToken)
+      expect(stored).toContain(createHash('sha256').update(retry.receiptToken).digest('hex'))
+      expect(JSON.stringify(await reopened.history())).not.toContain('receiptHash')
+    } finally { await reopened.close() }
+  })
+
+  it('does not extend candidate or terminal retention when recovering or clearing a receipt', async () => {
+    const root = await fixtureRoot()
+    let now = Date.parse('2026-11-10T00:00:00.000Z')
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch: releaseFetch('0.2.0'), clock: () => now })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'receipt-retention', expectedVersion: '0.2.0' })
+      const ready = await waitForReady(manager, started.operation.id)
+      now += 23 * 60 * 60 * 1000
+      const recovered = await manager.recoverReceipt(ready.id)
+      expect(recovered.operation).toEqual(ready)
+      await manager.acknowledgeReceipt(ready.id, recovered.receiptToken)
+      expect(await manager.read(ready.id)).toEqual(ready)
+      now += 60 * 60 * 1000 + 1
+      const expired = await manager.read(ready.id)
+      expect(expired).toMatchObject({ state: 'failed', message: expect.stringContaining('24 小时') })
+      const terminal = await manager.recoverReceipt(ready.id)
+      now += 23 * 60 * 60 * 1000
+      const finalReceipt = await manager.recoverReceipt(ready.id)
+      now += 60 * 60 * 1000 + 1
+      await expect(manager.recoverReceipt(ready.id)).rejects.toMatchObject({ code: 'UPDATE_RECEIPT_EXPIRED' })
+      await expect(manager.readWithReceipt(ready.id, terminal.receiptToken)).rejects.toMatchObject({ code: 'RECEIPT_INVALID' })
+      await expect(manager.readWithReceipt(ready.id, finalReceipt.receiptToken)).rejects.toMatchObject({ code: 'RECEIPT_EXPIRED' })
+      expect(await manager.read(ready.id)).toEqual(expired)
+    } finally { await manager.close() }
+  })
+
+  it('waits for preparation to finish before replacing its receipt', async () => {
+    const root = await fixtureRoot()
+    const base = releaseFetch('0.2.0')
+    let releaseDownload!: () => void
+    const held = new Promise<void>(resolve => { releaseDownload = resolve })
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('.zip')) await held
+      return base(input, init)
+    }) as unknown as typeof globalThis.fetch
+    const manager = new ControlUpdateManager({ config: config(root), currentVersion: '0.1.0', fetch })
+    await manager.initialize()
+    try {
+      const started = await manager.prepare({ requestId: 'preparing-receipt', expectedVersion: '0.2.0' })
+      await expect(manager.recoverReceipt(started.operation.id)).rejects.toMatchObject({ code: 'UPDATE_CONFLICT' })
+      releaseDownload()
+      await waitForReady(manager, started.operation.id)
+      await expect(manager.readWithReceipt(started.operation.id, started.receiptToken!)).resolves.toMatchObject({ state: 'ready' })
+      const recovered = await manager.recoverReceipt(started.operation.id)
+      await expect(manager.readWithReceipt(started.operation.id, recovered.receiptToken)).resolves.toMatchObject({ state: 'ready' })
+    } finally { releaseDownload(); await manager.close() }
+  })
+
   it.each([['ENOSPC', '磁盘空间不足'], ['EPERM', '目录权限与文件占用']])(
     'explains %s during preparation without exposing private filesystem details', async (code, message) => {
       const root = await fixtureRoot()
@@ -312,6 +391,9 @@ describe('control update application evidence', () => {
     expect(applied.operation.state).toBe('scheduled')
     await expect(manager.apply({ operationId: started.operation.id, requestId: 'apply-real' })).resolves.toMatchObject({ operation: { id: started.operation.id, state: 'scheduled' } })
     expect(schedules).toBe(2)
+    const recovered = await manager.recoverReceipt(started.operation.id)
+    expect(recovered.operation).toMatchObject({ state: 'scheduled', applyRequestId: 'apply-real' })
+    expect(schedules).toBe(2)
     const handoff = JSON.parse(await fs.readFile(handoffPath, 'utf8')) as { statusPath: string; installRoot: string }
 
     const newLayout = await installedLayout(root, '0.2.0')
@@ -329,6 +411,7 @@ describe('control update application evidence', () => {
     })
     await restarted.initialize()
     await expect(restarted.read(started.operation.id)).resolves.toMatchObject({ state: 'succeeded', targetVersion: '0.2.0' })
+    await expect(restarted.readWithReceipt(started.operation.id, recovered.receiptToken)).resolves.toMatchObject({ state: 'succeeded' })
     await restarted.close()
   })
 

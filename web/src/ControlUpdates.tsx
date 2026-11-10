@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { CloudDownload, RefreshCw } from 'lucide-react'
-import type { ControlUpdateApplyResult, ControlUpdateDiscovery, ControlUpdateOperation, ControlUpdatePrepareResult } from '../../shared/contracts'
-import { newRequestId, post } from './api'
+import type { ControlUpdateApplyResult, ControlUpdateDiscovery, ControlUpdateOperation, ControlUpdatePrepareResult, ControlUpdateReceiptResult } from '../../shared/contracts'
+import { api, newRequestId } from './api'
 import { Button, ConfirmDialog, ErrorBlock, Panel } from './components'
 import { formatFullDate } from './format'
 import { useResource } from './hooks'
@@ -32,9 +32,16 @@ export function ControlUpdates({ refreshToken }: { refreshToken: number }) {
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<ControlUpdateOperation | null>(null)
   const requestIds = useRef(new Map<string, string>())
+  const lifetime = useRef<AbortController | null>(null)
   const current = history.data?.find(item => !terminal.has(item.state))
   useEffect(() => {
+    const controller = new AbortController()
+    lifetime.current = controller
+    return () => controller.abort()
+  }, [])
+  useEffect(() => {
     for (const item of history.data ?? []) if (terminal.has(item.state)) requestIds.current.delete(`prepare:${item.targetVersion}`)
+    if (pending && history.data?.some(item => item.id === pending.id && item.state !== 'ready')) setPending(null)
   }, [history.data])
   useEffect(() => {
     if (!current) return
@@ -48,31 +55,66 @@ export function ControlUpdates({ refreshToken }: { refreshToken: number }) {
   }
   const prepare = async () => {
     if (!discovery.data?.latestVersion || busy) return
+    const signal = lifetime.current!.signal
     setBusy(true); setError(null)
     try {
-      const result = await post<ControlUpdatePrepareResult>('/control-updates/prepare', {
-        requestId: requestId(`prepare:${discovery.data.latestVersion}`), expectedVersion: discovery.data.latestVersion,
+      const result = await api<ControlUpdatePrepareResult>('/control-updates/prepare', {
+        method: 'POST', signal, body: JSON.stringify({
+          requestId: requestId(`prepare:${discovery.data.latestVersion}`), expectedVersion: discovery.data.latestVersion,
+        }),
       })
+      if (signal.aborted) return
       if (result.receiptToken) saveReceipt({ id: result.operation.id, token: result.receiptToken })
-      await history.reload()
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '更新准备未完成。') }
-    finally { setBusy(false) }
+    } catch (reason) { if (!signal.aborted) setError(`${reason instanceof Error ? reason.message : '未收到准备结果。'} 请查看更新记录确认状态。`) }
+    finally { if (!signal.aborted) { await history.reload(); setBusy(false) } }
+  }
+  const recoverReceipt = async (operation: ControlUpdateOperation, signal: AbortSignal) => {
+    const previous = readReceipt()
+    const result = await api<ControlUpdateReceiptResult>(`/control-updates/${operation.id}/receipt`, {
+      method: 'POST', signal, body: JSON.stringify({ receiptToken: previous?.id === operation.id ? previous.token : undefined }),
+    })
+    signal.throwIfAborted()
+    try { saveReceipt({ id: result.operation.id, token: result.receiptToken }) }
+    catch { throw new Error('无法保存更新回执，请允许本站使用会话存储后重试。') }
+    return result.operation
   }
   const apply = async () => {
     if (!pending || busy) return
+    const operation = pending
+    const signal = lifetime.current!.signal
     setBusy(true); setError(null)
     try {
-      await post<ControlUpdateApplyResult>(`/control-updates/${pending.id}/apply`, { requestId: requestId(`apply:${pending.id}`) })
+      const latest = await recoverReceipt(operation, signal)
+      if (latest.state !== 'ready') { setPending(null); return }
+      await api<ControlUpdateApplyResult>(`/control-updates/${operation.id}/apply`, {
+        method: 'POST', signal, body: JSON.stringify({ requestId: requestId(`apply:${operation.id}`) }),
+      })
+      if (signal.aborted) return
       setPending(null)
-      await history.reload()
-    } catch (reason) { setError(reason instanceof Error ? reason.message : '安装提交未完成，请查看更新记录。') }
-    finally { setBusy(false) }
+    } catch (reason) {
+      if (signal.aborted) return
+      // The helper can restart the panel before the apply response reaches this tab.
+      const latest = await api<ControlUpdateOperation>(`/control-updates/${operation.id}`, { signal }).catch(() => null)
+      if (signal.aborted) return
+      if (latest && latest.state !== 'ready') setPending(null)
+      else setError(`${reason instanceof Error ? reason.message : '未收到安装结果。'} 请查看更新回执或刷新记录确认状态。`)
+    } finally { if (!signal.aborted) { await history.reload(); setBusy(false) } }
+  }
+  const track = async (operation: ControlUpdateOperation) => {
+    if (busy) return
+    const signal = lifetime.current!.signal
+    setBusy(true); setError(null)
+    try { await recoverReceipt(operation, signal) }
+    catch (reason) { if (!signal.aborted) setError(reason instanceof Error ? reason.message : '无法读取更新回执。') }
+    finally { if (!signal.aborted) { await history.reload(); setBusy(false) } }
   }
   const discard = async (operation: ControlUpdateOperation) => {
+    if (busy) return
+    const signal = lifetime.current!.signal
     setBusy(true); setError(null)
-    try { await post(`/control-updates/${operation.id}/discard`, {}); await history.reload() }
-    catch (reason) { setError(reason instanceof Error ? reason.message : '取消未完成。') }
-    finally { setBusy(false) }
+    try { await api(`/control-updates/${operation.id}/discard`, { method: 'POST', signal, body: '{}' }) }
+    catch (reason) { if (!signal.aborted) setError(reason instanceof Error ? reason.message : '取消未完成，请查看更新记录。') }
+    finally { if (!signal.aborted) { await history.reload(); setBusy(false) } }
   }
   return <Panel title="Dyson Control" icon={<CloudDownload />} action={<Button variant="quiet" busy={discovery.loading} icon={<RefreshCw />} onClick={() => void discovery.reload()}>检查面板更新</Button>}>
     <div className="control-update-body">
@@ -82,14 +124,17 @@ export function ControlUpdates({ refreshToken }: { refreshToken: number }) {
       {discovery.data.releaseUrl && <p><a href={discovery.data.releaseUrl} target="_blank" rel="noreferrer">查看发布说明</a></p>}
       {discovery.data.canPrepare && !current && <Button busy={busy} icon={<CloudDownload />} onClick={() => void prepare()}>下载并校验更新</Button>}
     </> : <p className="muted">正在读取面板版本…</p>}
-    {error && <p className="text-warning" role="alert">{error}</p>}
+    {error && !pending && <p className="text-warning" role="alert">{error}</p>}
     {history.error && <ErrorBlock message={history.error} retry={history.reload} />}
     {current && <div className="control-update-operation" role="status"><strong>{current.targetVersion} · {stateLabels[current.state]}</strong><p>{current.message}</p>
-      {current.state === 'ready' && <div className="control-update-actions"><Button variant="primary" disabled={!discovery.data?.canApply || busy} onClick={() => setPending(current)}>安装面板更新</Button><Button variant="quiet" busy={busy} onClick={() => void discard(current)}>取消这次更新</Button></div>}
+      {current.state === 'ready' && <div className="control-update-actions"><Button variant="primary" disabled={!discovery.data?.canApply || Boolean(history.error) || busy} onClick={() => { setError(null); setPending(current) }}>安装面板更新</Button><Button variant="quiet" busy={busy} onClick={() => void discard(current)}>取消这次更新</Button></div>}
+      {['scheduled', 'applying'].includes(current.state) && <Button variant="quiet" busy={busy} onClick={() => void track(current)}>在此页面跟踪更新</Button>}
     </div>}
     {Boolean(history.data?.length) && <details className="control-update-history"><summary>面板更新记录</summary>{history.data!.map(item => <article key={item.id}><strong>{item.fromVersion} → {item.targetVersion} · {stateLabels[item.state]}</strong><p>{item.message}</p><small>{formatFullDate(item.updatedAt)}</small></article>)}</details>}
     </div>
-    {pending && <ConfirmDialog title={`安装面板 ${pending.targetVersion}？`} description="面板会等待正在执行的操作结束，再短暂重启。完成后需要重新登录；启动检查失败时会自动恢复原版本。此更新不会替换游戏或 Bridge。" confirmLabel="安装并重启面板" busy={busy} onConfirm={() => void apply()} onCancel={() => setPending(null)} />}
+    {pending && <ConfirmDialog title={`安装面板 ${pending.targetVersion}？`} description="面板会等待正在执行的操作结束，再短暂重启。完成后需要重新登录；启动检查失败时会自动恢复原版本。此更新不会替换游戏或 Bridge。" confirmLabel="安装并重启面板" busy={busy} onConfirm={() => void apply()} onCancel={() => setPending(null)}>
+      {error && <p className="text-warning" role="alert">{error}</p>}
+    </ConfirmDialog>}
   </Panel>
 }
 
@@ -99,7 +144,7 @@ export function ControlUpdateReceipt() {
   const [waiting, setWaiting] = useState(false)
   const [expired, setExpired] = useState(false)
   useEffect(() => {
-    const changed = () => { setReceipt(readReceipt()); setOperation(null); setExpired(false) }
+    const changed = () => { setReceipt(readReceipt()); setOperation(null); setExpired(false); setWaiting(false) }
     window.addEventListener(receiptEvent, changed)
     return () => window.removeEventListener(receiptEvent, changed)
   }, [])
@@ -110,6 +155,7 @@ export function ControlUpdateReceipt() {
     const refresh = async () => {
       try {
         const response = await fetch(`/api/control-updates/${receipt.id}/receipt`, { headers: { 'x-update-receipt': receipt.token }, credentials: 'omit', signal: controller.signal })
+        if (controller.signal.aborted) return
         if ([401, 404].includes(response.status)) { setExpired(true); return }
         if (!response.ok) throw new Error('unavailable')
         const body = await response.json() as { data: ControlUpdateOperation }

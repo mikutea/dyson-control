@@ -109,6 +109,7 @@ export interface ControlUpdateOperation {
 }
 export interface ControlUpdatePrepareResult { statusCode: 202; operation: ControlUpdateOperation; receiptToken: string | null }
 export interface ControlUpdateApplyResult { statusCode: 202; operation: ControlUpdateOperation }
+export interface ControlUpdateReceiptResult { operation: ControlUpdateOperation; receiptToken: string }
 export interface Save { id: string; name: string; bytes: number; modifiedAt: string; members: string[]; current: boolean }
 export interface Backup { id: string; saveName: string; createdAt: string; bytes: number; members: string[]; reason: string; retained?: boolean | null }
 export interface BackupRestorePreview {

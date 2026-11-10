@@ -87,7 +87,7 @@ export interface BuildAppOptions {
   runtimeOptions?: { clock?: () => number; intervalMs?: number }
   steamAuth?: SteamAuthManager
   serverSetup?: Pick<ServerSetupManager, 'status' | 'prepareSteam' | 'install' | 'prepareExisting' | 'adoptExisting'>
-  controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'history' | 'close'>
+  controlUpdates?: Pick<ControlUpdateManager, 'initialize' | 'discover' | 'prepare' | 'apply' | 'discard' | 'read' | 'readWithReceipt' | 'recoverReceipt' | 'history' | 'close'>
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
@@ -330,6 +330,12 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
     const token = z.string().regex(/^[A-Za-z0-9_-]{43}$/).parse(request.headers['x-update-receipt'])
     return data(await controlUpdates.readWithReceipt(id, token))
+  })
+  app.post('/api/control-updates/:id/receipt', async (request) => {
+    assertNoQuery(request)
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(request.params)
+    const { receiptToken } = z.object({ receiptToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/).optional() }).strict().parse(request.body)
+    return data(await controlUpdates.recoverReceipt(id, receiptToken))
   })
   app.post('/api/control-updates/prepare', async (request, reply) => {
     assertNoQuery(request)
@@ -577,7 +583,6 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
 
   app.addHook('onClose', async () => {
-    events.close()
     await controlUpdates.close()
     await queue.shutdown()
     await runtime.close()
@@ -588,6 +593,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   })
 
   app.addHook('preClose', async () => {
+    // HTTP shutdown waits for open responses; end SSE before that wait begins.
+    events.close()
     await steamAuth.close()
     runtime.stop()
     playerHistory.stop()

@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type {
   ControlConfig, ControlUpdateApplyResult, ControlUpdateDiscovery, ControlUpdateOperation,
-  ControlUpdateOperationState, ControlUpdatePrepareResult, ControlUpdateStep,
+  ControlUpdateOperationState, ControlUpdatePrepareResult, ControlUpdateReceiptResult, ControlUpdateStep,
 } from '../shared/contracts.js'
 export type {
   ControlUpdateApplyResult, ControlUpdateAvailability, ControlUpdateDiscovery, ControlUpdateOperation,
@@ -315,6 +315,33 @@ export class ControlUpdateManager {
     })
   }
 
+  async recoverReceipt(operationId: string, previousToken?: string): Promise<ControlUpdateReceiptResult> {
+    this.#assertOpen()
+    assertOperationId(operationId)
+    if (previousToken !== undefined && !/^[A-Za-z0-9_-]{43}$/.test(previousToken)) throw new ControlUpdateError('INVALID_INPUT', '更新回执格式无效。')
+    return this.#locked(async () => {
+      this.#assertOpen()
+      let record = await this.#require(operationId)
+      await this.#expirePrepared([record])
+      record = await this.#refreshHelperStatus(await this.#require(operationId))
+      // Preparation owns a live record until it has finished writing the candidate.
+      if (record.state === 'preparing') throw conflict('更新仍在准备，请等待下载校验完成。')
+      const expiresAt = record.completedAt ? Date.parse(record.completedAt) + receiptRetentionMs : null
+      if (expiresAt !== null && expiresAt <= this.#clock()) {
+        throw new ControlUpdateError('UPDATE_RECEIPT_EXPIRED', '更新已结束超过 24 小时，请在更新记录中查看结果。')
+      }
+      if (previousToken && record.receiptHash && constantTimeEqual(record.receiptHash, sha256Text(previousToken))) {
+        return { operation: publicOperation(record), receiptToken: previousToken }
+      }
+      const receiptToken = randomBytes(32).toString('base64url')
+      record.receiptHash = sha256Text(receiptToken)
+      record.receiptExpiresAt = expiresAt === null ? null : new Date(expiresAt).toISOString()
+      // Receipt recovery does not extend the prepared candidate's lifetime or change progress.
+      await this.#write(record)
+      return { operation: publicOperation(record), receiptToken }
+    })
+  }
+
   async history(): Promise<ControlUpdateOperation[]> {
     return this.#locked(async () => {
       await this.#expirePrepared()
@@ -541,7 +568,6 @@ export class ControlUpdateManager {
   async #clearReceipt(record: StoredOperation): Promise<void> {
     record.receiptHash = null
     record.receiptExpiresAt = null
-    record.updatedAt = this.#now()
     await this.#write(record)
   }
 
